@@ -1,0 +1,731 @@
+import torch
+import math
+import time
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import SamModel
+from utils.utils import print_trainable_parameters
+
+class LoRACore(nn.Module):
+    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout_rate=0):
+        super().__init__()
+        self.in_features = qkv_layer.in_features
+        self.out_features = qkv_layer.out_features
+        self.merge = merge
+        self.rank = rank
+        self.lora_alpha = lora_alpha
+        self.dropout_rate = dropout_rate
+        
+        self.linear = qkv_layer
+        if rank > 0:
+            self.linear.weight.requires_grad = False
+        self.scale = self.lora_alpha / self.rank
+        
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+    def init_weights(self):
+        """计算 LoRA 调整量（子类重写此方法）"""
+        raise NotImplementedError
+    
+    def forward(self, x):
+        raise NotImplementedError
+
+class LoRASam_DepWiseConv(LoRACore):
+    """
+    对sam的encoder的attention部分选中的q, k, v层的各种组合形式进行lora-dsc修改(refactor version)
+    """
+    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout_rate=0, 
+                 ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True):
+        super().__init__(qkv_layer, merge, rank, lora_alpha, dropout_rate)
+        self.ft_q = ft_q
+        self.ft_k = ft_k
+        self.ft_v = ft_v
+        self.add_dsc_conv = add_dsc_conv
+
+        # 使用 ModuleDict 管理动态创建的层
+        self.lora_a = nn.ModuleDict({})
+        self.lora_b = nn.ModuleDict({})
+        if self.add_dsc_conv:
+            self.lora_dw_conv = nn.ModuleDict({})
+            self.lora_pw_conv = nn.ModuleDict({})
+
+        # 按需创建参数和层
+        parts_to_finetune = []
+        if self.ft_q: parts_to_finetune.append('q')
+        if self.ft_k: parts_to_finetune.append('k')
+        if self.ft_v: parts_to_finetune.append('v')
+
+        for part in parts_to_finetune:
+            self.lora_a[part] = nn.Linear(self.in_features, rank, bias=False)
+            self.lora_b[part] = nn.Linear(rank, self.out_features // 3, bias=False)
+            if self.add_dsc_conv:
+                self.lora_dw_conv[part] = nn.Conv2d(rank, rank, kernel_size=3, padding=1, groups=rank, bias=False)
+                self.lora_pw_conv[part] = nn.Conv2d(rank, rank, kernel_size=1, padding=0, bias=False)
+   
+        self.init_weights()
+
+    def init_weights(self):
+        for part in self.lora_a.keys():
+            nn.init.kaiming_uniform_(self.lora_a[part].weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_b[part].weight)
+
+        if self.add_dsc_conv:
+            for part in self.lora_dw_conv.keys():
+                nn.init.kaiming_uniform_(self.lora_dw_conv[part].weight, a=math.sqrt(5))
+                nn.init.kaiming_uniform_(self.lora_pw_conv[part].weight, a=math.sqrt(5))
+    
+    def _get_delta(self, x, part: str):
+        if self.add_dsc_conv:
+            delta = self.lora_a[part](x)                    # [B, H, W, rank]
+            delta = delta.permute(0, 3, 1, 2)               # 转换为卷积格式: [B, rank, H, W]
+            delta = self.lora_dw_conv[part](delta)
+            delta = self.lora_pw_conv[part](delta)
+            delta = delta.permute(0, 2, 3, 1)               # 转换回原格式:[B, H, W, rank]
+            delta = self.lora_b[part](delta) * self.scale
+        else: # 标准 LoRA
+            delta = self.lora_b[part](self.lora_a[part](x)) * self.scale
+        return delta
+
+    def forward(self, x):
+        if self.rank > 0 and self.merge:
+            qkv = self.linear(x)
+            q, k, v = torch.chunk(qkv, 3, dim=-1)
+            if self.ft_q:
+                q = q + self._get_delta(x, 'q')
+            if self.ft_k:
+                k = k + self._get_delta(x, 'k')
+            if self.ft_v:
+                v = v + self._get_delta(x, 'v')
+
+            qkv_adjusted = torch.cat((q, k, v), dim=-1)
+            return self.dropout(qkv_adjusted)
+        else:
+            return self.dropout(self.linear(x))
+
+
+class LoRA_encoder_attn_Conv(nn.Module):
+    """
+    对sam的encoder的attention部分进行修改, 将qkv的线性层添加LoRA或者LoRA-standard-Conv
+    """
+    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout_rate=0.0, add_std_conv = False):
+        super(LoRA_encoder_attn_Conv, self).__init__()
+        self.in_features = qkv_layer.in_features
+        self.out_features = qkv_layer.out_features
+        self.merge = merge
+        self.rank = rank
+        self.dropout_rate = dropout_rate
+        self.lora_alpha = lora_alpha
+        self.add_conv = add_std_conv
+
+        self.linear = qkv_layer
+        self.linear.bias = qkv_layer.bias
+
+        if rank > 0:
+            self.linear.weight.requires_grad = False  # 冻结主线性层权重
+            self.lora_b = nn.Parameter(torch.zeros(self.out_features, rank))
+            self.lora_a = nn.Parameter(torch.zeros(rank, self.in_features))
+            self.scale = self.lora_alpha / self.rank
+
+            if self.add_conv:
+                self.lora_conv = nn.Conv2d(rank, rank, kernel_size=3, padding=1, bias=False)
+
+        if self.dropout_rate > 0:
+            self.dropout = nn.Dropout(p=self.dropout_rate)
+        else:
+            self.dropout = nn.Identity()
+        self.initial_weights()
+    
+    def initial_weights(self):
+        if self.rank > 0:
+            nn.init.kaiming_uniform_(self.lora_b, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_a)
+            if self.add_conv:
+                nn.init.kaiming_uniform_(self.lora_conv.weight, a=math.sqrt(5))
+    
+    def forward(self, x):
+        qkv = self.linear(x)
+        if self.rank > 0 and self.merge:
+            delta_qkv = x @ self.lora_a.T
+            
+            # 在LoRA的A矩阵之后应用Dropout
+            # delta_qkv = self.dropout(delta_qkv)
+
+            if self.add_conv:
+                # print(f"被调用了:{delta_qkv.shape}")    [2, 64, 64, 16]
+                delta_qkv = delta_qkv.permute(0, 3, 1, 2)
+                delta_qkv = self.lora_conv(delta_qkv)
+                delta_qkv = delta_qkv.permute(0, 2, 3, 1)
+            
+            delta_qkv = (delta_qkv @ self.lora_b.T) * self.scale
+            qkv = qkv + delta_qkv 
+            return self.dropout(qkv)
+        else:
+            return qkv
+
+class LoRA_SAM_qvConv(nn.Module):
+    """
+    对sam的encoder的attention部分的q,v层分开进行修改, 将qkv的线性层添加LoRA或者LoRA-standard-Conv
+    """
+    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout=0.0, add_std_conv = False):
+        super(LoRA_SAM_qvConv, self).__init__()
+        self.in_features = qkv_layer.in_features
+        self.out_features = qkv_layer.out_features
+        self.merge = merge
+        self.rank = rank
+        self.dropout_rate = dropout
+        self.lora_alpha = lora_alpha
+        self.add_conv = add_std_conv
+
+        self.linear = qkv_layer
+        self.linear.bias = qkv_layer.bias
+        if rank > 0:
+            self.linear.weight.requires_grad = False  # 冻结主线性层权重
+
+            self.lora_a_q  = nn.Parameter(torch.zeros(rank, self.in_features))
+            self.lora_b_q = nn.Parameter(torch.zeros(self.out_features // 3, rank))
+
+            self.lora_a_v = nn.Parameter(torch.zeros(rank, self.in_features))
+            self.lora_b_v = nn.Parameter(torch.zeros(self.out_features // 3, rank))
+
+            self.scale = self.lora_alpha / self.rank
+
+            if self.add_conv:
+                self.lora_conv_q = nn.Conv2d(rank, rank, kernel_size=3, padding=1, bias=False)
+                self.lora_conv_v = nn.Conv2d(rank, rank, kernel_size=3, padding=1, bias=False)
+
+        if self.dropout_rate > 0:
+            self.dropout = nn.Dropout(self.dropout_rate)
+        else:
+            self.dropout = nn.Identity()
+        self.initial_weights()
+
+    def initial_weights(self):
+        nn.init.kaiming_uniform_(self.lora_a_q, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_b_q)
+        nn.init.kaiming_uniform_(self.lora_a_v, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_b_v)
+
+        if hasattr(self, 'lora_conv_q'):
+            nn.init.kaiming_uniform_(self.lora_conv_q.weight, a=math.sqrt(5))
+        if hasattr(self, 'lora_conv_v'):
+            nn.init.kaiming_uniform_(self.lora_conv_v.weight, a=math.sqrt(5))
+
+    def forward(self, x):
+        # print(f"x.shape: {x.shape}")s
+        if self.rank > 0 and self.merge:
+            qkv = self.linear(x)
+            print(f"qkv shape: {qkv.shape}")
+            q, k, v = torch.chunk(qkv, 3, dim=-1)
+            print(f"q shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}")
+            if self.add_conv:
+                delta_q = (x @ self.lora_a_q.T)
+                delta_q = delta_q.permute(0, 3, 1, 2)
+                delta_q = self.lora_conv_q(delta_q)
+                delta_q = delta_q.permute(0, 2, 3, 1)
+                delta_q = (delta_q @ self.lora_b_q.T) * self.scale
+
+                delta_v = (x @ self.lora_a_v.T)
+                delta_v = delta_v.permute(0, 3, 1, 2)
+                delta_v = self.lora_conv_v(delta_v)
+                delta_v = delta_v.permute(0, 2, 3, 1)
+                delta_v = (delta_v @ self.lora_b_v.T) * self.scale
+            else:
+                # Compute LoRA adjustments dynamically based on input x
+                delta_q = (x @ self.lora_a_q.T) @ self.lora_b_q.T * self.scale  # Shape: [50, 14, 14, 768]
+                delta_v = (x @ self.lora_a_v.T) @ self.lora_b_v.T * self.scale  # Shape: [50, 14, 14, 768]
+            
+            # Add the LoRA adjustments to q and v
+            q = q + delta_q
+            v = v + delta_v
+
+            qkv_adjusted = torch.cat((q, k, v), dim=-1)
+            output = self.dropout(qkv_adjusted)
+            print(f"被调用了: {output.shape}")
+            print("=" * 20)
+            return output
+        else:
+            return self.dropout(self.linear(x))
+
+class LoRASam_qv_DepWiseConv(nn.Module):
+    """
+    对sam的encoder的attention部分的q,v层进行lora-dsc修改
+    """
+    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout=0, add_dsc_conv = True):
+        # dropout rate: 0.05?
+        super(LoRASam_qv_DepWiseConv, self).__init__()
+        self.in_features = qkv_layer.in_features
+        self.out_features = qkv_layer.out_features
+        self.merge = merge
+        self.rank = rank
+        self.dropout_rate = dropout
+        self.lora_alpha = lora_alpha
+        self.add_dsc_conv = add_dsc_conv
+
+        self.linear = qkv_layer
+        self.linear.bias = qkv_layer.bias
+        if rank > 0:
+            self.linear.weight.requires_grad = False  # 冻结主线性层权重
+
+            self.lora_a_q  = nn.Parameter(torch.zeros(rank, self.in_features))
+            self.lora_b_q = nn.Parameter(torch.zeros(self.out_features // 3, rank))
+
+            self.lora_a_v = nn.Parameter(torch.zeros(rank, self.in_features))
+            self.lora_b_v = nn.Parameter(torch.zeros(self.out_features // 3, rank))
+
+            self.scale = self.lora_alpha / self.rank
+
+            if self.add_dsc_conv:
+                self.lora_dw_conv_q = nn.Conv2d(rank, rank, kernel_size=3, padding=1, groups=rank, bias=False)
+                self.lora_pw_conv_q = nn.Conv2d(rank, rank, kernel_size=1, padding=0, bias=False)
+
+                self.lora_dw_conv_v = nn.Conv2d(rank, rank, kernel_size=3, padding=1, groups=rank, bias=False)
+                self.lora_pw_conv_v = nn.Conv2d(rank, rank, kernel_size=1, padding=0, bias=False)
+
+        if self.dropout_rate > 0:
+            self.dropout = nn.Dropout(self.dropout_rate)
+        else:
+            self.dropout = nn.Identity()
+        self.initial_weights()
+
+    def initial_weights(self):
+        nn.init.kaiming_uniform_(self.lora_a_q, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_b_q)
+        nn.init.kaiming_uniform_(self.lora_a_v, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_b_v)
+
+        if hasattr(self, 'lora_dw_conv_q'):
+            nn.init.kaiming_uniform_(self.lora_dw_conv_q.weight, a=math.sqrt(5))
+        if hasattr(self, 'lora_pw_conv_q'):
+            nn.init.kaiming_uniform_(self.lora_pw_conv_q.weight, a=math.sqrt(5))
+        if hasattr(self, 'lora_dw_conv_v'):
+            nn.init.kaiming_uniform_(self.lora_dw_conv_v.weight, a=math.sqrt(5))
+        if hasattr(self, 'lora_pw_conv_v'):
+            nn.init.kaiming_uniform_(self.lora_pw_conv_v.weight, a=math.sqrt(5))
+
+    def forward(self, x):
+        print(f"x.shape: {x.shape}")
+        if self.rank > 0 and self.merge:
+            qkv = self.linear(x)
+            # print("=" * 30)
+            # print(f"qkv shape: {qkv.shape}")
+            # print("=" * 30)
+            q, k, v = torch.chunk(qkv, 3, dim=-1)    # [25, 14, 14, 768]
+            # print("=" * 30)
+            # print(f"q shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}")
+            # print("=" * 30)
+            if self.add_dsc_conv:
+                delta_q = (x @ self.lora_a_q.T)
+                delta_q = delta_q.permute(0, 3, 1, 2)
+                delta_q = self.lora_dw_conv_q(delta_q)
+                delta_q = self.lora_pw_conv_q(delta_q)
+                delta_q = delta_q.permute(0, 2, 3, 1)
+                delta_q = (delta_q @ self.lora_b_q.T) * self.scale
+
+                delta_v = (x @ self.lora_a_v.T)
+                delta_v = delta_v.permute(0, 3, 1, 2)
+                delta_v = self.lora_dw_conv_v(delta_v)
+                delta_v = self.lora_pw_conv_v(delta_v)
+                delta_v = delta_v.permute(0, 2, 3, 1)
+                delta_v = (delta_v @ self.lora_b_v.T) * self.scale
+            else:
+                # Compute LoRA adjustments dynamically based on input x
+                delta_q = (x @ self.lora_a_q.T) @ self.lora_b_q.T * self.scale  # Shape: [50, 14, 14, 768]
+                delta_v = (x @ self.lora_a_v.T) @ self.lora_b_v.T * self.scale  # Shape: [50, 14, 14, 768]
+            
+            # Add the LoRA adjustments to q and v
+            q = q + delta_q
+            v = v + delta_v
+
+            qkv_adjusted = torch.cat((q, k, v), dim=-1)
+            output = self.dropout(qkv_adjusted)
+            print(f"被调用了: {output.shape}")
+            print("=" * 20)
+            return output
+        else:
+            return self.dropout(self.linear(x))
+
+class LoRA_Moe_DepwiseConv_Samqv(nn.Module):
+    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout=0.05, num_experts=3, kernel_sizes=[3, 5, 7]):
+        super(LoRA_Moe_DepwiseConv_Samqv, self).__init__()
+        self.in_features = qkv_layer.in_features
+        self.out_features = qkv_layer.out_features
+        self.merge = merge
+        self.rank = rank
+        self.dropout_rate = dropout
+        self.lora_alpha = lora_alpha
+        self.num_experts = num_experts
+        self.kernel_sizes = kernel_sizes
+
+        self.linear = qkv_layer
+        self.linear.bias = qkv_layer.bias
+        if rank > 0:
+            self.linear.weight.requires_grad = False  # 冻结主线性层权重
+
+            # 定义 Q 的 LoRA 参数
+            self.lora_a_q = nn.Parameter(torch.zeros(rank, self.in_features))
+            self.lora_b_q = nn.Parameter(torch.zeros(self.out_features // 3, rank))
+
+            # 定义 V 的 LoRA 参数
+            self.lora_a_v = nn.Parameter(torch.zeros(rank, self.in_features))
+            self.lora_b_v = nn.Parameter(torch.zeros(self.out_features // 3, rank))
+
+            self.scale = self.lora_alpha / self.rank  
+
+            # 定义 Q 和 V 的多个深度可分离卷积专家
+            self.q_experts = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(rank, rank, kernel_size=ks, padding=ks//2, groups=rank, bias=False),
+                    nn.Conv2d(rank, rank, kernel_size=1, padding=0, bias=False)
+                ) for ks in self.kernel_sizes
+            ])
+
+            self.v_experts = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(rank, rank, kernel_size=ks, padding=ks//2, groups=rank, bias=False),
+                    nn.Conv2d(rank, rank, kernel_size=1, padding=0, bias=False)
+                ) for ks in self.kernel_sizes
+            ])
+
+            # 定义门控网络
+            self.gate_q = nn.Linear(rank, self.num_experts)
+            self.gate_v = nn.Linear(rank, self.num_experts)
+
+        if self.dropout_rate > 0:
+            self.dropout = nn.Dropout(self.dropout_rate)
+        else:
+            self.dropout = nn.Identity()
+        self.initial_weights()
+
+    def initial_weights(self):
+        nn.init.kaiming_uniform_(self.lora_a_q, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_b_q)
+        nn.init.kaiming_uniform_(self.lora_a_v, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_b_v)
+
+        for conv in self.q_experts:
+            for layer in conv:
+                if isinstance(layer, nn.Conv2d):
+                    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+
+        for conv in self.v_experts:
+            for layer in conv:
+                if isinstance(layer, nn.Conv2d):
+                    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+
+        nn.init.kaiming_uniform_(self.gate_q.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.gate_v.weight, a=math.sqrt(5))
+        if self.gate_q.bias is not None:
+            nn.init.zeros_(self.gate_q.bias)
+        if self.gate_v.bias is not None:
+            nn.init.zeros_(self.gate_v.bias)
+
+    def forward(self, x):
+        # print(f"x.shape: {x.shape}")  # e.g., [batch, height, width, in_features]
+        if self.rank > 0 and self.merge:
+            qkv = self.linear(x)
+            # print(f"qkv shape: {qkv.shape}")  # [batch, height, width, out_features]
+            q, k, v = torch.chunk(qkv, 3, dim=-1)
+            # print(f"q shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}")  # [batch, height, width, out_features//3]
+
+            # Q 的 LoRA 调整
+            delta_q = (x @ self.lora_a_q.T)  # [batch, height, width, rank]
+            delta_q = delta_q.permute(0, 3, 1, 2)  # [batch, rank, height, width]
+
+            # 通过多个专家进行卷积，并使用门控权重加权
+            expert_outputs_q = [expert(delta_q) for expert in self.q_experts]  # List of [batch, rank, height, width]
+            expert_outputs_q = torch.stack(expert_outputs_q, dim=1)  # [batch, num_experts, rank, height, width]
+
+            # 计算门控权重
+            gate_input_q = delta_q.mean(dim=[2,3])  # [batch, rank]
+            gate_weights_q = self.gate_q(gate_input_q)  # [batch, num_experts]
+            gate_weights_q = torch.softmax(gate_weights_q, dim=-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [batch, num_experts, 1, 1, 1]
+
+            # 加权求和
+            weighted_experts_q = (expert_outputs_q * gate_weights_q).sum(dim=1)  # [batch, rank, height, width]
+
+            # 转换回原始形状
+            weighted_experts_q = weighted_experts_q.permute(0, 2, 3, 1)  # [batch, height, width, rank]
+            delta_q = (weighted_experts_q @ self.lora_b_q.T) * self.scale  # [batch, height, width, out_features//3]
+
+            # V 的 LoRA 调整
+            delta_v = (x @ self.lora_a_v.T)  # [batch, height, width, rank]
+            delta_v = delta_v.permute(0, 3, 1, 2)  # [batch, rank, height, width]
+
+            # 通过多个专家进行卷积，并使用门控权重加权
+            expert_outputs_v = [expert(delta_v) for expert in self.v_experts]  # List of [batch, rank, height, width]
+            expert_outputs_v = torch.stack(expert_outputs_v, dim=1)  # [batch, num_experts, rank, height, width]
+
+            # 计算门控权重
+            gate_input_v = delta_v.mean(dim=[2,3])  # [batch, rank]
+            gate_weights_v = self.gate_v(gate_input_v)  # [batch, num_experts]
+            gate_weights_v = torch.softmax(gate_weights_v, dim=-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [batch, num_experts, 1, 1, 1]
+
+            # 加权求和
+            weighted_experts_v = (expert_outputs_v * gate_weights_v).sum(dim=1)  # [batch, rank, height, width]
+
+            # 转换回原始形状
+            weighted_experts_v = weighted_experts_v.permute(0, 2, 3, 1)  # [batch, height, width, rank]
+            delta_v = (weighted_experts_v @ self.lora_b_v.T) * self.scale  # [batch, height, width, out_features//3]
+
+            # 将 LoRA 调整添加到 q 和 v
+            q = q + delta_q
+            v = v + delta_v
+
+            # 拼接调整后的 q, k, v
+            qkv_adjusted = torch.cat((q, k, v), dim=-1)  # [batch, height, width, out_features]
+            output = self.dropout(qkv_adjusted)
+            # print(f"Adjusted qkv shape: {output.shape}")  # [batch, height, width, out_features]
+            return output
+        else:
+            return self.dropout(self.linear(x))
+
+def get_sam_hg_model():
+    hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    # for name, param in hgsam_model.named_parameters():
+    # # 冻结某些层
+    #     if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
+    #         param.requires_grad_(False)
+    return hgsam_model
+
+def get_loradsc_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, add_dsc_conv, sam_type: str = "sam_base"):
+    """
+    lora-dsc-选中q,k,v的选定组合进行微调,不选中bias, 不选中output的proj层
+    """
+    if sam_type == "sam_base":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    elif sam_type == "sam_large":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
+
+    for name, param in hgsam_model.named_parameters():
+    # 冻结某些层
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+    for layers in hgsam_model.vision_encoder.layers:
+        # lora_alpha 默认应该等于 rank
+        layers.attn.qkv = LoRASam_DepWiseConv(qkv_layer = layers.attn.qkv, merge = True, 
+                                              rank=rank, lora_alpha=lora_alpha, dropout_rate=dropout_rate, 
+                                              ft_q = ft_q, ft_k = ft_k, ft_v = ft_v,
+                                              add_dsc_conv=add_dsc_conv)
+    return hgsam_model
+
+def get_sam_loraconv_qv_vision_encoder(rank=16, lora_alpha=16, dropout=0.0, add_std_conv=False):
+    """
+    对选中的qv层进行lora分解, 根据add_conv参数决定是否加入标准卷积
+    """
+    hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    for name, param in hgsam_model.named_parameters():
+    # 冻结某些层
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+    for layers in hgsam_model.vision_encoder.layers:
+        layers.attn.qkv = LoRA_SAM_qvConv(qkv_layer = layers.attn.qkv, merge = True, rank=rank, lora_alpha=lora_alpha, dropout=dropout, add_dsc_conv=add_std_conv)
+    return hgsam_model
+
+def get_sam_loraDSC_qv_vision_encoder(rank=16, lora_alpha=16, dropout=0.0, add_dsc_conv=True):
+    """
+    lora qv 使用深度可分离卷积
+    """
+    hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    for name, param in hgsam_model.named_parameters():
+    # 冻结某些层
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+    for layers in hgsam_model.vision_encoder.layers:
+        # lora_alpha 默认应该等于 rank
+        layers.attn.qkv = LoRASam_qv_DepWiseConv(qkv_layer = layers.attn.qkv, merge = True, rank=rank, lora_alpha=lora_alpha, dropout=dropout, add_dsc_conv=add_dsc_conv)
+    return hgsam_model
+
+def loraConv_attnqkv(lora_rank=16, lora_alpha=16, dropout_rate=0.0, add_std_conv=False):
+    """
+    lora qkv
+    """
+    hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    for name, param in hgsam_model.named_parameters():
+    # 冻结某些层
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+    for layers in hgsam_model.vision_encoder.layers:
+        layers.attn.qkv = LoRA_encoder_attn_Conv(qkv_layer = layers.attn.qkv, merge = True, rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=dropout_rate, add_std_conv=add_std_conv)
+    return hgsam_model
+
+
+
+
+# def get_LoRA_Moe_DepwiseConv_Samqv_vison_encoder(rank=16, dropout=0.05):
+#     """
+#     lora moe机制合并的深度可分离卷积 qv
+#     """
+#     hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+#     for name, param in hgsam_model.named_parameters():
+#     # 冻结某些层
+#         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+#             param.requires_grad_(False)
+#     for layers in hgsam_model.vision_encoder.layers:
+#         layers.attn.qkv = LoRA_Moe_DepwiseConv_Samqv(qkv_layer = layers.attn.qkv, merge = True, rank=rank, lora_alpha=rank, dropout=dropout, num_experts=3, kernel_sizes=[3, 5, 7])
+#     return hgsam_model
+
+def measure_inference_time(model, input_tensor, num_runs=10):
+    """
+    测量模型的推理时间。
+
+    :param model: 要测试的模型
+    :param input_tensor: 输入张量
+    :param num_runs: 运行次数
+    :return: 平均推理时间
+    """
+    start_time = time.time()
+    with torch.no_grad():
+        for _ in range(num_runs):
+            # _ = model.vision_encoder(input_tensor)
+            _ = model(input_tensor)
+    end_time = time.time()
+    avg_time = (end_time - start_time) / num_runs
+    return avg_time
+
+def create_model_for_inference(model, lora_weights_path: str, device: str = "cpu") -> SamModel:
+    """
+    一步到位创建用于推理的、加载了LoRA权重的SAM模型。
+    Args:
+        lora_weights_path (str): 保存的LoRA权重文件 (.pth) 的路径。
+        device (str): 模型加载到的设备 ('cpu' or 'cuda')。
+    Returns:
+        SamModel: 一个准备好进行推理的完整模型。
+    """
+    print("--- 开始构建推理模型 ---")
+    # custom_model_types = ['loradsc_qv', 'loradsc_qkv', 'loradsc_qk', ]
+    # if args.ft_type in custom_model_types:
+    # 步骤 2: 加载微调后的LoRA权重
+    print(f"步骤 2/2: 从 '{lora_weights_path}' 加载微调后的LoRA权重...")
+    try:
+        # 加载只包含LoRA参数的state_dict
+        lora_state_dict = torch.load(lora_weights_path, map_location=torch.device(device))
+        
+        # 使用 strict=False 将LoRA权重加载到模型中
+        # 这会填充 lora_a_q, lora_b_q 等参数，同时忽略文件中不存在的基础模型参数
+        missing_keys, unexpected_keys = model.load_state_dict(lora_state_dict, strict=False)
+        
+        print("LoRA权重加载成功！")
+        if unexpected_keys:
+             print(f"  - 警告: 权重文件中有多余的键: {unexpected_keys}")
+        # `missing_keys` 会列出所有基础模型的参数，这是正常现象
+        # print(f"  - {len(missing_keys)} 个基础模型参数被正确忽略。")
+
+    except FileNotFoundError:
+        print(f"  - 错误: 找不到LoRA权重文件: {lora_weights_path}。模型将使用随机初始化的LoRA权重。")
+    except Exception as e:
+        print(f"  - 错误: 加载LoRA权重时发生错误: {e}")
+
+    # 将模型移动到指定设备并设置为评估模式
+    model.to(device)
+    model.eval()
+    
+    print("--- 推理模型构建完成，已设为评估模式 ---")
+    return model
+
+
+if __name__ == "__main__":
+    hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+
+    layer_0 = hgsam_model.vision_encoder.layers[0]
+    print(layer_0)
+
+    linear = hgsam_model.vision_encoder.layers[0].attn.qkv
+    print(linear.in_features)
+    print(linear.out_features)
+    print('----before---')
+    print(hgsam_model.vision_encoder)
+    # x = torch.randn(2, 196, 768)
+    # output = linear(x)
+    # print(output[:, :, 768])
+    # print(linear.bias)
+
+    print("---after---")
+    # model = get_loradsc_model(rank=16, lora_alpha=16, dropout_rate=0.0, 
+    #                           ft_q = True, ft_k = False , ft_v = True, add_dsc_conv=False)
+    # model = get_sam_loraDSC_qv_vision_encoder(rank=16, lora_alpha=16, dropout=0.0, add_dsc_conv=True)
+
+    model = loraConv_attnqkv(lora_rank=16, lora_alpha=16, dropout_rate=0.0, add_std_conv=False)
+
+
+    for name, param in model.named_parameters():
+        if 'lora' in name and param.requires_grad:
+            print(name, param.shape)
+    
+
+    # print(model.vision_encoder)
+    print_trainable_parameters(model)
+
+    img = torch.rand((1, 3, 1024, 1024))
+    vs_encoder_output = model.vision_encoder(img)
+
+    # print("-------推理时间测试------")
+    # original_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    # for name, param in original_model.named_parameters():
+    #     if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+    #         param.requires_grad_(False)
+
+    # img = img.to('cuda')
+    # # 测量原始模型推理时间
+    # original_model.to('cuda')
+    
+    # original_avg_time = measure_inference_time(original_model, img)
+    # print(f"原始模型平均推理时间: {original_avg_time:.6f} 秒")
+
+    # # 测量 LoRA 模型推理时间
+    # model.to('cuda')
+    # lora_avg_time = measure_inference_time(model, img)
+    # print(f"LoRA 模型平均推理时间: {lora_avg_time:.6f} 秒")
+
+
+    # print(vs_encoder_output)
+
+    # x = torch.rand((1, 3, 1024, 1024))
+
+    # output = hgsam_model.vision_encoder(x)
+    # print(type(output))
+
+    # # t_layer_0, block = hgsam_model.vision_encoder.layers[0]
+
+    # print(hgsam_model.vision_encoder.layers[0])
+
+    # for name, child in hgsam_model.vision_encoder.layers[0].named_children():
+    #     print('------')
+    #     print(name)
+    #     print('||')
+    #     print(child)
+    #     print('------')
+
+
+    # linear = hgsam_model.vision_encoder.layers[0].attn.qkv
+    # print(linear.bias)
+    # print(linear.weight)
+    # print(linear.in_features)
+    # print(linear.out_features)
+    # y = torch.rand(768)
+    # y_out = linear(y)
+    # print(y_out)
+
+    # for t_layer_i, blk in enumerate(hgsam_model.vision_encoder.layers):
+    #     w_qkv_linear = blk.attn.qkv.in_features
+    #     w_qkv_bias = blk.attn.qkv.bias
+    #     w_proj_linear = blk.attn.proj.weight
+    #     w_proj_bias = blk.attn.proj.bias
+    #     print(w_qkv_linear)
+    #     # print(w_qkv_linear.in_features)
+    #     print(w_qkv_bias.shape)
+    #     print(w_proj_linear.shape)
+    #     print(w_proj_bias.shape)
+    
+    # # 定义你的配置 (必须与训练时完全一致)
+    # LORA_RANK = 16
+    # LORA_ADD_CONV = True
+    # LORA_WEIGHTS_PATH = "./new_weights/neu_seg_output/neu_seg_finetue_loradsc_qv_encoder_20250712_044024.pth"
+    # DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+
+    # # 使用我们封装好的函数一步创建模型
+    # final_model = create_model_for_inference(model = model,
+    #                                          lora_rank = None,
+    #                                          lora_add_conv = None,
+    #                                         lora_weights_path=LORA_WEIGHTS_PATH,
+    #                                         device=DEVICE
+    #                                     )
