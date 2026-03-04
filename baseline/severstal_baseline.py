@@ -39,11 +39,11 @@ if __name__ == '__main__':
 
     model_choice = args.bse_model
 
-    hyperparameters['optimizer_name'] = "AdamW",
-    hyperparameters['scheduler_name'] = "cosine_scheduler",
-    hyperparameters['loss_fn_name'] = "monai.DiceCELoss",
+    hyperparameters['optimizer_name'] = "AdamW"
+    hyperparameters['scheduler_name'] = "cosine_scheduler"
+    hyperparameters['loss_fn_name'] = "monai.DiceCELoss"
     hyperparameters['task_name']= "severstal_" + args.bse_model
-    hyperparameters['output_dir'] = './new_weights/severstal_output/' + args.bse_model
+    hyperparameters['output_dir'] = './new_weights'
     if not args.infer_mode:
         model = create_bsl_model_from_type(args=args)
 
@@ -109,4 +109,3 @@ if __name__ == '__main__':
                                 loss_fn = criterion,  device = device, 
                                 results_filename="bsl_sever_evaluation_results.txt",
                                 eval_traindataset = True)
-

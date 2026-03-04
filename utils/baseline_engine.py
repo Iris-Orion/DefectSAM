@@ -1,7 +1,7 @@
+import os
 import pytz
 import torch
 import time
-import wandb
 import swanlab
 import baseline.modelLib as modelLib
 import argparse
@@ -18,11 +18,30 @@ def create_bsl_model_from_type(args: argparse.Namespace):
 
     model_map = {
         "vanilla_unet": lambda: modelLib.get_vanilla_unet(n_channels=3, num_classes=1),
-        "unet_res34": lambda: modelLib.get_smp_unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=3, classes=1, activation=None),
-        "deeplabv3plus_effb0": lambda: modelLib.get_smp_deeplabv3plus(encoder_name="efficientnet-b0", encoder_weights="imagenet", in_channels=3, classes=1, activation=None),
-        "deeplabv3plus_effb3": lambda: modelLib.get_smp_deeplabv3plus(encoder_name="efficientnet-b3", encoder_weights="imagenet", in_channels=3, classes=1, activation=None),
-        "segformer_b0": lambda: modelLib.build_segformer_model(encoder_name="mit_b0", encoder_weights="imagenet", in_channels=3, classes=1, activation=None),
-        "segformer_b2": lambda: modelLib.build_segformer_model(encoder_name="mit_b2", encoder_weights="imagenet", in_channels=3, classes=1, activation=None),
+        "unet_res34": lambda: modelLib.get_smp_unet(encoder_name="resnet34", 
+                                                    encoder_weights="imagenet", 
+                                                    in_channels=3, classes=1, 
+                                                    activation=None),
+        "deeplabv3plus_effb0": lambda: modelLib.get_smp_deeplabv3plus(encoder_name="efficientnet-b0", 
+                                                                      encoder_weights="imagenet", 
+                                                                      in_channels=3, 
+                                                                      classes=1, 
+                                                                      activation=None),
+        "deeplabv3plus_effb3": lambda: modelLib.get_smp_deeplabv3plus(encoder_name="efficientnet-b3", 
+                                                                      encoder_weights="imagenet", 
+                                                                      in_channels=3, 
+                                                                      classes=1, 
+                                                                      activation=None),
+        "segformer_b0": lambda: modelLib.build_segformer_model(encoder_name="mit_b0", 
+                                                               encoder_weights="imagenet", 
+                                                               in_channels=3, 
+                                                               classes=1, 
+                                                               activation=None),
+        "segformer_b2": lambda: modelLib.build_segformer_model(encoder_name="mit_b2", 
+                                                               encoder_weights="imagenet", 
+                                                               in_channels=3, 
+                                                               classes=1, 
+                                                               activation=None),
     }
 
     if model_choice not in model_map:
@@ -107,15 +126,6 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
     shanghai_tz = pytz.timezone('Asia/Shanghai')
     start_timestamp = datetime.now(shanghai_tz).strftime("%Y%m%d_%H%M%S")
 
-    # 2. 初始化 WandB (如果开启)
-    wandb_run = None
-    if hyperparameters.get('use_wandb', False):
-        wandb_run = wandb.init(
-            project=hyperparameters.get('wandb_project', 'retina_project'),
-            config=hyperparameters, # 自动记录所有超参数
-            name=f"{hyperparameters.get('task_name')}_{start_timestamp}"
-        )
-
     # Initialize SwanLab
     swanlab_run = None
     if hyperparameters.get('use_swanlab', False):
@@ -128,8 +138,17 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
     num_epochs = hyperparameters.get("num_epochs", 100)
     earlystop_PATIENCE = hyperparameters.get("patience", 10)
     earlystop_MIN_DELTA = hyperparameters.get("min_delta", 0.0001)
+    disable_early_stop = hyperparameters.get("disable_early_stop", False)
     task_name = hyperparameters.get("task_name", "unnamed_task")
     output_dir = hyperparameters.get('output_dir', "unset_output_dir")
+    model_choice = hyperparameters.get('bse_model', None)
+
+    # 统一保存目录结构: <dataset_dir>/<baseline_model>/
+    if model_choice:
+        normalized_dir = os.path.normpath(output_dir)
+        if os.path.basename(normalized_dir) != model_choice:
+            output_dir = os.path.join(output_dir, model_choice)
+            hyperparameters['output_dir'] = output_dir
 
     # 用于记录每个epoch的过程性结果
     history = {
@@ -169,19 +188,6 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
         history["val_dicescore"].append(avg_val_dicescore)
         history["val_ious"].append(avg_val_ious)
 
-        # 3. 将结果同步到 WandB
-        if wandb_run:
-            wandb.log({
-                "epoch": epoch + 1,
-                "train/loss": avg_train_loss,
-                "train/dice": avg_train_dicescore,
-                "train/iou": avg_train_ious,
-                "val/loss": avg_val_loss,
-                "val/dice": avg_val_dicescore,
-                "val/iou": avg_val_ious,
-                "learning_rate": optimizer.param_groups[0]['lr']
-            })
-
         if swanlab_run:
             swanlab.log({
                 "train/loss": avg_train_loss,
@@ -199,6 +205,16 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
             no_improve_epochs = 0
             best_epoch = epoch + 1
             history['best_epoch'] = best_epoch
+            history['best_metrics'] = {
+                "train_loss": avg_train_loss,
+                "train_dicescore": avg_train_dicescore,
+                "train_ious": avg_train_ious,
+                "val_loss": avg_val_loss,
+                "val_dicescore": avg_val_dicescore,
+                "val_ious": avg_val_ious,
+                "val_hd95": avg_val_hd95,
+                "learning_rate": optimizer.param_groups[0]['lr']
+            }
             
             print(f"Validation dice 改善到 {best_val_dice:.4f}. Saving model...")
             if save_best_model:
@@ -213,7 +229,15 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
             if swanlab_run:
                 swanlab.log({
                     "best_val_dicescore": best_val_dice,
-                    "best_epoch": best_epoch
+                    "best_epoch": best_epoch,
+                    "best/train_loss": avg_train_loss,
+                    "best/train_dice": avg_train_dicescore,
+                    "best/train_iou": avg_train_ious,
+                    "best/val_loss": avg_val_loss,
+                    "best/val_dice": avg_val_dicescore,
+                    "best/val_iou": avg_val_ious,
+                    "best/val_hd95": avg_val_hd95,
+                    "best/learning_rate": optimizer.param_groups[0]['lr']
                     })
         else:
             no_improve_epochs += 1
@@ -225,7 +249,7 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
             start_timestamp=start_timestamp, result_name=task_name, target_dir=output_dir
         )
 
-        if no_improve_epochs >= earlystop_PATIENCE:
+        if (not disable_early_stop) and (no_improve_epochs >= earlystop_PATIENCE):
             print(f"Early stopping triggered after {earlystop_PATIENCE} epochs without improvement.")
             break
             
@@ -248,12 +272,6 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
         hyperparameters=hyperparameters, results=history, epoch=output_data["last_completed_epoch"],
         start_timestamp=start_timestamp, result_name=task_name, target_dir=output_dir,
     )
-
-    # 4. 训练结束，记录最终测试结果并关闭
-    if wandb_run:
-        wandb.run.summary["best_val_dice"] = best_val_dice
-        wandb.run.summary["final_test_dice"] = final_test_dice
-        wandb.finish()
     
     if swanlab_run:
         swanlab.log({"final_test_dice": final_test_dice, 

@@ -19,7 +19,7 @@ class LoRACore(nn.Module):
         self.linear = qkv_layer
         if rank > 0:
             self.linear.weight.requires_grad = False
-        self.scale = self.lora_alpha / self.rank
+        self.scale = self.lora_alpha / self.rank if self.rank > 0 else 0.0
         
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
@@ -29,6 +29,84 @@ class LoRACore(nn.Module):
     
     def forward(self, x):
         raise NotImplementedError
+
+
+class LoRASam_Plus(LoRACore):
+    """
+    LoRA+ for SAM attention qkv projection.
+
+    说明：
+    - 结构上仍是标准 LoRA：ΔW = B @ A；
+    - LoRA+ 的核心在优化策略：A/B 使用不同学习率（通常 B 更大）；
+    - 本类提供 get_loraplus_param_groups 以便优化器直接使用不同 lr。
+    """
+    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout_rate=0,
+                 ft_q=True, ft_k=False, ft_v=True):
+        super().__init__(qkv_layer, merge, rank, lora_alpha, dropout_rate)
+        self.ft_q = ft_q
+        self.ft_k = ft_k
+        self.ft_v = ft_v
+
+        self.lora_a = nn.ModuleDict({})
+        self.lora_b = nn.ModuleDict({})
+
+        parts_to_finetune = []
+        if self.ft_q:
+            parts_to_finetune.append('q')
+        if self.ft_k:
+            parts_to_finetune.append('k')
+        if self.ft_v:
+            parts_to_finetune.append('v')
+
+        for part in parts_to_finetune:
+            self.lora_a[part] = nn.Linear(self.in_features, rank, bias=False)
+            self.lora_b[part] = nn.Linear(rank, self.out_features // 3, bias=False)
+
+        self.init_weights()
+
+    def init_weights(self):
+        if self.rank <= 0:
+            return
+        for part in self.lora_a.keys():
+            nn.init.kaiming_uniform_(self.lora_a[part].weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_b[part].weight)
+
+    def _get_delta(self, x, part: str):
+        return self.lora_b[part](self.lora_a[part](x)) * self.scale
+
+    def get_loraplus_param_groups(self, base_lr: float, lora_plus_lr_ratio: float = 16.0, weight_decay: float = 0.0):
+        """
+        返回 LoRA+ 推荐的参数组：A 用 base_lr，B 用 base_lr * lora_plus_lr_ratio。
+        可直接传给 torch.optim.Optimizer。
+        """
+        if self.rank <= 0:
+            return []
+
+        a_params, b_params = [], []
+        for part in self.lora_a.keys():
+            a_params.extend(self.lora_a[part].parameters())
+            b_params.extend(self.lora_b[part].parameters())
+
+        return [
+            {"params": a_params, "lr": base_lr, "weight_decay": weight_decay},
+            {"params": b_params, "lr": base_lr * lora_plus_lr_ratio, "weight_decay": weight_decay},
+        ]
+
+    def forward(self, x):
+        if self.rank > 0 and self.merge:
+            qkv = self.linear(x)
+            q, k, v = torch.chunk(qkv, 3, dim=-1)
+
+            if self.ft_q:
+                q = q + self._get_delta(x, 'q')
+            if self.ft_k:
+                k = k + self._get_delta(x, 'k')
+            if self.ft_v:
+                v = v + self._get_delta(x, 'v')
+
+            qkv_adjusted = torch.cat((q, k, v), dim=-1)
+            return self.dropout(qkv_adjusted)
+        return self.dropout(self.linear(x))
 
 class LoRASam_DepWiseConv(LoRACore):
     """
@@ -101,6 +179,59 @@ class LoRASam_DepWiseConv(LoRACore):
             return self.dropout(qkv_adjusted)
         else:
             return self.dropout(self.linear(x))
+
+
+class LoRASam_DepWiseConv_Gated(LoRASam_DepWiseConv):
+    """
+    最小改动版 Gated LoRA-DSC：
+    - 保持 LoRA 低秩分解不变；
+    - 在每个被微调分支(q/k/v)上引入可学习门控 gamma；
+    - 提供 LoRA+ 参数组接口（A 与 B/Conv/Gate 分组不同学习率）。
+    """
+    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout_rate=0,
+                 ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, gate_init: float = 1e-3):
+        super().__init__(
+            qkv_layer=qkv_layer,
+            merge=merge,
+            rank=rank,
+            lora_alpha=lora_alpha,
+            dropout_rate=dropout_rate,
+            ft_q=ft_q,
+            ft_k=ft_k,
+            ft_v=ft_v,
+            add_dsc_conv=add_dsc_conv,
+        )
+        self.gate = nn.ParameterDict({
+            part: nn.Parameter(torch.tensor(float(gate_init)))
+            for part in self.lora_a.keys()
+        })
+
+    def _get_delta(self, x, part: str):
+        delta = super()._get_delta(x, part)
+        return self.gate[part] * delta
+
+    def get_loraplus_param_groups(self, base_lr: float, lora_plus_lr_ratio: float = 16.0, weight_decay: float = 0.0):
+        """
+        LoRA+ 参数组：
+        - A: base_lr
+        - B + (DSC conv + gate): base_lr * ratio
+        """
+        if self.rank <= 0:
+            return []
+
+        a_params, b_side_params = [], []
+        for part in self.lora_a.keys():
+            a_params.extend(self.lora_a[part].parameters())
+            b_side_params.extend(self.lora_b[part].parameters())
+            if self.add_dsc_conv:
+                b_side_params.extend(self.lora_dw_conv[part].parameters())
+                b_side_params.extend(self.lora_pw_conv[part].parameters())
+            b_side_params.append(self.gate[part])
+
+        return [
+            {"params": a_params, "lr": base_lr, "weight_decay": weight_decay},
+            {"params": b_side_params, "lr": base_lr * lora_plus_lr_ratio, "weight_decay": weight_decay},
+        ]
 
 
 class LoRA_encoder_attn_Conv(nn.Module):
@@ -508,6 +639,69 @@ def get_loradsc_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, add_dsc_
                                               add_dsc_conv=add_dsc_conv)
     return hgsam_model
 
+def get_loradsc_gated_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, add_dsc_conv,
+                            gate_init: float = 1e-3, sam_type: str = "sam_base"):
+    """
+    Gated LoRA-DSC 版本 SAM。
+    """
+    if sam_type == "sam_base":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    elif sam_type == "sam_large":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
+    else:
+        raise ValueError(f"Unknown sam_type: {sam_type}")
+
+    for name, param in hgsam_model.named_parameters():
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+
+    for layers in hgsam_model.vision_encoder.layers:
+        layers.attn.qkv = LoRASam_DepWiseConv_Gated(
+            qkv_layer=layers.attn.qkv,
+            merge=True,
+            rank=rank,
+            lora_alpha=lora_alpha,
+            dropout_rate=dropout_rate,
+            ft_q=ft_q,
+            ft_k=ft_k,
+            ft_v=ft_v,
+            add_dsc_conv=add_dsc_conv,
+            gate_init=gate_init,
+        )
+    return hgsam_model
+
+def get_loraplus_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=False, ft_v=True, sam_type: str = "sam_base"):
+    """
+    构建 LoRA+ 版本 SAM。
+
+    说明：LoRA+ 的核心是优化阶段对 A/B 使用不同学习率。
+    模型注入后，请在优化器中调用 LoRASam_Plus.get_loraplus_param_groups。
+    """
+    if sam_type == "sam_base":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    elif sam_type == "sam_large":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
+    else:
+        raise ValueError(f"Unknown sam_type: {sam_type}")
+
+    for name, param in hgsam_model.named_parameters():
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+
+    for layers in hgsam_model.vision_encoder.layers:
+        layers.attn.qkv = LoRASam_Plus(
+            qkv_layer=layers.attn.qkv,
+            merge=True,
+            rank=rank,
+            lora_alpha=lora_alpha,
+            dropout_rate=dropout_rate,
+            ft_q=ft_q,
+            ft_k=ft_k,
+            ft_v=ft_v,
+        )
+
+    return hgsam_model
+
 def get_sam_loraconv_qv_vision_encoder(rank=16, lora_alpha=16, dropout=0.0, add_std_conv=False):
     """
     对选中的qv层进行lora分解, 根据add_conv参数决定是否加入标准卷积
@@ -644,8 +838,11 @@ if __name__ == "__main__":
     #                           ft_q = True, ft_k = False , ft_v = True, add_dsc_conv=False)
     # model = get_sam_loraDSC_qv_vision_encoder(rank=16, lora_alpha=16, dropout=0.0, add_dsc_conv=True)
 
-    model = loraConv_attnqkv(lora_rank=16, lora_alpha=16, dropout_rate=0.0, add_std_conv=False)
+    # model = loraConv_attnqkv(lora_rank=16, lora_alpha=16, dropout_rate=0.0, add_std_conv=False)
 
+    model = get_loradsc_gated_model(rank=16, lora_alpha=16, dropout_rate=0.0,
+                                       ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
+                                       gate_init=1e-3, sam_type="sam_base")
 
     for name, param in model.named_parameters():
         if 'lora' in name and param.requires_grad:

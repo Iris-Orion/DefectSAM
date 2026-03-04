@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import segmentation_models_pytorch as smp
+
 from torchvision import transforms
 from pathlib import Path
 from torchinfo import summary
@@ -338,12 +338,9 @@ def test_smp_on_severstal():
     # print(output)
 #------test_smp_on_severstal---------------------#
 
-
-
-
 if __name__ == "__main__":
-    # test_vanilla_unet()
-    test_smp_unet()
+    test_vanilla_unet()
+    # test_smp_unet()
     # test_smp_deeplabv3plus()
     # test_smp_on_severstal()
     # test_smp_segformer()

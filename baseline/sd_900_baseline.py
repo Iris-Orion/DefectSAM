@@ -33,13 +33,13 @@ if __name__ == '__main__':
     # logging.info(f"验证集: {get_image_names_from_subset(val_dataset)}")
     # logging.info(f"测试集: {get_image_names_from_subset(test_dataset)}")
 
-    test_sd900_info()
+    test_sd900_info(train_dataset)
 
     hyperparameters['optimizer'] = "AdamW"
     hyperparameters['scheduler'] = "cosine_scheduler"
     hyperparameters['loss_function'] = "monai.DiceCELoss"
     hyperparameters['task_name'] = "sd900_" + hyperparameters['bse_model']
-    hyperparameters['output_dir'] = "./new_weights/sd900_output"
+    hyperparameters['output_dir'] = "./new_weights"
 
     if not args.infer_mode:
         model = create_bsl_model_from_type(args=args)
@@ -86,6 +86,7 @@ if __name__ == '__main__':
             current_model = None # 初始化    
 
             print(f"================================================================")
+            print(f"==> Inferencing")
             print(f"==> Path: {checkpoint_path}")
             print(f"==> Loading Type: {loading_type}")
             print(f"================================================================")

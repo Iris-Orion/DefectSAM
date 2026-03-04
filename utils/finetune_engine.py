@@ -18,8 +18,29 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from utils.utils import compute_dice_score, compute_iou_score, save_model, save_training_logs, print_trainable_parameters
 from transformers import get_cosine_schedule_with_warmup
 from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric  # 导入monai的指标计算模块
-from utils.sam_arch import get_loradsc_model, get_sam_loraDSC_qv_vision_encoder, create_model_for_inference, loraConv_attnqkv
+from utils.sam_arch import get_loradsc_model, get_loradsc_gated_model, get_sam_loraDSC_qv_vision_encoder, create_model_for_inference, loraConv_attnqkv
 from utils.loratask import get_hf_lora_model, get_hf_adalora_model
+
+
+def debug_print_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None:
+    """
+    打印优化器中每个 param group 的关键信息，便于确认 LoRA+ 分组是否生效。
+    """
+    print("\n========== Optimizer Param Groups ==========")
+    total_params = 0
+    for group_idx, group in enumerate(optimizer.param_groups):
+        params = group.get("params", [])
+        param_count = sum(param.numel() for param in params)
+        tensor_count = len(params)
+        group_lr = group.get("lr", None)
+        group_wd = group.get("weight_decay", None)
+        total_params += param_count
+        print(
+            f"[Group {group_idx}] lr={group_lr:.6e} | wd={group_wd} | "
+            f"tensors={tensor_count} | params={param_count:,}"
+        )
+    print(f"Total params in optimizer groups: {total_params:,}")
+    print("===========================================\n")
 
 def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoader = None):
     """
@@ -43,6 +64,11 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
 
     if model_type == 'loradsc_qv':
         return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
+
+    elif model_type == 'loradsc_qv_gated':
+        return get_loradsc_gated_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+                                       ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
+                                       gate_init=1e-3, sam_type=sam_type)
     
     elif model_type == 'loradsc_q':
         return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True)
@@ -349,10 +375,34 @@ def run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
     warmup_ratio = hyperparameters['warmup_ratio']
     patience = hyperparameters['patience']
     min_delta = hyperparameters['min_delta']
+    use_loraplus_optim = hyperparameters.get('use_loraplus_optim', False)
+    lora_plus_lr_ratio = hyperparameters.get('lora_plus_lr_ratio', 16.0)
     use_early_stop = not hyperparameters.get('disable_early_stop', False)
-    
+
     trainable_parameters = [param for param in model.parameters() if param.requires_grad]      # 收集所有可训练的参数
-    optimizer = AdamW(trainable_parameters, lr=lr, weight_decay=wd)
+
+    optimizer = None
+    if use_loraplus_optim:
+        param_groups = []
+        for module in model.modules():
+            if hasattr(module, 'get_loraplus_param_groups') and callable(module.get_loraplus_param_groups):
+                param_groups.extend(
+                    module.get_loraplus_param_groups(
+                        base_lr=lr,
+                        lora_plus_lr_ratio=lora_plus_lr_ratio,
+                        weight_decay=wd,
+                    )
+                )
+        if param_groups:
+            optimizer = AdamW(param_groups)
+            print(f"Using LoRA+ optimizer param groups (ratio={lora_plus_lr_ratio}).")
+        else:
+            print("LoRA+ optimizer requested but no compatible modules found; fallback to standard AdamW.")
+
+    if optimizer is None:
+        optimizer = AdamW(trainable_parameters, lr=lr, weight_decay=wd)
+
+    debug_print_optimizer_param_groups(optimizer)
     # loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
     scaler = torch.cuda.amp.GradScaler(enabled=True)  # 混合精度训练
 

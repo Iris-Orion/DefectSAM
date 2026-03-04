@@ -9,6 +9,7 @@ def get_bse_args():
 
     parser.add_argument('--patience', type=int, default=10, help='早停容忍的epoch数')
     parser.add_argument('--min_delta', type=float, default=0.0001, help='验证指标提升的最小阈值')
+    parser.add_argument('--disable_early_stop', action='store_true', help='关闭早停以进行全周期训练')
 
     parser.add_argument('--device_id', type=int, default=0, help='gpu id')
     parser.add_argument('--num_workers', type=int, default=4, help='num_workers')
@@ -17,8 +18,8 @@ def get_bse_args():
     parser.add_argument('--save_bse_model', action='store_true', help='是否保存baseline模型')
     parser.add_argument('--infer_mode', action="store_true", help='推理模式')
 
-    parser.add_argument('--use_wandb', action='store_true', help='是否使用 wandb 记录')
-    parser.add_argument('--wandb_project', type=str, default='Retina_Blood_Vessel_Baseline', help='wandb项目名称')
+    parser.add_argument('--use_swanlab', action='store_true', help='是否使用 swanlab 记录')
+    parser.add_argument('--swanlab_project', type=str, default='input your project name', help='swanlab项目名称')
     bse_args = parser.parse_args()  
 
     return bse_args
@@ -42,6 +43,8 @@ def add_common_ft_args(parser):
     parser.add_argument('--lora_rank', type=int, default=16, help='LoRA 的秩 (rank)')
     parser.add_argument('--lora_alpha', type=int, default=16, help='LoRA 的 alpha 值')
     parser.add_argument('--lora_dropout', type=float, default=0.0, help='LoRA 的 dropout 比例')
+    parser.add_argument('--use_loraplus_optim', action='store_true', help='是否启用 LoRA+ 优化器参数组')
+    parser.add_argument('--lora_plus_lr_ratio', type=float, default=16.0, help='LoRA+ 中 B 组学习率相对 A 组的倍数')
 
     # 环境与设备
     parser.add_argument('--device_id', type=int, default=0, help='训练使用的设备ID (GPU)')
@@ -57,8 +60,8 @@ def add_common_ft_args(parser):
     parser.add_argument('--infer_mode', action="store_true", help='是否在训练中引入无缺陷样本进行推理式评估')
     parser.add_argument('--zero_shot', action="store_true", help='是否进行zero-shot评估')
 
-    parser.add_argument('--use_swanlab', action='store_true', help='是否使用 wandb 记录')
-    parser.add_argument('--swanlab_project', type=str, default='input your project name', help='wandb项目名称')
+    parser.add_argument('--use_swanlab', action='store_true', help='是否使用 swanlab 记录')
+    parser.add_argument('--swanlab_project', type=str, default='input your project name', help='swanlab项目名称')
 
     # sam模型大小选择
     parser.add_argument('--sam_type', type=str, default="sam_base", help='sam模型大小选择')
@@ -98,6 +101,7 @@ def get_severstal_bsl_args():
 
     parser.add_argument('--patience', type=int, default=10, help='早停容忍的epoch数')
     parser.add_argument('--min_delta', type=float, default=0.0001, help='验证指标提升的最小阈值')
+    parser.add_argument('--disable_early_stop', action='store_true', help='关闭早停以进行全周期训练')
 
     parser.add_argument('--device_id', type=int, default=2, help='gpu id')
     parser.add_argument('--num_workers', type=int, default=4, help='num_workers')
@@ -105,6 +109,8 @@ def get_severstal_bsl_args():
 
     parser.add_argument('--save_bse_model', action='store_true', help='是否保存baseline模型')
     parser.add_argument('--infer_mode', action="store_true", help='推理模式')
+    parser.add_argument('--use_swanlab', action='store_true', help='是否使用 swanlab 记录')
+    parser.add_argument('--swanlab_project', type=str, default='input your project name', help='swanlab项目名称')
 
     # 添加Severstal特有的参数
     parser.add_argument('--include_no_defect', action="store_true", help='是否在训练中引入无缺陷样本')
