@@ -6,7 +6,7 @@ from transformers import SamModel
 from utils.finetune_engine import run_finetune_engine, inference_engine, _process_batch, zero_shot, create_model_from_type
 from utils.helper_function import set_seed
 from utils.config import get_common_ft_args
-from data.data_utils_ft import create_retina_dataset_ft
+from data.retina_dataset import create_retina_dataset_ft
 
 from weights.weights_dict_dhs_sd900 import sd900_dict, scale_sd900_dict, new_sd900_dict, sam_sd900_dict
 

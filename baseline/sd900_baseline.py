@@ -9,7 +9,7 @@ from transformers import get_cosine_schedule_with_warmup
 from utils.helper_function import set_seed
 from utils.baseline_engine import baseline_experiment, bsl_inference_engine, create_bsl_model_from_type
 from utils.config import get_bse_args
-from data.data_utils_baseline import sd900_bsl_create_dataset, get_label_distribution, test_sd900_info
+from data.sd900_dataset import sd900_bsl_create_dataset, get_label_distribution, test_sd900_info
 
 from weights.weights_dict_dhs_sd900 import bsl_sd900_dict
 
@@ -64,7 +64,7 @@ if __name__ == '__main__':
         
         device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
 
-        baseline_experiment( model = model, 
+        baseline_experiment( model = model,
                             device = device,
                             train_loader = train_loader,
                             val_loader = val_loader,
@@ -73,7 +73,8 @@ if __name__ == '__main__':
                             optimizer = optimizer,
                             scheduler = cosine_scheduler,
                             hyperparameters = hyperparameters,
-                            save_best_model = args.save_bse_model
+                            save_best_model = args.save_bse_model,
+                            scheduler_per_batch = True
                             )
     
     else:

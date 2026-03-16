@@ -3,7 +3,7 @@ import torch
 import monai
 from torch.utils.data import  DataLoader
 
-from data.data_utils_ft import floodseg_create_dataset
+from data.floodseg_ft import floodseg_create_dataset
 from utils.helper_function import set_seed
 from utils.config import get_common_ft_args
 from utils.finetune_engine import create_model_from_type, _process_batch_with_point_grid, run_finetune_engine, inference_engine
