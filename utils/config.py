@@ -57,6 +57,7 @@ def add_common_ft_args(parser):
     
     # 推理与数据模式
     parser.add_argument('--auto_seg', action="store_true", help='是否自动分割而不使用prompt')
+    parser.add_argument('--sam_style_train', action="store_true", help='使用SAM原始多prompt多轮迭代训练策略')
     parser.add_argument('--infer_mode', action="store_true", help='是否在训练中引入无缺陷样本进行推理式评估')
     parser.add_argument('--zero_shot', action="store_true", help='是否进行zero-shot评估')
 

@@ -63,10 +63,11 @@ class SDsaliency900Dataset_BSL(Dataset):
 class SDsaliency900Dataset_FT(Dataset):
     """SAM finetune 使用"""
 
-    def __init__(self, source_dir, ground_truth_dir, transforms: A.Compose):
+    def __init__(self, source_dir, ground_truth_dir, transforms: A.Compose, is_train=True):
         self.source_dir = source_dir
         self.ground_truth_dir = ground_truth_dir
         self.transforms = transforms
+        self.is_train = is_train
 
         self.image_names = sorted([f for f in os.listdir(source_dir) if f.endswith('.bmp')])
         self.labels = []
@@ -101,13 +102,21 @@ class SDsaliency900Dataset_FT(Dataset):
 
         resized_img = self.letterbox_imagenp(image, [1024, 1024])
         resized_mask = self.letterbox_mask_1ch(mask, [1024, 1024])
-        bbox = get_bounding_box(resized_mask)
-        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
 
         if self.transforms:
             augmented = self.transforms(image=resized_img, mask=resized_mask)
             image_tensor = augmented['image'] / 255.0
             mask_tensor = augmented['mask'] / 255.0
+        else:
+            image_tensor = torch.from_numpy(resized_img.transpose(2, 0, 1)).float() / 255.0
+            mask_tensor = torch.from_numpy(resized_mask).float() / 255.0
+
+        # bbox 在数据增强之后从变换后的 mask 上计算，确保与增强后的空间位置一致
+        mask_np_for_bbox = (mask_tensor.numpy() * 255).astype(np.uint8)
+        if mask_np_for_bbox.ndim == 3:
+            mask_np_for_bbox = mask_np_for_bbox[0]
+        bbox = get_bounding_box(mask_np_for_bbox, perturb=self.is_train)
+        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
 
         return {
             "image": image_tensor.float(),
@@ -191,7 +200,7 @@ def sd900_bsl_create_dataset():
     return train_dataset, val_dataset, test_dataset, labels
 
 
-def sd_900_finetune_create_dataset(
+def sd900_finetune_create_dataset(
     sd900_src_dir='./data/sd900/Source Images',
     sd900_gt_dir='./data/sd900/Ground truth',
     split_seed=42,
@@ -205,8 +214,8 @@ def sd_900_finetune_create_dataset(
     train_indices, val_indices, test_indices = split_stratified_6_2_2(labels, seed=split_seed)
 
     train_transforms, val_test_transforms = get_sd900_albumentation_transforms_ft()
-    train_full_dataset = SDsaliency900Dataset_FT(source_dir=sd900_src_dir, ground_truth_dir=sd900_gt_dir, transforms=train_transforms)
-    val_test_full_dataset = SDsaliency900Dataset_FT(source_dir=sd900_src_dir, ground_truth_dir=sd900_gt_dir, transforms=val_test_transforms)
+    train_full_dataset = SDsaliency900Dataset_FT(source_dir=sd900_src_dir, ground_truth_dir=sd900_gt_dir, transforms=train_transforms, is_train=True)
+    val_test_full_dataset = SDsaliency900Dataset_FT(source_dir=sd900_src_dir, ground_truth_dir=sd900_gt_dir, transforms=val_test_transforms, is_train=False)
 
     train_dataset = torch.utils.data.Subset(train_full_dataset, train_indices)
     val_dataset = torch.utils.data.Subset(val_test_full_dataset, val_indices)
@@ -214,7 +223,7 @@ def sd_900_finetune_create_dataset(
     return train_dataset, val_dataset, test_dataset
 
 
-def sd_900_finetune_create_dataloader(args, train_dataset, val_dataset, test_dataset):
+def sd900_finetune_create_dataloader(args, train_dataset, val_dataset, test_dataset):
     batch_size = args.batch_size
     num_workers = args.num_workers
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)

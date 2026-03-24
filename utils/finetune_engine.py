@@ -14,11 +14,20 @@ from datetime import datetime
 from transformers import SamModel
 from peft import PeftModel, PeftConfig
 from torch.utils.data import DataLoader
+from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
 from torch.profiler import profile, record_function, ProfilerActivity
-from utils.utils import compute_dice_score, compute_iou_score, save_model, save_training_logs, print_trainable_parameters
 from transformers import get_cosine_schedule_with_warmup
-from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric  # 导入monai的指标计算模块
-from utils.sam_arch import get_loradsc_model, get_loradsc_gated_model, get_sam_loraDSC_qv_vision_encoder, create_model_for_inference, loraConv_attnqkv
+from utils.utils import (compute_dice_score, 
+                         compute_iou_score, 
+                         save_model, 
+                         save_training_logs, 
+                         print_trainable_parameters)
+
+from utils.sam_arch import (get_loradsc_model, 
+                            get_loradsc_gated_model, 
+                            get_sam_loraDSC_qv_vision_encoder, 
+                            create_model_for_inference, 
+                            loraConv_attnqkv)
 from utils.loratask import get_hf_lora_model, get_hf_adalora_model
 
 
@@ -208,7 +217,7 @@ def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, off
     else:
         bboxes = batch["bbox"].unsqueeze(1).to(device)   #box prompt
 
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    with torch.amp.autocast(device_type="cuda"):
         outputs = model(pixel_values=images, input_boxes=bboxes, multimask_output=False)
         predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
 
@@ -225,7 +234,189 @@ def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, off
 
     return loss, predicted_masks, gt_downsampled
 
-def _process_batch_with_point_grid(batch, model, loss_fn, device, use_amp, 
+
+def _sample_points_from_mask(gt_mask, num_points=1, sample_from='foreground'):
+    """
+    从GT mask中采样点坐标，模拟SAM原始训练中的point prompt。
+    Args:
+        gt_mask: [H, W] numpy array 或 tensor, 二值mask
+        num_points: 采样点数
+        sample_from: 'foreground' 从前景采样, 'error_region' 从预测错误区域采样
+    Returns:
+        coords: [num_points, 2] numpy array, (x, y) 格式
+        labels: [num_points] numpy array, 1=前景, 0=背景
+    """
+    if isinstance(gt_mask, torch.Tensor):
+        gt_mask = gt_mask.cpu().numpy()
+    if gt_mask.ndim == 3:
+        gt_mask = gt_mask[0]
+
+    fg_indices = np.argwhere(gt_mask > 0.5)  # [N, 2] -> (y, x)
+    bg_indices = np.argwhere(gt_mask <= 0.5)
+
+    coords = []
+    labels = []
+
+    if sample_from == 'foreground' and len(fg_indices) > 0:
+        chosen = fg_indices[np.random.choice(len(fg_indices), size=min(num_points, len(fg_indices)), replace=False)]
+        for yx in chosen:
+            coords.append([yx[1], yx[0]])  # (x, y)
+            labels.append(1)
+    elif len(bg_indices) > 0:
+        chosen = bg_indices[np.random.choice(len(bg_indices), size=min(num_points, len(bg_indices)), replace=False)]
+        for yx in chosen:
+            coords.append([yx[1], yx[0]])
+            labels.append(0)
+
+    # 如果采样不足（极端情况），用零填充
+    while len(coords) < num_points:
+        coords.append([0, 0])
+        labels.append(0)
+
+    return np.array(coords, dtype=np.float32), np.array(labels, dtype=np.int64)
+
+
+def _sample_correction_points(pred_mask, gt_mask, num_points=1):
+    """
+    从上一轮预测的错误区域采样纠正点（SAM多轮迭代的核心）。
+    假阳性区域采样背景点(label=0)，假阴性区域采样前景点(label=1)。
+    """
+    if isinstance(pred_mask, torch.Tensor):
+        pred_mask = (torch.sigmoid(pred_mask) > 0.5).float().cpu().numpy()
+    if isinstance(gt_mask, torch.Tensor):
+        gt_mask = gt_mask.cpu().numpy()
+    if pred_mask.ndim == 3:
+        pred_mask = pred_mask[0]
+    if gt_mask.ndim == 3:
+        gt_mask = gt_mask[0]
+
+    false_negative = (gt_mask > 0.5) & (pred_mask < 0.5)  # 漏检
+    false_positive = (gt_mask < 0.5) & (pred_mask > 0.5)  # 误检
+
+    fn_indices = np.argwhere(false_negative)
+    fp_indices = np.argwhere(false_positive)
+
+    coords = []
+    labels = []
+
+    # 优先从较大的错误区域采样
+    if len(fn_indices) >= len(fp_indices) and len(fn_indices) > 0:
+        chosen = fn_indices[np.random.choice(len(fn_indices), size=min(num_points, len(fn_indices)), replace=False)]
+        for yx in chosen:
+            coords.append([yx[1], yx[0]])
+            labels.append(1)  # 前景纠正点
+    elif len(fp_indices) > 0:
+        chosen = fp_indices[np.random.choice(len(fp_indices), size=min(num_points, len(fp_indices)), replace=False)]
+        for yx in chosen:
+            coords.append([yx[1], yx[0]])
+            labels.append(0)  # 背景纠正点
+
+    while len(coords) < num_points:
+        coords.append([0, 0])
+        labels.append(0)
+
+    return np.array(coords, dtype=np.float32), np.array(labels, dtype=np.int64)
+
+
+def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
+                             auto_seg=False, offset_info=None,
+                             prompt_probs=(0.5, 0.3, 0.2),
+                             num_iter_rounds=3,
+                             num_points=1):
+    """
+    复刻SAM原始训练流程的process_batch分支。
+
+    核心逻辑:
+      1. 第一轮: 随机选择 prompt 类型 (box / point / no_prompt)
+         - box: 从GT mask提取bbox (扰动已在dataset中完成)
+         - point: 从GT前景区域随机采样点
+         - no_prompt: 不提供任何prompt (概率较低)
+      2. 后续轮次: 将上一轮的pred mask logits作为mask prompt送回，
+         同时从预测错误区域采样纠正点
+      3. 只对最后一轮计算loss并反向传播，前面的轮次用no_grad节省显存
+
+    Args:
+        prompt_probs: (box_prob, point_prob, no_prompt_prob) 三种prompt的采样概率
+        num_iter_rounds: 迭代轮数 (SAM论文中默认用了多轮)
+        num_points: 每轮采样的点数
+    """
+    images = batch["image"].to(device)
+    ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)  # [B, 1, H, W]
+    batch_size = images.shape[0]
+
+    gt_downsampled = F.interpolate(ground_truth_masks, size=(256, 256), mode="nearest")  # [B, 1, 256, 256]
+
+    # 随机选择第一轮的prompt类型
+    prompt_type = np.random.choice(['box', 'point', 'no_prompt'], p=prompt_probs)
+
+    prev_masks_logits = None  # 上一轮的预测logits，用作mask prompt
+    is_last_round = (num_iter_rounds == 1)
+
+    for round_idx in range(num_iter_rounds):
+        is_last_round = (round_idx == num_iter_rounds - 1)
+        input_boxes = None
+        input_points = None
+        input_labels = None
+
+        # 构造当前轮的prompt
+        if round_idx == 0:
+            if prompt_type == 'box':
+                input_boxes = batch["bbox"].unsqueeze(1).to(device)  # [B, 1, 4]
+            elif prompt_type == 'point':
+                all_coords = []
+                all_labels = []
+                for b in range(batch_size):
+                    gt_1024 = ground_truth_masks[b, 0].cpu().numpy()
+                    coords, labs = _sample_points_from_mask(gt_1024, num_points=num_points, sample_from='foreground')
+                    all_coords.append(coords)
+                    all_labels.append(labs)
+                input_points = torch.tensor(np.stack(all_coords), dtype=torch.float32, device=device).unsqueeze(1)
+                input_labels = torch.tensor(np.stack(all_labels), dtype=torch.long, device=device).unsqueeze(1)
+            # else: no_prompt -> 全部为None
+        else:
+            # 后续轮次：从错误区域采样纠正点
+            all_coords = []
+            all_labels = []
+            for b in range(batch_size):
+                coords, labs = _sample_correction_points(
+                    prev_masks_logits[b], gt_downsampled[b],
+                    num_points=num_points
+                )
+                coords = coords * 4.0  # 256 -> 1024
+                all_coords.append(coords)
+                all_labels.append(labs)
+            input_points = torch.tensor(np.stack(all_coords), dtype=torch.float32, device=device).unsqueeze(1)
+            input_labels = torch.tensor(np.stack(all_labels), dtype=torch.long, device=device).unsqueeze(1)
+
+        if not is_last_round:
+            # 前面的轮次不需要梯度，只生成mask prompt，大幅节省显存
+            with torch.no_grad():
+                with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                    outputs = model(
+                        pixel_values=images,
+                        input_boxes=input_boxes,
+                        input_points=input_points,
+                        input_labels=input_labels,
+                        multimask_output=False,
+                    )
+                    prev_masks_logits = outputs.pred_masks.squeeze(1).detach()  # [B, 1, 256, 256]
+        else:
+            # 最后一轮：保留梯度，计算loss
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                outputs = model(
+                    pixel_values=images,
+                    input_boxes=input_boxes,
+                    input_points=input_points,
+                    input_labels=input_labels,
+                    multimask_output=False,
+                )
+                predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
+                loss = loss_fn(predicted_masks, gt_downsampled)
+
+    return loss, predicted_masks, gt_downsampled
+
+
+def _process_batch_with_point_grid(batch, model, loss_fn, device, use_amp,
                                    auto_seg=True, points_per_side=16, offset_info = None):
     """
     使用密集点网格作为提示进行边缘检测微调
@@ -274,18 +465,33 @@ def _process_batch_with_point_grid(batch, model, loss_fn, device, use_amp,
 
     return loss, predicted_masks, gt_downsampled
 
-def _train_one_epoch(model, dataloader, optimizer, scheduler, loss_fn, procees_batch_fn, scaler, device, auto_seg = False, offset_info=None):
+def _train_one_epoch(model, 
+                     dataloader, 
+                     optimizer, 
+                     scheduler, 
+                     loss_fn, 
+                     procees_batch_fn, 
+                     scaler, device, 
+                     auto_seg = False, 
+                     offset_info=None):
     """
     执行一个完整的训练 epoch。
     """
     model.train()
     total_loss, total_dice, total_iou = 0, 0, 0
+    hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
     use_amp = scaler is not None
 
     for batch in tqdm(dataloader, desc="Training"):
         optimizer.zero_grad()
 
-        loss, pred_masks, gt = procees_batch_fn(batch, model, loss_fn, device, use_amp, auto_seg = auto_seg, offset_info = offset_info)
+        loss, pred_masks, gt = procees_batch_fn(batch, 
+                                                model, 
+                                                loss_fn, 
+                                                device, 
+                                                use_amp, 
+                                                auto_seg = auto_seg, 
+                                                offset_info = offset_info)
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -300,37 +506,60 @@ def _train_one_epoch(model, dataloader, optimizer, scheduler, loss_fn, procees_b
         total_loss += loss.item()
         total_dice += compute_dice_score(pred_masks, gt)
         total_iou += compute_iou_score(pred_masks, gt)
+        hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().cpu(), y=gt.cpu())
 
     avg_loss = total_loss / len(dataloader)
     avg_dice = total_dice / len(dataloader)
     avg_iou = total_iou / len(dataloader)
+    avg_hd95 = hd95_metric.aggregate().item()
+    hd95_metric.reset()
 
-    return avg_loss, avg_dice, avg_iou
+    return avg_loss, avg_dice, avg_iou, avg_hd95
 
-def _evaluate(model, dataloader, loss_fn, procees_batch_fn, device, scaler, auto_seg = False, offset_info = None):
+def _evaluate(model, 
+              dataloader, 
+              loss_fn, 
+              procees_batch_fn, 
+              device, scaler, 
+              auto_seg = False, 
+              offset_info = None):
     """
-    在验证集上评估模型。
+    评估模型。
     """
     model.eval()
     total_loss, total_dice, total_iou = 0, 0, 0
+    hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
     use_amp = scaler is not None
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            loss, pred_masks, gt = procees_batch_fn(batch, model, loss_fn, device, use_amp, auto_seg = auto_seg, offset_info = offset_info)
+            loss, pred_masks, gt = procees_batch_fn(batch, 
+                                                    model, 
+                                                    loss_fn, 
+                                                    device, 
+                                                    use_amp, 
+                                                    auto_seg = auto_seg, 
+                                                    offset_info = offset_info)
             
             total_loss += loss.item()
             total_dice += compute_dice_score(pred_masks, gt)
             total_iou += compute_iou_score(pred_masks, gt)
+            hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().cpu(), y=gt.cpu())
 
     avg_loss = total_loss / len(dataloader)
     avg_dice = total_dice / len(dataloader)
     avg_iou = total_iou / len(dataloader)
+    avg_hd95 = hd95_metric.aggregate().item()
+    hd95_metric.reset()
 
-    return avg_loss, avg_dice, avg_iou
+    return avg_loss, avg_dice, avg_iou, avg_hd95
 
-def run_finetune_engine(train_dataloader, val_dataloader, test_dataloader, 
-                        model, device, hyperparameters, 
+def run_finetune_engine(train_dataloader, 
+                        val_dataloader, 
+                        test_dataloader, 
+                        model, 
+                        device,
+                        hyperparameters, 
                         process_batch_fn,
                         loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean'), 
                         save_dir = "./new_weights/unspec_output", auto_seg=False):
@@ -418,9 +647,12 @@ def run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
         num_cycles = 0.5
     )
 
-    history = {"train_loss": [], "train_dicescore": [], "train_ious": [],"val_loss": [], "val_dicescore": [], "val_ious": []}
-    best_val_dicescore = 0.0    # 记录最好的val_dicescore   TODO: 思考是用最小的loss的那一轮还是最大的dice score的那一轮
-    no_improve_epochs = 0       # 连续无改进的 epoch 计数
+    history = {
+        "train_loss": [], "train_dice": [], "train_iou": [], "train_hd95": [],
+        "val_loss": [], "val_dice": [], "val_iou": [], "val_hd95": [],
+    }
+    best_val_dicescore = 0.0
+    no_improve_epochs = 0
     best_epoch = -1
     best_model_path = None
 
@@ -442,46 +674,59 @@ def run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
     for epoch in range(num_epochs):
         print(f"--- Epoch {epoch + 1}/{num_epochs} ---")
 
-        train_loss, train_dicescore, train_ious = _train_one_epoch(model, train_dataloader, optimizer, 
+        train_loss, train_dice, train_iou, train_hd95 = _train_one_epoch(model, train_dataloader, optimizer,
                                                                    cosine_scheduler, loss_fn, process_batch_fn, scaler, device, auto_seg = auto_seg, offset_info = offset_info)
-        print(f"Training loss: {train_loss:.4f}, train dice score: {train_dicescore:.4f}, train iou: {train_ious:.4f}")         # training
+        print(f"Training loss: {train_loss:.4f}, train dice: {train_dice:.4f}, train iou: {train_iou:.4f}, train hd95: {train_hd95:.4f}")
 
         for i, param_group in enumerate(optimizer.param_groups):
-            print(f"Current learning rate (param_group {i}): {param_group['lr']:.6e}")  # 打印一个batch之后此时的学习率
+            print(f"Current learning rate (param_group {i}): {param_group['lr']:.6e}")
 
-        val_loss, val_dicescore, val_ious = _evaluate(model, val_dataloader, loss_fn, process_batch_fn,
+        val_loss, val_dice, val_iou, val_hd95 = _evaluate(model, val_dataloader, loss_fn, process_batch_fn,
                                                       device, scaler, auto_seg = auto_seg, offset_info=offset_info)
-        print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dicescore:.4f}, Val IoU: {val_ious:.4f}')          #validation
+        print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val HD95: {val_hd95:.4f}')
 
         history["train_loss"].append(train_loss)
-        history["train_dicescore"].append(train_dicescore)
-        history["train_ious"].append(train_ious)
+        history["train_dice"].append(train_dice)
+        history["train_iou"].append(train_iou)
+        history["train_hd95"].append(train_hd95)
         history["val_loss"].append(val_loss)
-        history["val_dicescore"].append(val_dicescore)
-        history["val_ious"].append(val_ious)
+        history["val_dice"].append(val_dice)
+        history["val_iou"].append(val_iou)
+        history["val_hd95"].append(val_hd95)
 
-        # 3. 将结果同步到 WandB
         if swanlab_run:
             swanlab.log({
                 "train/loss": train_loss,
-                "train/dice": train_dicescore,
-                "train/iou": train_ious,
+                "train/dice": train_dice,
+                "train/iou": train_iou,
+                "train/hd95": train_hd95,
                 "val/loss": val_loss,
-                "val/dice": val_dicescore,
-                "val/iou": val_ious,
+                "val/dice": val_dice,
+                "val/iou": val_iou,
+                "val/hd95": val_hd95,
                 "learning_rate": optimizer.param_groups[0]['lr']
             }, step=epoch+1)
 
-        improved = val_dicescore - best_val_dicescore > min_delta
+        improved = val_dice - best_val_dicescore > min_delta
         if improved:
-            best_val_dicescore = val_dicescore
+            best_val_dicescore = val_dice
             no_improve_epochs = 0
             best_epoch = epoch + 1
             history['best_epoch'] = best_epoch
+            history['best_metrics'] = {
+                "train_loss": train_loss,
+                "train_dice": train_dice,
+                "train_iou": train_iou,
+                "train_hd95": train_hd95,
+                "val_loss": val_loss,
+                "val_dice": val_dice,
+                "val_iou": val_iou,
+                "val_hd95": val_hd95,
+            }
             print(f"验证 dice 改善到 {best_val_dicescore:.4f}, 保存模型...")
             best_model_path = save_model( hyperparameters=hyperparameters,
-                                            start_timestamp = start_timestamp, 
-                                            model=model, 
+                                            start_timestamp = start_timestamp,
+                                            model=model,
                                             optimizer=optimizer,
                                             scaler=scaler,
                                             epoch = epoch+1,
@@ -489,10 +734,17 @@ def run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
                                             target_dir= save_dir,
                                             SAVE_HUGGINGFACE_PRETRAINED_MODEL = SAVE_HUGGINGFACE_PRETRAINED_MODEL,
                                             save_lora_only=save_lora_only)
-            if swanlab:
+            if swanlab_run:
                 swanlab.log({
-                    "best_val_dicescore": best_val_dicescore,
-                    "best_epoch": best_epoch
+                    "best_epoch": best_epoch,
+                    "best/train_loss": train_loss,
+                    "best/train_dice": train_dice,
+                    "best/train_iou": train_iou,
+                    "best/train_hd95": train_hd95,
+                    "best/val_loss": val_loss,
+                    "best/val_dice": val_dice,
+                    "best/val_iou": val_iou,
+                    "best/val_hd95": val_hd95,
                     })
         else:
             if use_early_stop:
@@ -510,9 +762,6 @@ def run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
         if use_early_stop and no_improve_epochs >= patience:
             print(f"验证指标连续 {patience} 个 epoch 无改善，提前停止训练。")
             break
-        # --- 训练结束后，使用最佳模型进行最终评估 ---
-    # 4. 训练结束，记录最终测试结果并关闭
-
 
     print("\n--- Training finished. Starting final evaluation with the best model. ---")
     if not best_model_path:
@@ -541,13 +790,14 @@ def run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
             print("Successfully loaded model from standard PyTorch checkpoint.")
 
     # 在测试集上评估
-    final_test_loss, final_test_dice, final_test_iou = _evaluate(loaded_model, test_dataloader, loss_fn, process_batch_fn, device, scaler, auto_seg=auto_seg, offset_info = offset_info)
-    print(f'Final Test Set Evaluation: Loss: {final_test_loss:.4f}, Dice: {final_test_dice:.4f}, IoU: {final_test_iou:.4f}')
-    history["final_test_metrics"]={"loss": final_test_loss, "dice": final_test_dice, "iou": final_test_iou}
+    final_test_loss, final_test_dice, final_test_iou, final_test_hd95 = _evaluate(loaded_model, test_dataloader, loss_fn, process_batch_fn, device, scaler, auto_seg=auto_seg, offset_info = offset_info)
+    print(f'Final Test Set Evaluation: Loss: {final_test_loss:.4f}, Dice: {final_test_dice:.4f}, IoU: {final_test_iou:.4f}, HD95: {final_test_hd95:.4f}')
+    history["final_test_metrics"]={"loss": final_test_loss, "dice": final_test_dice, "iou": final_test_iou, "hd95": final_test_hd95}
 
     if swanlab_run:
-        swanlab.log({"final_test_dice": final_test_dice, 
-                     "final_test_iou": final_test_iou})
+        swanlab.log({"test/test_dice": final_test_dice,
+                     "test/test_iou": final_test_iou,
+                     "test/test_hd95": final_test_hd95})
         swanlab.finish()
 
     # 将最终结果保存到日志文件中

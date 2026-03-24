@@ -8,7 +8,7 @@ import pytz
 import json
 from datetime import datetime
 
-###--------------- 自定义Loss ------------------###
+
 class DiceLoss(nn.Module):
     """
     在计算 Dice Loss 时，不应对预测值进行二值化，因为这会导致梯度为零，
@@ -32,7 +32,6 @@ class DiceLoss(nn.Module):
         
         return dice_loss
 
-#PyTorch
 class DiceBCELoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
         super(DiceBCELoss, self).__init__()
@@ -95,10 +94,6 @@ class MultiClassDiceLoss(nn.Module):
             dice_loss += 1 - dice
         return dice_loss / target.shape[1]
 
-###--------------- 自定义Loss ------------------###
-
-
-###--------------- 自定义评估指标 ------------------###
 def compute_dice_score(pred, target, epsilon=1e-6, threshold = 0.5):
     """
     计算dice score
@@ -136,25 +131,6 @@ def compute_iou_score(pred, target, epsilon=1e-6, threshold=0.5):
 
     iou = (intersection + epsilon) / (union + epsilon)  # 计算IOU
     return iou.item()
-###--------------- 自定义评估指标 ------------------###
-
-
-###--------------- 自定义评估指标 ------------------###
-def compute_dice_score_onSam(pred, target, epsilon=1e-6):
-    """
-    该函数已经弃用
-    计算直接sam输出的mask与ground truth的 dice score, 
-    pred, target 均为 0/1 或 bool 类型的二值掩码
-    """
-    # 确保都是 float 类型
-    pred = pred.view(-1).float()
-    target = target.view(-1).float()
-
-    intersection = (pred * target).sum()
-    union = pred.sum() + target.sum()
-    dice = (2.0 * intersection + epsilon) / (union + epsilon)
-    return dice.item()
-###--------------- 自定义评估指标 ------------------###
 
 def save_lora_parameters(model: torch.nn.Module, filename: str) -> None:
     """
@@ -176,14 +152,12 @@ def save_lora_parameters(model: torch.nn.Module, filename: str) -> None:
     torch.save(lora_state_dict, filename)
     print(f"成功将 {len(lora_state_dict)} 个LoRA层对应的参数张量保存到 {filename}")
 
-
-###--------------- 保存模型 ------------------###
 def save_model(hyperparameters,
-               start_timestamp, # 训练开始时间
+               start_timestamp,             # 训练开始时间
                model: torch.nn.Module,
                optimizer,
                scaler,
-               epoch,                   # 当前 epoch，用于恢复训练时知道从哪个 epoch 开始
+               epoch,                       # 当前 epoch，用于恢复训练时知道从哪个 epoch 开始
                model_name: str,
                target_dir: str = "./model_output",
                SAVE_HUGGINGFACE_PRETRAINED_MODEL: bool = False,
@@ -242,15 +216,14 @@ def save_model(hyperparameters,
         return model_path
 ###--------------- 保存模型 ------------------###
 
-###--------------- 保存log ------------------###
+
 def save_training_logs(
-    hyperparameters,
-    results,
-    epoch: int,
-    start_timestamp: str,
-    result_name: str,
-    target_dir: str = "./model_output"
-):
+                        hyperparameters,
+                        results,
+                        epoch: int,
+                        start_timestamp: str,
+                        result_name: str,
+                        target_dir: str = "./model_output"):
     """
     将超参数和训练结果保存到JSON日志文件中。
 
@@ -290,10 +263,6 @@ def save_training_logs(
 
     return output_data
 
-    # (可选) 可以在此处添加打印最终结果的逻辑
-    # print_summary(results, hyperparameters)
-
-###--------------- 保存log ------------------###
 
 def print_trainable_parameters(model):
     trainable_params = 0
@@ -332,15 +301,3 @@ def get_loss_fn(loss_name: str = "bce_logit"):
         raise ValueError(f"Unknown loss name '{loss_name}'. "
                          f"Available names: {list(losses.keys())}")
     return losses[loss_name]
-
-
-
-
-
-# 实例化并使用 DiceCoefficient 类
-# dice_calculator = DiceLoss(epsilon=1)
-# mean_dice_loss = dice_calculator(testoutput.detach().cpu().squeeze(), idx_mask)
-# # 输出结果
-# print("平均 Dice 系数: {:.4f}".format(mean_dice_loss))
-# # for i, score in enumerate(dice_loss_per_channel):
-# #     print("通道 {} 的 Dice 系数: {:.4f}".format(i, score))

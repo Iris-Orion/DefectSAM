@@ -7,7 +7,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from utils.config import get_bse_args
 from utils.helper_function import set_seed
-from data.data_utils_baseline import neu_bsl_create_dataset
+from data.neu_dataset import neu_bsl_create_dataset
 from utils.baseline_engine import baseline_experiment, bsl_inference_engine, create_bsl_model_from_type
 from weights.neu_weights import bsl_neu_dict
 
@@ -23,20 +23,11 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    print("="*40)
+    print("-"*40)
     print(f"[数据统计] 训练集图片: {len(train_dataset)} 张")
     print(f"[数据统计] 验证集图片: {len(val_dataset)} 张")
     print(f"[数据统计] 测试集图片: {len(test_dataset)} 张")
-    print("="*40)
-
-    # unique_vals = set()
-    # for i in range(len(train_dataset)):
-    #     _, mask, image_id = train_dataset[i]
-    #     # 假设 mask 是 torch.Tensor（调用 ToTensorV2 后）
-    #     # 如果 mask 是浮点型数据，可以先转为 numpy 数组
-    #     mask_np = mask.numpy()
-    #     unique_vals.update(np.unique(mask_np).tolist())
-    # print("所有mask的unique值：", unique_vals)
+    print("-"*40)
 
     image, mask, _ = train_dataset[0]
     print(f"-"*40 + "Debug Test" + "-"*40)
@@ -50,7 +41,7 @@ if __name__ == "__main__":
     hyperparameters['scheduler'] = "cosine_scheduler"
     hyperparameters['loss_function'] = "monai.DiceCELoss"
     hyperparameters['task_name'] = 'neu_seg_' + hyperparameters['bse_model']
-    hyperparameters['output_dir'] = './pretrained_weights/neu_seg_output' + '/' + hyperparameters['bse_model']
+    hyperparameters['output_dir'] = './new_weights/neu_seg_output' + '/' + hyperparameters['bse_model']
 
     if not args.infer_mode:
         model = create_bsl_model_from_type(args=args)

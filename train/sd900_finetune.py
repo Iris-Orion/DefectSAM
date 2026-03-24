@@ -2,10 +2,15 @@ import torch
 import monai
 import copy
 from transformers import SamModel
-from utils.finetune_engine import run_finetune_engine, inference_engine, _process_batch, zero_shot, create_model_from_type
 from utils.helper_function import set_seed
 from utils.config import get_common_ft_args
-from data.sd900_dataset import sd_900_finetune_create_dataset, sd_900_finetune_create_dataloader, debug_sd900_img_and_mask
+from utils.finetune_engine import (run_finetune_engine,
+                                   inference_engine,
+                                   _process_batch, _process_batch_sam_style,
+                                   zero_shot,
+                                   create_model_from_type)
+from data.sd900_dataset import (sd900_finetune_create_dataset, 
+                                sd900_finetune_create_dataloader)
 
 from weights.weights_dict_dhs_sd900 import sd900_dict, scale_sd900_dict, new_sd900_dict, sam_sd900_dict
 
@@ -21,40 +26,30 @@ if __name__ == '__main__':
 
     print(hyperparameters)
 
-    train_dataset, val_dataset, test_dataset = sd_900_finetune_create_dataset()
-    train_dataloader, val_dataloader, test_dataloader = sd_900_finetune_create_dataloader(args=args, 
+    train_dataset, val_dataset, test_dataset = sd900_finetune_create_dataset()
+    train_dataloader, val_dataloader, test_dataloader = sd900_finetune_create_dataloader(args=args, 
                                                                                           train_dataset=train_dataset, 
                                                                                           val_dataset=val_dataset, 
                                                                                           test_dataset=test_dataset)
-    # hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    # for name, param in hgsam_model.named_parameters():
-    #     # 冻结某些层
-    #     if name.startswith("vision_encoder"):
-    #         param.requires_grad_(False)
-
-    #----------------------- model 选择 --------------------------#
-    # model = loratask.get_hf_lora_model(model = hgsam_model, target_part = 'mask_decoder')
-    # model = loratask.get_hf_lora_model(model = hgsam_model, target_part = 'vision_encoder')
-    # model = hgsam_model
-    # model = loratask.get_hf_adalora_model(model = hgsam_model, target_part='vision_encoder', lora_rank=LORA_RANK, total_step=NUM_EPOCHS * len(train_dataloader))
-
-    #----------------------- lora-dsc --------------------------#
-    lora_rank = args.lora_rank
-    lora_alpha = args.lora_alpha
-    lora_dropout = args.lora_dropout
-
+    
     device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
 
-    debug_sd900_img_and_mask()
 
     if not args.infer_mode:
         model = create_model_from_type(args=args, train_dataloader=train_dataloader)
+
+        # 选择 process_batch 函数：SAM原始多prompt多轮策略 or 单一box prompt
+        if args.sam_style_train:
+            batch_fn = _process_batch_sam_style
+        else:
+            batch_fn = _process_batch
+
         results, fintuned_model = run_finetune_engine(train_dataloader=train_dataloader,
                                                         val_dataloader = val_dataloader,
                                                         test_dataloader=test_dataloader,
                                                         model=model,
                                                         device=device,
-                                                        process_batch_fn = _process_batch,
+                                                        process_batch_fn = batch_fn,
                                                         hyperparameters=hyperparameters,
                                                         save_dir = "./new_weights/sd900_output",
                                                         auto_seg = args.auto_seg)
@@ -65,8 +60,8 @@ if __name__ == '__main__':
 
         SambPath = "./HuggingfaceModel/sam_vit_base/model"
         MedSamPath = "./HuggingfaceModel/wanglab/medsam-vit-base/model"
-        zero_shot(model_path = SambPath,
-                  train_dataloader=train_dataloader,
+        zero_shot(  model_path = SambPath,
+                    train_dataloader=train_dataloader,
                     val_dataloader=val_dataloader,
                     test_dataloader=test_dataloader,
                     loss_fn=seg_loss,
@@ -123,28 +118,5 @@ if __name__ == '__main__':
                                 results_filename="sd900_eval_results.txt",
                                 auto_seg=current_args.auto_seg,
                                 eval_traindataset=True)
-
-    # zero shot
-    # train_dataloader, test_dataloader = sd_900_finetune_create_dataset()
-    # device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
-    # torch.cuda.set_device(device)
-    # print(f"using devcie {device}")
-    # hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    # medsam_model = SamModel.from_pretrained("./HuggingfaceModel/wanglab/medsam-vit-base/model")
-
-    # model = medsam_model
-    # model.to(device)
-    # model.eval()
-    # with torch.no_grad():
-    #     train_dice, train_iou = inference_step(dataloader=train_dataloader,
-    #                                         model=model,
-    #                                         device=device,
-    #                                         use_bbox=True)
-        
-    #     test_dice, test_iou = inference_step(dataloader=test_dataloader,
-    #                                         model=model,
-    #                                         device=device,
-    #                                         use_bbox=True)
-    # print(f"train dice: {train_dice:.4f}  train_iou: {train_iou:.4f} || test dice: {test_dice:.4f} test_iou: {test_iou:.4f}")
 
     

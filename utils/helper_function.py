@@ -43,28 +43,29 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps):
     # )
     pass
 
-def get_bounding_box(ground_truth_map):
+def get_bounding_box(ground_truth_map, perturb=True, perturb_range=20):
     """
-    给neu_finetune用的bbox获取函数
-    从ground_truth中获得bbox
+    从ground_truth中获得bbox。
     输入:ground_truth_map 是一个合并的掩码 : np.array
+    参数:
+        perturb: 是否对bbox添加随机扰动（训练时True，验证/测试时False）
+        perturb_range: 随机扰动的最大像素数，与SAM原始训练策略一致（默认±20px）
     """
-    # 先转为np格式
-    # print(type(ground_truth_map))
     assert type(ground_truth_map) == np.ndarray, "check type"
     if np.sum(ground_truth_map) == 0:
         bbox = [0, 0, 0, 0]
     else:
-        # 从非空掩码中得到bounding box
         y_indices, x_indices = np.where(ground_truth_map > 0)
         x_min, x_max = np.min(x_indices), np.max(x_indices)
         y_min, y_max = np.min(y_indices), np.max(y_indices)
 
-        H, W = ground_truth_map.shape
-        x_min = max(0, x_min - np.random.randint(0, 20))
-        x_max = min(W, x_max + np.random.randint(0, 20))
-        y_min = max(0, y_min - np.random.randint(0, 20))
-        y_max = min(H, y_max + np.random.randint(0, 20))
+        if perturb:
+            H, W = ground_truth_map.shape
+            x_min = max(0, x_min - np.random.randint(0, perturb_range))
+            x_max = min(W, x_max + np.random.randint(0, perturb_range))
+            y_min = max(0, y_min - np.random.randint(0, perturb_range))
+            y_max = min(H, y_max + np.random.randint(0, perturb_range))
+
         bbox = [x_min, y_min, x_max, y_max]
     return bbox
 
