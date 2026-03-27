@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
+from sklearn.model_selection import KFold
 from torch.utils.data import Dataset, Subset
 
 from data.common_ops import build_binary_mask
@@ -88,14 +89,16 @@ class Retina_Dataset_ft(SegDatasetForFinetune):
         resized_img = self.letterbox_imagenp(image, [1024, 1024])
         resized_mask = self.letterbox_mask_1ch(mask, [1024, 1024])
 
-        bbox = get_bounding_box(resized_mask)
-        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
-
         if self.transforms:
             augmented = self.transforms(image=resized_img, mask=resized_mask)
             image_tensor = augmented['image'] / 255.0
             mask_tensor = (augmented['mask']) / 255.0
             mask_tensor = (mask_tensor > 0).float()
+
+        # bbox 必须在增强之后从变换后的 mask 上计算，否则翻转后 bbox 与 mask 不一致
+        mask_np_for_bbox = mask_tensor.squeeze().numpy().astype(np.uint8)
+        bbox = get_bounding_box(mask_np_for_bbox)
+        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
 
         return {
             "image": image_tensor.float(),
@@ -216,6 +219,57 @@ def create_retina_dataset_ft():
         transforms=test_transforms,
     )
 
+    print(f"训练集大小: {len(retina_train_subset)}")
+    print(f"验证集大小: {len(retina_val_subset)}")
+    print(f"测试集大小: {len(retina_test_set)}")
+
+    return retina_train_subset, retina_val_subset, retina_test_set
+
+
+def create_retina_dataset_ft_kfold(num_folds=5, fold_index=0, random_state=42, shuffle=True):
+    """
+    在 Retina 训练集上执行 K 折划分，同时保留官方 test 集作为外部测试集。
+    """
+    if num_folds < 2:
+        raise ValueError(f"num_folds 必须 >= 2，当前为 {num_folds}")
+    if fold_index < 0 or fold_index >= num_folds:
+        raise ValueError(f"fold_index 必须在 [0, {num_folds - 1}] 内，当前为 {fold_index}")
+
+    train_transforms, test_transforms = general_albumentation_transforms_for_finetune()
+
+    retina_train_images_dir = 'data/Retina_Blood_Vessel/train/image'
+    retina_train_annotations_dir = 'data/Retina_Blood_Vessel/train/mask'
+
+    retina_test_images_dir = 'data/Retina_Blood_Vessel/test/image'
+    retina_test_annotations_dir = 'data/Retina_Blood_Vessel/test/mask'
+
+    train_dataset_with_aug = Retina_Dataset_ft(
+        retina_train_images_dir,
+        retina_train_annotations_dir,
+        transforms=train_transforms,
+    )
+
+    val_dataset_no_aug = Retina_Dataset_ft(
+        retina_train_images_dir,
+        retina_train_annotations_dir,
+        transforms=test_transforms,
+    )
+
+    kfold = KFold(n_splits=num_folds, shuffle=shuffle, random_state=random_state)
+    all_indices = np.arange(len(train_dataset_with_aug))
+    splits = list(kfold.split(all_indices))
+    train_indices, val_indices = splits[fold_index]
+
+    retina_train_subset = Subset(train_dataset_with_aug, train_indices.tolist())
+    retina_val_subset = Subset(val_dataset_no_aug, val_indices.tolist())
+
+    retina_test_set = Retina_Dataset_ft(
+        retina_test_images_dir,
+        retina_test_annotations_dir,
+        transforms=test_transforms,
+    )
+
+    print(f"Retina K 折验证: fold {fold_index + 1}/{num_folds}")
     print(f"训练集大小: {len(retina_train_subset)}")
     print(f"验证集大小: {len(retina_val_subset)}")
     print(f"测试集大小: {len(retina_test_set)}")

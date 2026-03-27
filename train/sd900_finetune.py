@@ -51,7 +51,7 @@ if __name__ == '__main__':
                                                         device=device,
                                                         process_batch_fn = batch_fn,
                                                         hyperparameters=hyperparameters,
-                                                        save_dir = "./new_weights/sd900_output",
+                                                        save_dir = "./new_weights/finetune/sd900_output/"+hyperparameters['ft_type'],
                                                         auto_seg = args.auto_seg)
     
     elif args.zero_shot:
@@ -71,7 +71,7 @@ if __name__ == '__main__':
                     auto_seg=False,
                     eval_traindataset=True)
     else:
-        scaler = torch.cuda.amp.GradScaler(enabled=True) 
+        scaler = torch.amp.GradScaler('cuda', enabled=True) 
         seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
         # checkpoints_to_evaluate = sd900_dict()

@@ -23,7 +23,7 @@ if __name__ == '__main__':
     hyperparameters['optimizer'] = "AdamW"
     hyperparameters['scheduler'] = "cosine_scheduler"
     hyperparameters['loss_function'] = "monai.DiceCELoss"
-    hyperparameters['output_dir'] = './new_weights/severstal_output'
+    hyperparameters['output_dir'] = './new_weights/finetune/severstal_output'
     hyperparameters['task_name'] = "severstal_" + hyperparameters['ft_type']
     print(hyperparameters)
 
@@ -43,9 +43,9 @@ if __name__ == '__main__':
     test_dataset = SteelDataset_WithBoxPrompt(test_df, data_path=data_path, transforms=val_transforms)
 
     # 小数据集不要使用num_workers避免加负载
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.num_workers)    # 不pin memory的话： 1024 张一轮训练1min34s     
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.num_workers)       # 全部训练一轮大概8min03s
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.num_workers)       # pin memory的话： 1024 张一轮训练1min05s
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.num_workers, persistent_workers=(args.num_workers > 0))    # 不pin memory的话： 1024 张一轮训练1min34s     
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.num_workers, persistent_workers=(args.num_workers > 0))       # 全部训练一轮大概8min03s
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.num_workers, persistent_workers=(args.num_workers > 0))       # pin memory的话： 1024 张一轮训练1min05s
 
     if not args.infer_mode:
         model = create_model_from_type(args=args, train_dataloader=train_dataloader)

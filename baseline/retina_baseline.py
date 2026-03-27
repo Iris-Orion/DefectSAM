@@ -4,7 +4,7 @@ import monai
 import copy
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
+from utils.helper_function import get_lr_scheduler
 
 from utils.helper_function import set_seed
 from utils.baseline_engine import baseline_experiment, bsl_inference_engine, create_bsl_model_from_type
@@ -31,7 +31,7 @@ if __name__ == '__main__':
     hyperparameters['scheduler'] = "cosine_scheduler"
     hyperparameters['loss_function'] = "monai.DiceCELoss"
     hyperparameters['task_name'] = "retina_" + hyperparameters['bse_model']
-    hyperparameters['output_dir'] = "./new_weights"
+    hyperparameters['output_dir'] = "./new_weights/baseline/retina"
 
     if not args.infer_mode:
         model = create_bsl_model_from_type(args=args)
@@ -43,12 +43,7 @@ if __name__ == '__main__':
         warmup_ratio = 0.1
         warmup_steps = int(warmup_ratio * total_steps)
 
-        cosine_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-            num_cycles=0.5
-        )
+        cosine_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps)
 
         device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
 

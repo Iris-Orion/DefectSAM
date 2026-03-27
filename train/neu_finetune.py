@@ -25,9 +25,9 @@ if __name__ == '__main__':
     print(hyperparameters)
     
     train_dataset, val_dataset, test_dataset = create_neu_dataset_stratified()
-    train_dataloader = DataLoader(train_dataset, batch_size=hyperparameters['batch_size'], shuffle=True, num_workers=hyperparameters['num_workers'], pin_memory=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=hyperparameters['batch_size'], shuffle=False, num_workers=hyperparameters['num_workers'], pin_memory=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=hyperparameters['batch_size'], shuffle=False, num_workers=hyperparameters['num_workers'], pin_memory=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=hyperparameters['batch_size'], shuffle=True, num_workers=hyperparameters['num_workers'], pin_memory=True, persistent_workers=(hyperparameters['num_workers'] > 0))
+    val_dataloader = DataLoader(val_dataset, batch_size=hyperparameters['batch_size'], shuffle=False, num_workers=hyperparameters['num_workers'], pin_memory=True, persistent_workers=(hyperparameters['num_workers'] > 0))
+    test_dataloader = DataLoader(test_dataset, batch_size=hyperparameters['batch_size'], shuffle=False, num_workers=hyperparameters['num_workers'], pin_memory=True, persistent_workers=(hyperparameters['num_workers'] > 0))
 
     lora_rank = args.lora_rank
     lora_alpha = args.lora_alpha
@@ -71,7 +71,7 @@ if __name__ == '__main__':
     else:
         # infer evaluation
         checkpoints_to_evaluate = dif_rank_neu_dict()
-        scaler = torch.cuda.amp.GradScaler(enabled=True) 
+        scaler = torch.amp.GradScaler('cuda', enabled=True) 
         seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
         device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
         for checkpoint_info in checkpoints_to_evaluate:

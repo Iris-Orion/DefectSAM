@@ -80,13 +80,17 @@ class NEU_SEG_Dataset(Dataset):
 
         img_1024 = self.letterbox_imagenp(image_np, [1024, 1024])
         mask_1024 = self.letterbox_mask_1ch(mask_np, [1024, 1024])
-        bbox = get_bounding_box(mask_1024)
-        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
 
         if self.transforms:
             augmented = self.transforms(image=img_1024, mask=mask_1024)
             image_tensor = augmented['image'] / 255.0
             mask_tensor = augmented['mask'].float()
+
+        # bbox 必须在增强之后从变换后的 mask 上计算，否则翻转后 bbox 与 mask 不一致
+        mask_np_for_bbox = mask_tensor.squeeze().numpy().astype(np.uint8)
+        bbox = get_bounding_box(mask_np_for_bbox)
+        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
+
         return {
             "image": image_tensor.float(),
             "mask": mask_tensor.float(),

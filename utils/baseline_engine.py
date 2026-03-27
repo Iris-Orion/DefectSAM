@@ -49,31 +49,61 @@ def create_bsl_model_from_type(args: argparse.Namespace):
 
     return model_map[model_choice]()
 
-def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, device, scheduler_per_batch=False):
+def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, device, scaler, scheduler_per_batch=False):
     model.train()
     total_loss, total_dice, total_iou = 0, 0, 0
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
+    use_amp = scaler is not None
 
-    for images, masks, _ in tqdm(data_loader, desc="Training"):
-        images = images.to(device)
-        masks = masks.to(device)
+    # nanoGPT 风格：pin_memory + non_blocking，由 CUDA 内部 copy stream 重叠传输与计算
+    loader_iter = iter(data_loader)
+    try:
+        n_img, n_msk, n_meta = next(loader_iter)
+        n_img = n_img.to(device, non_blocking=True)
+        n_msk = n_msk.to(device, non_blocking=True)
+    except StopIteration:
+        return 0, 0, 0, 0
 
-        outputs = model(images)
-        loss = criterion(outputs, masks)
+    pbar = tqdm(total=len(data_loader), desc="Training")
 
-        total_dice += compute_dice_score(outputs, masks)
-        total_iou += compute_iou_score(outputs, masks)
-        hd95_metric(y_pred=(torch.sigmoid(outputs) > 0.5).float().cpu(), y=masks.cpu())
+    while True:
+        images, masks = n_img, n_msk
 
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+
+        # prefetch next batch: async H2D transfer overlaps with backward below
+        try:
+            n_img, n_msk, n_meta = next(loader_iter)
+            n_img = n_img.to(device, non_blocking=True)
+            n_msk = n_msk.to(device, non_blocking=True)
+            has_next = True
+        except StopIteration:
+            has_next = False
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         if scheduler_per_batch and scheduler is not None:
             scheduler.step()
 
         total_loss += loss.item()
+        with torch.no_grad():
+            total_dice += compute_dice_score(outputs, masks)
+            total_iou += compute_iou_score(outputs, masks)
+            hd95_metric(y_pred=(torch.sigmoid(outputs) > 0.5).float().cpu(), y=masks.cpu())
+        pbar.update(1)
+        if not has_next:
+            break
 
+    pbar.close()
     avg_loss = total_loss / len(data_loader)
     avg_dice = total_dice / len(data_loader)
     avg_iou = total_iou / len(data_loader)
@@ -81,21 +111,23 @@ def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, device,
     hd95_metric.reset()
     return avg_loss, avg_dice, avg_iou, avg_hd95
 
-def evaluate(model, data_loader, criterion, device):
+def evaluate(model, data_loader, criterion, device, scaler=None):
     """
     Returns:  tuple: (平均损失, 平均Dice分数, 平均IoU分数, 平均HD95)
     """
     model.eval()
     total_loss, total_dice, total_iou = 0, 0, 0
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
+    use_amp = scaler is not None
 
     with torch.no_grad():
         for images, masks, _ in tqdm(data_loader, desc="Evaluating"):
-            images = images.to(device)
-            masks = masks.to(device)
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
 
-            outputs = model(images)
-            loss = criterion(outputs, masks)
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                outputs = model(images)
+                loss = criterion(outputs, masks)
             total_loss += loss.item()
 
             total_dice += compute_dice_score(outputs, masks)
@@ -144,7 +176,24 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
         "val_loss": [], "val_dice": [], "val_iou": [], "val_hd95": [],
     }
 
+    # TF32：几乎零精度损失，提升 matmul / cudnn 吞吐
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     model.to(device)
+
+    # torch.compile：静态图优化，减少 kernel launch overhead
+    try:
+        model = torch.compile(model, mode='default')
+        print("torch.compile 已启用 (mode='default')")
+    except Exception as e:
+        print(f"torch.compile 不可用，跳过: {e}")
+
+    # BF16 GradScaler：BF16 指数范围与 FP32 相同，无需梯度缩放
+    _use_bf16 = torch.cuda.is_bf16_supported()
+    scaler = torch.amp.GradScaler('cuda', enabled=not _use_bf16)
+    print(f"AMP dtype: {'bfloat16' if _use_bf16 else 'float16'} | GradScaler enabled: {not _use_bf16}")
+
     best_val_dice = 0.0
     best_model_path = ""
     no_improve_epochs = 0
@@ -153,14 +202,14 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
 
     for epoch in range(num_epochs):
         print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
-        
+
         avg_train_loss, avg_train_dice, avg_train_iou, avg_train_hd95 = train_one_epoch(
-            model, train_loader, criterion, optimizer, scheduler, device, scheduler_per_batch
+            model, train_loader, criterion, optimizer, scheduler, device, scaler, scheduler_per_batch
         )
         print(f'Train Results: Loss: {avg_train_loss:.4f}, Dice: {avg_train_dice:.4f}, IoU: {avg_train_iou:.4f}, HD95: {avg_train_hd95:.4f}')
 
         avg_val_loss, avg_val_dice, avg_val_iou, avg_val_hd95 = evaluate(
-            model, val_loader, criterion, device
+            model, val_loader, criterion, device, scaler
         )
         print(f'Validation Results: Loss: {avg_val_loss:.4f}, Dice: {avg_val_dice:.4f}, IoU: {avg_val_iou:.4f}, HD95: {avg_val_hd95:.4f}')
 

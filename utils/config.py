@@ -2,7 +2,7 @@ import argparse
 
 def get_bse_args():
     parser = argparse.ArgumentParser(description='基线训练模型的args选择')
-    parser.add_argument('--batch_size', type=int, default=24, help='训练的batch size')
+    parser.add_argument('--batch_size', type=int, default=16, help='训练的batch size')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='训练的学习率')
     parser.add_argument('--num_epochs', type=int, default=100, help='epochs')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='权重衰减')
@@ -15,11 +15,11 @@ def get_bse_args():
     parser.add_argument('--num_workers', type=int, default=4, help='num_workers')
     parser.add_argument('--bse_model', type=str, default='unet_res34', help='baseline model')
 
-    parser.add_argument('--save_bse_model', action='store_true', help='是否保存baseline模型')
+    parser.add_argument('--save_bse_model', '--save', action='store_true', help='是否保存baseline模型')
     parser.add_argument('--infer_mode', action="store_true", help='推理模式')
 
-    parser.add_argument('--use_swanlab', action='store_true', help='是否使用 swanlab 记录')
-    parser.add_argument('--swanlab_project', type=str, default='input your project name', help='swanlab项目名称')
+    parser.add_argument('--use_swanlab', '--swanlab', action='store_true', help='是否使用 swanlab 记录')
+    parser.add_argument('--swanlab_project', '--pj_name', type=str, default='input your project name', help='swanlab项目名称')
     bse_args = parser.parse_args()  
 
     return bse_args
@@ -30,7 +30,7 @@ def add_common_ft_args(parser):
     # 训练超参数
     parser.add_argument('--batch_size', type=int, default=2, help='训练的batch size')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='训练的学习率')
-    parser.add_argument('--num_epochs', type=int, default=100, help='训练的总轮数 (epochs)')
+    parser.add_argument('--num_epochs', type=int, default=50, help='训练的总轮数 (epochs)')
     
     # 早停与正则化
     parser.add_argument('--patience', type=int, default=10, help='早停(early stop)的耐心值')
@@ -61,8 +61,13 @@ def add_common_ft_args(parser):
     parser.add_argument('--infer_mode', action="store_true", help='是否在训练中引入无缺陷样本进行推理式评估')
     parser.add_argument('--zero_shot', action="store_true", help='是否进行zero-shot评估')
 
-    parser.add_argument('--use_swanlab', action='store_true', help='是否使用 swanlab 记录')
-    parser.add_argument('--swanlab_project', type=str, default='input your project name', help='swanlab项目名称')
+    # 交叉验证
+    parser.add_argument('--use_kfold', action='store_true', help='是否启用 K 折交叉验证')
+    parser.add_argument('--num_folds', type=int, default=5, help='K 折交叉验证中的折数')
+    parser.add_argument('--fold_index', type=int, default=-1, help='指定运行某一折，-1 表示运行全部折')
+
+    parser.add_argument('--use_swanlab', '--swanlab',  action='store_true', help='是否使用 swanlab 记录')
+    parser.add_argument('--swanlab_project', '--pj_name', type=str, default='input your project name', help='swanlab项目名称')
 
     # sam模型大小选择
     parser.add_argument('--sam_type', type=str, default="sam_base", help='sam模型大小选择')

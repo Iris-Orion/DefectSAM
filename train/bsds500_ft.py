@@ -93,7 +93,7 @@ def bsd500_finetune_engine( train_dataloader, val_dataloader, test_dataloader,
     trainable_parameters = [param for param in model.parameters() if param.requires_grad]      # 收集所有可训练的参数
     optimizer = AdamW(trainable_parameters, lr=lr, weight_decay=wd)
     # loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-    scaler = torch.cuda.amp.GradScaler(enabled=True)  # 混合精度训练
+    scaler = torch.amp.GradScaler('cuda', enabled=True)  # 混合精度训练
 
     # 学习率调度策略 
     total_steps = len(train_dataloader) * num_epochs
@@ -252,7 +252,7 @@ if __name__ == '__main__':
 
     else:
         checkpoint_path='/workspace/DefectDetection/new_weights/sd900_output/loradsc_qv_rank_16_20250720_080218.pth'
-        scaler = torch.cuda.amp.GradScaler(enabled=True) 
+        scaler = torch.amp.GradScaler('cuda', enabled=True) 
         loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
         inference_engine (  model, args, best_model_path = checkpoint_path, 
                             train_dataloader=train_loader, val_dataloader=val_loader, test_dataloader=test_loader,

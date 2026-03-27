@@ -3,7 +3,7 @@ import torch
 import copy
 from torch.utils.data import DataLoader
 from torch import optim
-from transformers import get_cosine_schedule_with_warmup
+from utils.helper_function import get_lr_scheduler
 from utils.helper_function import set_seed
 from utils.baseline_engine import baseline_experiment, bsl_inference_engine, create_bsl_model_from_type
 from utils.config import get_bse_args
@@ -43,12 +43,7 @@ if __name__ == "__main__":
         warmup_ratio = 0.1
         warmup_steps = int(warmup_ratio * total_steps)     
 
-        cosine_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-            num_cycles = 0.5
-        )
+        cosine_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps)
         
         device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
         results, fintuned_model = baseline_experiment(model, 

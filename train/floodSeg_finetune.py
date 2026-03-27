@@ -19,9 +19,9 @@ if __name__ == '__main__':
     batch_size = args.batch_size
     num_workers = args.num_workers
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0))
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0))
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0))
     
     lora_rank = args.lora_rank
     lora_alpha = args.lora_alpha
@@ -44,7 +44,7 @@ if __name__ == '__main__':
     else:
         model = create_model_from_type(args=args, train_dataloader=train_loader)
         checkpoint_path='/workspace/DefectDetection/pretrained_weights/sd900_output/loradsc_qv_rank_16_20250720_080218.pth'
-        scaler = torch.cuda.amp.GradScaler(enabled=True) 
+        scaler = torch.amp.GradScaler('cuda', enabled=True) 
         loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
         inference_engine (  model, args, best_model_path = checkpoint_path, 
                             train_dataloader=train_loader, val_dataloader=val_loader, test_dataloader=test_loader,

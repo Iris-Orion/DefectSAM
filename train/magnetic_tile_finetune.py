@@ -20,7 +20,7 @@ def mag_inference(model, device, dataloader, scaler):
         for batch in tqdm(dataloader):
             ground_truth_masks = batch["mask"].float().to(device)      # gt
             if scaler is not None:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     outputs = model(pixel_values = batch["image"].to(device),
                                     input_boxes = batch["bbox"].unsqueeze(1).to(device),     # [B, 4] ----unsqueeze----> [B, 1, 4]
                                     multimask_output=False)
@@ -52,9 +52,9 @@ if __name__ == "__main__":
     print(f"label: {label}")
 
     # 创建 DataLoader
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
 
     hyperparameters['optimizer'] = 'AdamW'
     hyperparameters['loss_function'] = 'monai.DiceCELoss'
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     
     else:
         # checkpoint_path='/workspace/DefectDetection/new_weights/magnetic_tile_output/loradsc_qv_rank_16_20250721_200224.pth'
-        scaler = torch.cuda.amp.GradScaler(enabled=True) 
+        scaler = torch.amp.GradScaler('cuda', enabled=True) 
         seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
         # checkpoints_to_evaluate = magnetic_tile_dict()
         # checkpoints_to_evaluate = scale_magnetic_tile_dict()
@@ -156,7 +156,7 @@ if __name__ == "__main__":
     # print(f"using devcie {device}")
 
     # seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-    # scaler = torch.cuda.amp.GradScaler(enabled=True)
+    # scaler = torch.amp.GradScaler('cuda', enabled=True)
 
     # train_dice, train_ious = mag_inference(model=hgsam_model,
     #                                        device=device,

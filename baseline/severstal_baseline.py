@@ -3,7 +3,7 @@ import monai
 import torch
 from pathlib import Path
 from torchinfo import summary
-from transformers import  get_cosine_schedule_with_warmup
+from utils.helper_function import get_lr_scheduler
 
 from data import severstal
 from utils.config import get_severstal_bsl_args
@@ -22,15 +22,17 @@ if __name__ == '__main__':
     include_no_defect = args.include_no_defect
     NUM_WORKERS = args.num_workers          
 
-    train_df, val_df, test_df = severstal.traindf_preprocess(split_seed=42, include_no_defect = args.include_no_defect,
-                                                              create_mini_dataset=create_mini_dataset, mini_size=256)
-    p = Path("data/severstal_steel_defect_detection")
+    train_df, val_df, test_df = severstal.traindf_preprocess(split_seed=42, 
+                                                             include_no_defect = args.include_no_defect,
+                                                             create_mini_dataset=create_mini_dataset, 
+                                                             mini_size=256)
+    severstal_dataset_path = Path("data/severstal_steel_defect_detection")
     train_transforms, val_transforms = severstal.get_albumentations_transforms()    # albumentations
     # train_transforms, val_transforms = data_setup.get_torchvision_transforms()
     train_dataloader, val_dataloader, test_dataloader = severstal.create_dataloaders_no_prompt(train_df,
                                                                                                 val_df,
                                                                                                 test_df,
-                                                                                                data_path = p,
+                                                                                                data_path = severstal_dataset_path,
                                                                                                 train_transform=train_transforms,
                                                                                                 val_transform=val_transforms,
                                                                                                 batch_size=batch_size,
@@ -63,12 +65,7 @@ if __name__ == '__main__':
         warmup_ratio = 0.1
         warmup_steps = int(warmup_ratio * total_steps)     
 
-        cosine_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-            num_cycles = 0.5
-        )
+        cosine_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps)
         
         device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
         baseline_experiment(model = model,

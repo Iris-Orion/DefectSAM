@@ -3,7 +3,7 @@ import monai
 import copy
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
+from utils.helper_function import get_lr_scheduler
 
 from utils.config import get_bse_args
 from utils.helper_function import set_seed
@@ -60,12 +60,7 @@ if __name__ == "__main__":
         warmup_ratio = 0.1
         warmup_steps = int(warmup_ratio * total_steps)
         
-        cosine_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-            num_cycles = 0.5
-        )
+        cosine_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps)
 
         baseline_experiment(model = model, 
                             device = device,

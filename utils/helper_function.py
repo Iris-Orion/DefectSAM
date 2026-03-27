@@ -1,3 +1,4 @@
+import math
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,22 +27,25 @@ def set_seed(seed: int = 42):
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
 
-def get_lr_scheduler(optimizer, warmup_steps, total_steps):
-    # 学习率调度策略 
-    # linear_scheduler = get_linear_schedule_with_warmup( optimizer,
-    #                                                     num_warmup_steps=warmup_steps,
-    #                                                     num_training_steps=total_steps
-    #                                                     )
-    
-    # 初始化多项式学习率调度器
-    # polynomial_scheduler = get_polynomial_decay_schedule_with_warmup(
-    #     optimizer=optimizer,
-    #     num_warmup_steps=warmup_steps,
-    #     num_training_steps=total_steps,
-    #     lr_end=1e-7,       # 训练结束时,学习率衰减到何值，默认为1e-7
-    #     power=0.9
-    # )
-    pass
+def get_lr_scheduler(optimizer, warmup_steps, total_steps, eta_min_ratio=0.1):
+    """Cosine warmup scheduler，最终学习率衰减到 base_lr * eta_min_ratio。
+
+    Args:
+        eta_min_ratio: 最终学习率 = 初始学习率 * eta_min_ratio，默认 0.1
+    """
+    def lr_lambda(current_step):
+        # 1) linear warmup
+        if current_step < warmup_steps:
+            return (current_step + 1) / (warmup_steps + 1)
+        # 2) past total_steps, clamp to min lr
+        if current_step > total_steps:
+            return eta_min_ratio
+        # 3) cosine decay down to eta_min_ratio
+        decay_ratio = (current_step - warmup_steps) / (total_steps - warmup_steps)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return eta_min_ratio + coeff * (1 - eta_min_ratio)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 def get_bounding_box(ground_truth_map, perturb=True, perturb_range=20):
     """
