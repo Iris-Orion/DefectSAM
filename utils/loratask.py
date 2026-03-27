@@ -47,7 +47,7 @@ def get_hf_lokr_model(model):
 def get_hf_adalora_model(model, total_step, target_part='vision_encoder', lora_rank=8, init_r=12):
     target_modules = get_sam_target_modules(model, target_part=target_part)
     config = AdaLoraConfig(
-        r=lora_rank,
+        target_r=lora_rank,   # fix bug
         init_r=init_r,
         tinit=int(total_step * 0.1),
         tfinal=int(total_step * 0.8),    
