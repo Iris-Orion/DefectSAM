@@ -110,8 +110,8 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
         elif model_type == 'adalora_encoder':
             if train_dataloader is None:
                 raise ValueError("train_dataloader must be provided for 'adalora_encoder' type.")
-            ada_lora_rank = 8
-            ada_init_r = 12
+            ada_lora_rank = 16      # (default setting is 8)
+            ada_init_r = 24     # adalora paper recommend settings (x1.5)
             total_step = args.num_epochs * len(train_dataloader)
             return get_hf_adalora_model(model=hgsam_model, total_step=total_step, target_part='vision_encoder', lora_rank=ada_lora_rank, init_r=ada_init_r)
         

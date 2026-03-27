@@ -3,7 +3,6 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 import random
-import wandb
 
 def set_device(gpu_idx: int=0):
     device = torch.device(f"cuda:{gpu_idx}" if torch.cuda.is_available() else "cpu")
