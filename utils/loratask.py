@@ -44,20 +44,29 @@ def get_hf_lokr_model(model):
     model.print_trainable_parameters()
     return model
 
-def get_hf_adalora_model(model, total_step, target_part='vision_encoder', lora_rank=8, init_r=12):
+def get_hf_adalora_model(
+    model,
+    total_step,
+    target_part='vision_encoder',
+    target_r=8,
+    init_r=12,
+    lora_alpha=8,
+):
     target_modules = get_sam_target_modules(model, target_part=target_part)
     config = AdaLoraConfig(
-        target_r=lora_rank,   # fix bug
+        target_r=target_r,
         init_r=init_r,
+        lora_alpha=lora_alpha,
         tinit=int(total_step * 0.1),
-        tfinal=int(total_step * 0.8),    
+        tfinal=int(total_step * 0.8),
         deltaT=10,
         target_modules=target_modules,
-        total_step = total_step,
+        total_step=total_step,
         # modules_to_save=["classifier"],
     )
     model = get_peft_model(model, config)
     return model
+
 
 def filter_target_modules(named_modules, target_substrings):
     """

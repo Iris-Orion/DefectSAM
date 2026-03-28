@@ -110,11 +110,18 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
         elif model_type == 'adalora_encoder':
             if train_dataloader is None:
                 raise ValueError("train_dataloader must be provided for 'adalora_encoder' type.")
-            ada_lora_rank = 16      # (default setting is 8)
-            ada_init_r = 24     # adalora paper recommend settings (x1.5)
+            ada_target_r = lora_rank
+            ada_init_r = max(int(ada_target_r * 1.5), ada_target_r)
             total_step = args.num_epochs * len(train_dataloader)
-            return get_hf_adalora_model(model=hgsam_model, total_step=total_step, target_part='vision_encoder', lora_rank=ada_lora_rank, init_r=ada_init_r)
-        
+            return get_hf_adalora_model(
+                model=hgsam_model,
+                total_step=total_step,
+                target_part='vision_encoder',
+                target_r=ada_target_r,
+                init_r=ada_init_r,
+                lora_alpha=lora_alpha,
+            )
+
         elif model_type == 'sam_fully':
             return hgsam_model
         
@@ -629,8 +636,8 @@ def run_finetune_engine(train_dataloader,
     swanlab_run = None
     if hyperparameters.get('use_swanlab', False):
         swanlab_run = swanlab.init(
-            project=hyperparameters.get('swanlab_project', 'retina_project'),
-            experiment_name=f"{hyperparameters.get('task_name')}_{start_timestamp}",
+            project=hyperparameters.get('swanlab_project', 'please name your swanlab project'),
+            experiment_name=f"{hyperparameters.get('task_name', 'please name your experiment name')}_{start_timestamp}",
             config=hyperparameters,     # 自动记录所有超参数
         )
 

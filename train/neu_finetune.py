@@ -5,7 +5,7 @@ import copy
 from transformers import SamModel
 from torch.utils.data import DataLoader
 
-from data.data_utils_ft import create_neu_dataset_stratified, debug_neu_dataset_info
+from data.neu_dataset import create_neu_dataset_stratified, debug_neu_dataset_info
 from utils.config import get_common_ft_args
 from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, create_model_from_type, zero_shot
 from utils.helper_function import set_seed
@@ -20,7 +20,8 @@ if __name__ == '__main__':
     hyperparameters['optimizer'] = "AdamW"
     hyperparameters['scheduler'] = "cosine_scheduler"
     hyperparameters['loss_function'] = "monai.DiceCELoss"
-    hyperparameters['output_dir'] = './new_weights/neu_seg_output'
+    hyperparameters['output_dir'] = './new_weights/neu_seg_output/finetune'
+    hyperparameters['task_name'] = 'neu_' + hyperparameters['ft_type'] + "_" +  hyperparameters['sam_type']
 
     print(hyperparameters)
     
