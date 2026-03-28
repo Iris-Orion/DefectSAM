@@ -793,7 +793,8 @@ def create_model_for_inference(model, lora_weights_path: str, device: str = "cpu
     try:
         # 加载只包含LoRA参数的state_dict
         lora_state_dict = torch.load(lora_weights_path, map_location=torch.device(device))
-        
+        lora_state_dict = {k.replace('_orig_mod.', ''): v for k, v in lora_state_dict.items()}
+
         # 使用 strict=False 将LoRA权重加载到模型中
         # 这会填充 lora_a_q, lora_b_q 等参数，同时忽略文件中不存在的基础模型参数
         missing_keys, unexpected_keys = model.load_state_dict(lora_state_dict, strict=False)

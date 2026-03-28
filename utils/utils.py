@@ -138,7 +138,7 @@ def save_lora_parameters(model: torch.nn.Module, filename: str) -> None:
     """
     # 1. 创建一个字典，只包含需要梯度的参数
     lora_state_dict = {
-        name: param
+        name.replace('_orig_mod.', ''): param
         for name, param in model.named_parameters()
         if param.requires_grad
     }
@@ -185,7 +185,7 @@ def save_model(hyperparameters,
         saved_model_str = model_name + start_timestamp + ".pth"
         model_path = os.path.join(save_dir, saved_model_str)
         model.save_pretrained(model_path)   # hugging face保存方式
-        print(f"模型已保存至:{model_path}", )
+        print(f"模型已保存至:{model_path}")
         return model_path
 
         # optimizer_path = os.path.join(save_dir, f"optimizer_{start_timestamp}.pth")

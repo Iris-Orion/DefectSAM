@@ -2,6 +2,7 @@
 import torch
 import torch._dynamo
 torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.suppress_errors = True   # 符号形状推导失败时静默回退到 eager，不打印警告
 
 import torch.nn.functional as F
 import pytz
@@ -723,6 +724,9 @@ def run_finetune_engine(train_dataloader,
 
     model.to(device)
 
+    # 保存未编译的原始模型引用，用于训练结束后加载最佳权重（避免对已编译模型做 load_state_dict 触发重新编译）
+    base_model = model
+
     # torch.compile：对计算图进行静态优化，减少 kernel launch 开销
     try:
         model = torch.compile(model, mode='default')
@@ -863,11 +867,13 @@ def run_finetune_engine(train_dataloader,
                 print(f"Error loading Hugging Face PEFT model: {e}")
                 loaded_model = None            # 加载失败
         elif save_lora_only:
-            loaded_model = create_model_for_inference(model=model, lora_weights_path=best_model_path, device=device)
+            # 使用未编译的原始模型加载权重，避免重新编译
+            loaded_model = create_model_for_inference(model=base_model, lora_weights_path=best_model_path, device=device)
         else:
             checkpoint = torch.load(best_model_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            loaded_model = model
+            # 使用未编译的原始模型加载权重，避免重新编译
+            base_model.load_state_dict(checkpoint['model_state_dict'])
+            loaded_model = base_model
             print("Successfully loaded model from standard PyTorch checkpoint.")
 
     # 在测试集上评估
