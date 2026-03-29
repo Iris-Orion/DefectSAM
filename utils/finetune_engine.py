@@ -18,6 +18,7 @@ from datetime import datetime
 from transformers import SamModel
 from peft import PeftModel, PeftConfig
 from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
 from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
 from torch.profiler import profile, record_function, ProfilerActivity
 from utils.helper_function import get_lr_scheduler
@@ -229,7 +230,7 @@ def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, off
     else:
         bboxes = batch["bbox"].unsqueeze(1).to(device)   #box prompt
 
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
         outputs = model(pixel_values=images, input_boxes=bboxes, multimask_output=False)
         predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
 
@@ -517,17 +518,19 @@ def _train_one_epoch(model,
                      scaler, device,
                      auto_seg=False,
                      offset_info=None,
-                     mfu_tracker: MFUTracker = None):
+                     mfu_tracker: MFUTracker = None,
+                     master_process: bool = True):
     """
     执行一个完整的训练 epoch。
     mfu_tracker: 可选，传入后每个 batch 会更新 MFU 并在 tqdm 后缀中显示。
+    master_process: DDP 模式下只在主进程显示进度条。
     """
     model.train()
     total_loss, total_dice, total_iou = 0, 0, 0
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
     use_amp = scaler is not None
 
-    pbar = tqdm(CUDAPrefetcher(dataloader, device), desc="Training", total=len(dataloader))
+    pbar = tqdm(CUDAPrefetcher(dataloader, device), desc="Training", total=len(dataloader), disable=not master_process)
     for batch in pbar:
         optimizer.zero_grad()
 
@@ -571,15 +574,17 @@ def _train_one_epoch(model,
     avg_mfu = mfu_tracker.mfu if mfu_tracker is not None else -1.0
     return avg_loss, avg_dice, avg_iou, avg_hd95, avg_mfu
 
-def _evaluate(model, 
-              dataloader, 
-              loss_fn, 
-              procees_batch_fn, 
-              device, scaler, 
-              auto_seg = False, 
-              offset_info = None):
+def _evaluate(model,
+              dataloader,
+              loss_fn,
+              procees_batch_fn,
+              device, scaler,
+              auto_seg = False,
+              offset_info = None,
+              master_process: bool = True):
     """
     评估模型。
+    master_process: DDP 模式下只在主进程显示进度条。
     """
     model.eval()
     total_loss, total_dice, total_iou = 0, 0, 0
@@ -587,7 +592,7 @@ def _evaluate(model,
     use_amp = scaler is not None
 
     with torch.no_grad():
-        for batch in tqdm(CUDAPrefetcher(dataloader, device), desc="Evaluating", total=len(dataloader)):
+        for batch in tqdm(CUDAPrefetcher(dataloader, device), desc="Evaluating", total=len(dataloader), disable=not master_process):
             loss, pred_masks, gt = procees_batch_fn(batch, 
                                                     model, 
                                                     loss_fn, 
@@ -609,33 +614,45 @@ def _evaluate(model,
 
     return avg_loss, avg_dice, avg_iou, avg_hd95
 
-def run_finetune_engine(train_dataloader, 
-                        val_dataloader, 
-                        test_dataloader, 
-                        model, 
+def run_finetune_engine(train_dataloader,
+                        val_dataloader,
+                        test_dataloader,
+                        model,
                         device,
-                        hyperparameters, 
+                        hyperparameters,
                         process_batch_fn,
-                        loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean'), 
-                        save_dir = "./new_weights/unspec_output", auto_seg=False):
+                        loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean'),
+                        save_dir = "./new_weights/unspec_output", auto_seg=False,
+                        ddp_info=None,
+                        train_sampler=None):
     """
-    一个通用的微调训练引擎，适用于所有数据集。
+    一个通用的微调训练引擎，适用于所有数据集。支持单卡和 DDP 多卡训练。
     Args:
         process_batch_fn (function): 用于处理数据批次的函数。应为 `_process_batch` 或 `_process_batch_severstal`。
+        ddp_info (dict, optional): DDP 配置字典，由 setup_ddp() 返回。None 时退化为单卡训练。
+        train_sampler (DistributedSampler, optional): DDP 模式下的训练数据采样器，每个 epoch 需调用 set_epoch。
     """
+    # ---------- DDP 参数解析（仿照 nanoGPT）----------
+    ddp = ddp_info is not None and ddp_info.get('ddp', False)
+    master_process = ddp_info['master_process'] if ddp else True
+    ddp_local_rank = ddp_info['local_rank'] if ddp else 0
 
-    print_trainable_parameters(model)
-    print(f"using devcie {device}")
-    
-    for name, param in model.named_parameters():
-        if 'lora' in name and param.requires_grad:
-            print(name, param.shape)                # lora系列模型的插入位置信息debug
+    if master_process:
+        print_trainable_parameters(model)
+        print(f"using device {device}")
+        if ddp:
+            print(f"DDP 已启用: world_size={ddp_info['world_size']}, rank={ddp_info['rank']}, local_rank={ddp_local_rank}")
+
+    if master_process:
+        for name, param in model.named_parameters():
+            if 'lora' in name and param.requires_grad:
+                print(name, param.shape)                # lora系列模型的插入位置信息debug
 
     shanghai_tz = pytz.timezone('Asia/Shanghai')                                # 设置时区为亚洲/上海
     start_timestamp = datetime.now(shanghai_tz).strftime("%Y%m%d_%H%M%S")       # 获取当前时间戳
 
     swanlab_run = None
-    if hyperparameters.get('use_swanlab', False):
+    if hyperparameters.get('use_swanlab', False) and master_process:  # DDP: 只在主进程初始化 swanlab
         swanlab_run = swanlab.init(
             project=hyperparameters.get('swanlab_project', 'please name your swanlab project'),
             experiment_name=f"{hyperparameters.get('task_name', 'please name your experiment name')}_{start_timestamp}",
@@ -649,7 +666,8 @@ def run_finetune_engine(train_dataloader,
     else:
         log_name = hyperparameters["ft_type"]
 
-    print(f"权重保存格式: hugging face格式:{SAVE_HUGGINGFACE_PRETRAINED_MODEL} || lora格式:{save_lora_only}")
+    if master_process:
+        print(f"权重保存格式: hugging face格式:{SAVE_HUGGINGFACE_PRETRAINED_MODEL} || lora格式:{save_lora_only}")
 
     # 从超参数中获取值
     lr = hyperparameters['learning_rate']
@@ -678,14 +696,17 @@ def run_finetune_engine(train_dataloader,
                 )
         if param_groups:
             optimizer = AdamW(param_groups)
-            print(f"Using LoRA+ optimizer param groups (ratio={lora_plus_lr_ratio}).")
+            if master_process:
+                print(f"Using LoRA+ optimizer param groups (ratio={lora_plus_lr_ratio}).")
         else:
-            print("LoRA+ optimizer requested but no compatible modules found; fallback to standard AdamW.")
+            if master_process:
+                print("LoRA+ optimizer requested but no compatible modules found; fallback to standard AdamW.")
 
     if optimizer is None:
         optimizer = AdamW(trainable_parameters, lr=lr, weight_decay=wd)
 
-    debug_print_optimizer_param_groups(optimizer)
+    if master_process:
+        debug_print_optimizer_param_groups(optimizer)
     # loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
     # BF16 指数范围与 FP32 相同，不会产生梯度上溢，无需 GradScaler
     _use_bf16 = torch.cuda.is_bf16_supported()
@@ -701,7 +722,8 @@ def run_finetune_engine(train_dataloader,
     # MFU 估算器：基于 SAM ViT-B，RTX 5090 BF16 峰值算力
     sam_type = hyperparameters.get('sam_type', 'sam_base')
     mfu_estimator = SAMMFUEstimator(sam_type=sam_type, gpu_type='rtx5090')
-    print(mfu_estimator.summary())
+    if master_process:
+        print(mfu_estimator.summary())
 
     history = {
         "train_loss": [], "train_dice": [], "train_iou": [], "train_hd95": [],
@@ -713,10 +735,11 @@ def run_finetune_engine(train_dataloader,
     best_epoch = -1
     best_model_path = None
 
-    if use_early_stop:
-        print(f"早停已启用 (patience={patience}, min_delta={min_delta}).")
-    else:
-        print("早停已关闭：将运行完整训练轮次，同时仍跟踪最佳指标以保存模型。")
+    if master_process:
+        if use_early_stop:
+            print(f"早停已启用 (patience={patience}, min_delta={min_delta}).")
+        else:
+            print("早停已关闭：将运行完整训练轮次，同时仍跟踪最佳指标以保存模型。")
 
     # TF32：在 matmul 和 cudnn 上允许 TF32，在几乎不损失精度的前提下提升吞吐
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -727,24 +750,45 @@ def run_finetune_engine(train_dataloader,
     # 保存未编译的原始模型引用，用于训练结束后加载最佳权重（避免对已编译模型做 load_state_dict 触发重新编译）
     base_model = model
 
-    # torch.compile：对计算图进行静态优化，减少 kernel launch 开销
-    try:
-        model = torch.compile(model, mode='default')
-        print("torch.compile 已启用 (mode='default')")
-    except Exception as e:
-        print(f"torch.compile 不可用，跳过: {e}")
+    # torch.compile：只编译计算量最大的 vision_encoder 子模块，
+    # 避免 mask_decoder 中的条件分支导致 compile 失败或产生过大的中间缓存
+    use_compile = not hyperparameters.get('no_compile', False)
+    if use_compile:
+        try:
+            model.vision_encoder = torch.compile(model.vision_encoder, mode='default')
+            if master_process:
+                print("torch.compile 已启用 (仅 vision_encoder, mode='default')")
+        except Exception as e:
+            if master_process:
+                print(f"torch.compile 不可用，跳过: {e}")
+    else:
+        if master_process:
+            print("torch.compile 已禁用 (--no_compile)")
+
+    # ---------- DDP 包装（仿照 nanoGPT，在 compile 之后包装）----------
+    # find_unused_parameters=True: SAM 的 prompt_encoder 等模块在某些前向路径中不参与 loss 计算，
+    # DDP 默认会报错，开启此选项允许存在未使用的参数
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+    raw_model = model.module if ddp else model  # 用于保存权重时获取未包装的模型
 
     model.train()
 
     # CHANGE: 仅在需要时计算 offset_info
     offset_info = None
     if process_batch_fn == _process_batch_severstal:
-        print("Severstal-specific processing enabled. Calculating offset info.")
+        if master_process:
+            print("Severstal-specific processing enabled. Calculating offset info.")
         offset_info = severstal_get_offset()
 
     # 将 process_batch_fn 传递给训练周期函数
     for epoch in range(num_epochs):
-        print(f"--- Epoch {epoch + 1}/{num_epochs} ---")
+        if master_process:
+            print(f"--- Epoch {epoch + 1}/{num_epochs} ---")
+
+        # DDP: 每个 epoch 设置 sampler 的 epoch，保证各进程数据的 shuffle 不同
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
         # 每个 epoch 重新创建 tracker，EMA 从头累积
         batch_size = hyperparameters.get('batch_size', 4)
@@ -753,18 +797,22 @@ def run_finetune_engine(train_dataloader,
         train_loss, train_dice, train_iou, train_hd95, train_mfu = _train_one_epoch(
             model, train_dataloader, optimizer,
             cosine_scheduler, loss_fn, process_batch_fn, scaler, device,
-            auto_seg=auto_seg, offset_info=offset_info, mfu_tracker=mfu_tracker)
+            auto_seg=auto_seg, offset_info=offset_info, mfu_tracker=mfu_tracker,
+            master_process=master_process)
 
-        mfu_str = f"{train_mfu*100:.2f}%" if train_mfu >= 0 else "N/A"
-        print(f"Training loss: {train_loss:.4f}, train dice: {train_dice:.4f}, "
-              f"train iou: {train_iou:.4f}, train hd95: {train_hd95:.4f}, MFU: {mfu_str}")
+        if master_process:
+            mfu_str = f"{train_mfu*100:.2f}%" if train_mfu >= 0 else "N/A"
+            print(f"Training loss: {train_loss:.4f}, train dice: {train_dice:.4f}, "
+                  f"train iou: {train_iou:.4f}, train hd95: {train_hd95:.4f}, MFU: {mfu_str}")
 
-        for i, param_group in enumerate(optimizer.param_groups):
-            print(f"Current learning rate (param_group {i}): {param_group['lr']:.6e}")
+            for i, param_group in enumerate(optimizer.param_groups):
+                print(f"Current learning rate (param_group {i}): {param_group['lr']:.6e}")
 
         val_loss, val_dice, val_iou, val_hd95 = _evaluate(model, val_dataloader, loss_fn, process_batch_fn,
-                                                      device, scaler, auto_seg = auto_seg, offset_info=offset_info)
-        print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val HD95: {val_hd95:.4f}')
+                                                      device, scaler, auto_seg = auto_seg, offset_info=offset_info,
+                                                      master_process=master_process)
+        if master_process:
+            print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val HD95: {val_hd95:.4f}')
 
         history["train_loss"].append(train_loss)
         history["train_dice"].append(train_dice)
@@ -808,17 +856,19 @@ def run_finetune_engine(train_dataloader,
                 "val_iou": val_iou,
                 "val_hd95": val_hd95,
             }
-            print(f"验证 dice 改善到 {best_val_dicescore:.4f}, 保存模型...")
-            best_model_path = save_model( hyperparameters=hyperparameters,
-                                            start_timestamp = start_timestamp,
-                                            model=model,
-                                            optimizer=optimizer,
-                                            scaler=scaler,
-                                            epoch = epoch+1,
-                                            model_name= log_name,
-                                            target_dir= save_dir,
-                                            SAVE_HUGGINGFACE_PRETRAINED_MODEL = SAVE_HUGGINGFACE_PRETRAINED_MODEL,
-                                            save_lora_only=save_lora_only)
+            # DDP: 只在主进程保存模型，避免多进程同时写文件冲突
+            if master_process:
+                print(f"验证 dice 改善到 {best_val_dicescore:.4f}, 保存模型...")
+                best_model_path = save_model( hyperparameters=hyperparameters,
+                                                start_timestamp = start_timestamp,
+                                                model=raw_model,  # DDP: 使用未包装的模型保存权重
+                                                optimizer=optimizer,
+                                                scaler=scaler,
+                                                epoch = epoch+1,
+                                                model_name= log_name,
+                                                target_dir= save_dir,
+                                                SAVE_HUGGINGFACE_PRETRAINED_MODEL = SAVE_HUGGINGFACE_PRETRAINED_MODEL,
+                                                save_lora_only=save_lora_only)
             if swanlab_run:
                 swanlab.log({
                     "best_epoch": best_epoch,
@@ -834,65 +884,81 @@ def run_finetune_engine(train_dataloader,
         else:
             if use_early_stop:
                 no_improve_epochs += 1
-                print(f"验证 dice 未改善, 已连续 {no_improve_epochs} 个 epoch 没有提升.")
+                if master_process:
+                    print(f"验证 dice 未改善, 已连续 {no_improve_epochs} 个 epoch 没有提升.")
             else:
-                print("验证 dice 未改善（未启用早停），继续完整训练。")
+                if master_process:
+                    print("验证 dice 未改善（未启用早停），继续完整训练。")
 
-        output_data = save_training_logs( hyperparameters = hyperparameters,
-                                            results = history,
-                                            epoch = epoch+1,
-                                            start_timestamp = start_timestamp,
-                                            result_name = log_name,
-                                            target_dir = save_dir)
+        if master_process:
+            output_data = save_training_logs( hyperparameters = hyperparameters,
+                                                results = history,
+                                                epoch = epoch+1,
+                                                start_timestamp = start_timestamp,
+                                                result_name = log_name,
+                                                target_dir = save_dir)
         if use_early_stop and no_improve_epochs >= patience:
-            print(f"验证指标连续 {patience} 个 epoch 无改善，提前停止训练。")
+            if master_process:
+                print(f"验证指标连续 {patience} 个 epoch 无改善，提前停止训练。")
             break
 
-    print("\n--- Training finished. Starting final evaluation with the best model. ---")
+    # ---------- 最终评估：所有 rank 都执行（torchrun 要求所有进程一起退出）----------
+    if master_process:
+        print("\n--- Training finished. Starting final evaluation with the best model. ---")
+
     if not best_model_path:
-        print("Warning: No best model was saved. Final evaluation will be on the last state of the model.")
-        loaded_model = model
+        if master_process:
+            print("Warning: No best model was saved. Final evaluation will be on the last state of the model.")
+        loaded_model = raw_model
     else:
-        print(f"Loading best model from: {best_model_path}")
+        if master_process:
+            print(f"Loading best model from: {best_model_path}")
         if SAVE_HUGGINGFACE_PRETRAINED_MODEL:
             try:
                 config = PeftConfig.from_pretrained(best_model_path)
                 base_model_path = config.base_model_name_or_path
                 base_model = SamModel.from_pretrained(base_model_path)
-                
-                loaded_model = PeftModel.from_pretrained(base_model, best_model_path)       # 从保存的路径加载 PeftModel
+
+                loaded_model = PeftModel.from_pretrained(base_model, best_model_path)
                 loaded_model.to(device)
-                print("Successfully loaded model in Hugging Face PEFT format.")
             except Exception as e:
-                print(f"Error loading Hugging Face PEFT model: {e}")
-                loaded_model = None            # 加载失败
+                if master_process:
+                    print(f"Error loading Hugging Face PEFT model: {e}")
+                loaded_model = None
         elif save_lora_only:
-            # 使用未编译的原始模型加载权重，避免重新编译
-            loaded_model = create_model_for_inference(model=base_model, lora_weights_path=best_model_path, device=device)
+            # 需要从最佳 epoch 的保存文件中读取 lora 参数，覆盖掉当前的过拟合参数
+            lora_state_dict = torch.load(best_model_path, map_location=device)
+            lora_state_dict = {k.replace('_orig_mod.', ''): v for k, v in lora_state_dict.items()}
+            base_model.load_state_dict(lora_state_dict, strict=False)
+            
+            loaded_model = base_model
+            loaded_model.eval()
         else:
             checkpoint = torch.load(best_model_path, map_location=device)
-            # 使用未编译的原始模型加载权重，避免重新编译
             base_model.load_state_dict(checkpoint['model_state_dict'])
             loaded_model = base_model
-            print("Successfully loaded model from standard PyTorch checkpoint.")
 
-    # 在测试集上评估
-    final_test_loss, final_test_dice, final_test_iou, final_test_hd95 = _evaluate(loaded_model, test_dataloader, loss_fn, process_batch_fn, device, scaler, auto_seg=auto_seg, offset_info = offset_info)
-    print(f'Final Test Set Evaluation: Loss: {final_test_loss:.4f}, Dice: {final_test_dice:.4f}, IoU: {final_test_iou:.4f}, HD95: {final_test_hd95:.4f}')
-    history["final_test_metrics"]={"loss": final_test_loss, "dice": final_test_dice, "iou": final_test_iou, "hd95": final_test_hd95}
+    # 所有 rank 都跑评估（只有 master 显示进度条和打印结果）
+    final_test_loss, final_test_dice, final_test_iou, final_test_hd95 = _evaluate(
+        loaded_model, test_dataloader, loss_fn, process_batch_fn, device, scaler,
+        auto_seg=auto_seg, offset_info=offset_info, master_process=master_process)
 
-    if swanlab_run:
-        swanlab.log({"test/test_dice": final_test_dice,
-                     "test/test_iou": final_test_iou,
-                     "test/test_hd95": final_test_hd95})
-        swanlab.finish()
+    if master_process:
+        print(f'Final Test Set Evaluation: Loss: {final_test_loss:.4f}, Dice: {final_test_dice:.4f}, IoU: {final_test_iou:.4f}, HD95: {final_test_hd95:.4f}')
+        history["final_test_metrics"]={"loss": final_test_loss, "dice": final_test_dice, "iou": final_test_iou, "hd95": final_test_hd95}
 
-    # 将最终结果保存到日志文件中
-    save_training_logs(
-        hyperparameters=hyperparameters, results=history, epoch=output_data["last_completed_epoch"],
-        start_timestamp=start_timestamp, result_name=log_name, target_dir=save_dir,
-    )
-    print("--- Training finished ---")
+        if swanlab_run:
+            swanlab.log({"test/test_dice": final_test_dice,
+                         "test/test_iou": final_test_iou,
+                         "test/test_hd95": final_test_hd95})
+            swanlab.finish()
+
+        save_training_logs(
+            hyperparameters=hyperparameters, results=history, epoch=output_data["last_completed_epoch"],
+            start_timestamp=start_timestamp, result_name=log_name, target_dir=save_dir,
+        )
+        print("--- Training finished ---")
+
     return history, model
 
 

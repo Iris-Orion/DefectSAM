@@ -49,6 +49,9 @@ def add_common_ft_args(parser):
     # 环境与设备
     parser.add_argument('--device_id', type=int, default=0, help='训练使用的设备ID (GPU)')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载器 (DataLoader) 的工作进程数')
+    parser.add_argument('--local-rank', '--local_rank', type=int, default=-1, help='torchrun DDP 自动传入，无需手动设置')
+    parser.add_argument('--no_compile', action='store_true', help='禁用 torch.compile 以节省显存')
+
 
     # 微调与保存策略
     parser.add_argument('--ft_type', type=str, default="loradsc_qv", help='微调方法类型')

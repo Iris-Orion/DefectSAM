@@ -1,5 +1,8 @@
 import math
+import os
 import torch
+import torch.distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
 import matplotlib.pyplot as plt
 import numpy as np
 import random
@@ -10,21 +13,69 @@ def set_device(gpu_idx: int=0):
     print(f"Set device: {device}")
     return device
 
-def set_seed(seed: int = 42):
+def setup_ddp():
+    """
+    检测并初始化 DDP 环境（仿照 nanoGPT 写法）。
+    通过环境变量 RANK 自动判断是否在 torchrun 启动的分布式环境中。
+
+    Returns:
+        dict: 包含 DDP 相关信息的字典:
+            - ddp (bool): 是否处于 DDP 模式
+            - rank (int): 全局 rank
+            - local_rank (int): 本节点内的 rank（用于设备分配）
+            - world_size (int): 总进程数
+            - master_process (bool): 是否为主进程（rank == 0），主进程负责日志、保存等
+            - device (torch.device): 当前进程绑定的 GPU 设备
+
+    使用方式:
+        # 单卡: python train.py
+        # 多卡: torchrun --standalone --nproc_per_node=4 train.py
+    """
+    ddp = int(os.environ.get('RANK', -1)) != -1  # 通过 RANK 环境变量判断是否为 DDP 运行
+    if ddp:
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = torch.device(f'cuda:{ddp_local_rank}')
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0  # 只有 rank 0 负责日志记录和模型保存
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        device = None  # 非 DDP 模式下由训练脚本自行设置
+
+    return {
+        'ddp': ddp,
+        'rank': ddp_rank,
+        'local_rank': ddp_local_rank,
+        'world_size': ddp_world_size,
+        'master_process': master_process,
+        'device': device,
+    }
+
+def cleanup_ddp():
+    """销毁 DDP 进程组，在训练结束时调用。"""
+    if int(os.environ.get('RANK', -1)) != -1:
+        destroy_process_group()
+
+def set_seed(seed: int = 42, seed_offset: int = 0):
     """
     设置随机种子以确保实验可重复性。
+    DDP 模式下每个进程使用不同的 seed_offset，保证各卡采样数据不同。
 
     参数:
         seed (int): 随机种子值。默认为42。
+        seed_offset (int): 种子偏移量，DDP 模式下传入 rank 值。默认为0。
     """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # torch.cuda.manual_seed_all(seed)  # 如果使用多GPU
-    # # 确保在每次操作时使用相同的种子
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
+    actual_seed = seed + seed_offset
+    random.seed(actual_seed)
+    np.random.seed(actual_seed)
+    torch.manual_seed(actual_seed)
+    torch.cuda.manual_seed(actual_seed)
+    torch.cuda.manual_seed_all(actual_seed)  # 多 GPU 时同步设置
 
 def get_lr_scheduler(optimizer, warmup_steps, total_steps, eta_min_ratio=0.1):
     """Cosine warmup scheduler，最终学习率衰减到 base_lr * eta_min_ratio。
