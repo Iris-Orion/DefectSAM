@@ -29,11 +29,16 @@ from utils.utils import (compute_dice_score,
                          print_trainable_parameters)
 from utils.mfu import SAMMFUEstimator, MFUTracker
 
-from utils.sam_arch import (get_loradsc_model, 
-                            get_loradsc_gated_model, 
-                            get_sam_loraDSC_qv_vision_encoder, 
-                            create_model_for_inference, 
-                            loraConv_attnqkv)
+from utils.sam_arch import (get_loradsc_model,
+                            get_loradsc_global_only_model,
+                            get_loradsc_gated_model,
+                            get_sam_loraDSC_qv_vision_encoder,
+                            create_model_for_inference,
+                            loraConv_attnqkv,
+                            get_loraplus_model,
+                            get_loraga_model,
+                            get_lorapro_model,
+                            get_moelora_model)
 from utils.loratask import get_hf_lora_model, get_hf_adalora_model
 
 
@@ -80,6 +85,10 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
     if model_type == 'loradsc_qv':
         return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
 
+    elif model_type == 'loradsc_qv_global':
+        return get_loradsc_global_only_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+                                             ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
+
     elif model_type == 'loradsc_qv_gated':
         return get_loradsc_gated_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
                                        ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
@@ -99,6 +108,27 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
     
     elif model_type == 'lora_attn_qv':
         return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False)
+
+    elif model_type == 'loraplus_qv':
+        args.use_loraplus_optim = True  # 强制启用 LoRA+ 优化器
+        return get_loraplus_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+                                  ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
+
+    elif model_type == 'loraga_qv':
+        device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
+        return get_loraga_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+                                train_dataloader=train_dataloader, device=device, sam_type=sam_type)
+
+    elif model_type == 'lorapro_qv':
+        device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
+        model, pro_hook = get_lorapro_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+                                            train_dataloader=train_dataloader, device=device, sam_type=sam_type)
+        model._lorapro_hook = pro_hook  # 挂到模型上，训练循环中调用
+        return model
+
+    elif model_type == 'moelora_qv':
+        return get_moelora_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+                                 num_experts=3, kernel_sizes=[3, 5, 7], sam_type=sam_type)
 
     elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'sam_fully', 'sam_decoder']:
         hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
@@ -543,12 +573,21 @@ def _train_one_epoch(model,
                                                 auto_seg=auto_seg,
                                                 offset_info=offset_info)
 
+        # 获取 LoRA-Pro hook（如果存在）
+        _raw = getattr(model, 'module', model)  # DDP unwrap
+        _pro_hook = getattr(_raw, '_lorapro_hook', None)
+
         if use_amp:
             scaler.scale(loss).backward()
+            if _pro_hook is not None:
+                scaler.unscale_(optimizer)
+                _pro_hook.replace_gradients()
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            if _pro_hook is not None:
+                _pro_hook.replace_gradients()
             optimizer.step()
 
         scheduler.step()  # 学习率调度，根据选择的scheduler需要判断scheduler在每个batch中更新还是在一轮epoch之后再更新

@@ -7,21 +7,24 @@ from transformers import SamModel
 from utils.utils import print_trainable_parameters
 
 class LoRACore(nn.Module):
-    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout_rate=0):
+    def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0):
         super().__init__()
         self.in_features = qkv_layer.in_features
         self.out_features = qkv_layer.out_features
-        self.merge = merge
+        self.enabled = enabled
         self.rank = rank
         self.lora_alpha = lora_alpha
         self.dropout_rate = dropout_rate
-        
+
         self.linear = qkv_layer
         if rank > 0:
             self.linear.weight.requires_grad = False
+            if self.linear.bias is not None:
+                self.linear.bias.requires_grad = False
         self.scale = self.lora_alpha / self.rank if self.rank > 0 else 0.0
-        
-        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+        # dropout 只作用于 LoRA 分支的输入: lora_b(lora_a(dropout(x))) * scale
+        self.lora_dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
     def init_weights(self):
         """计算 LoRA 调整量（子类重写此方法）"""
@@ -40,9 +43,9 @@ class LoRASam_Plus(LoRACore):
     - LoRA+ 的核心在优化策略：A/B 使用不同学习率（通常 B 更大）；
     - 本类提供 get_loraplus_param_groups 以便优化器直接使用不同 lr。
     """
-    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout_rate=0,
+    def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
                  ft_q=True, ft_k=False, ft_v=True):
-        super().__init__(qkv_layer, merge, rank, lora_alpha, dropout_rate)
+        super().__init__(qkv_layer, enabled, rank, lora_alpha, dropout_rate)
         self.ft_q = ft_q
         self.ft_k = ft_k
         self.ft_v = ft_v
@@ -72,7 +75,7 @@ class LoRASam_Plus(LoRACore):
             nn.init.zeros_(self.lora_b[part].weight)
 
     def _get_delta(self, x, part: str):
-        return self.lora_b[part](self.lora_a[part](x)) * self.scale
+        return self.lora_b[part](self.lora_a[part](self.lora_dropout(x))) * self.scale
 
     def get_loraplus_param_groups(self, base_lr: float, lora_plus_lr_ratio: float = 16.0, weight_decay: float = 0.0):
         """
@@ -93,7 +96,7 @@ class LoRASam_Plus(LoRACore):
         ]
 
     def forward(self, x):
-        if self.rank > 0 and self.merge:
+        if self.rank > 0 and self.enabled:
             qkv = self.linear(x)
             q, k, v = torch.chunk(qkv, 3, dim=-1)
 
@@ -104,17 +107,16 @@ class LoRASam_Plus(LoRACore):
             if self.ft_v:
                 v = v + self._get_delta(x, 'v')
 
-            qkv_adjusted = torch.cat((q, k, v), dim=-1)
-            return self.dropout(qkv_adjusted)
-        return self.dropout(self.linear(x))
+            return torch.cat((q, k, v), dim=-1)
+        return self.linear(x)
 
 class LoRASam_DepWiseConv(LoRACore):
     """
     对sam的encoder的attention部分选中的q, k, v层的各种组合形式进行lora-dsc修改(refactor version)
     """
-    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout_rate=0, 
+    def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
                  ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True):
-        super().__init__(qkv_layer, merge, rank, lora_alpha, dropout_rate)
+        super().__init__(qkv_layer, enabled, rank, lora_alpha, dropout_rate)
         self.ft_q = ft_q
         self.ft_k = ft_k
         self.ft_v = ft_v
@@ -153,19 +155,20 @@ class LoRASam_DepWiseConv(LoRACore):
                 nn.init.kaiming_uniform_(self.lora_pw_conv[part].weight, a=math.sqrt(5))
     
     def _get_delta(self, x, part: str):
+        x_drop = self.lora_dropout(x)
         if self.add_dsc_conv:
-            delta = self.lora_a[part](x)                    # [B, H, W, rank]
+            delta = self.lora_a[part](x_drop)               # [B, H, W, rank]
             delta = delta.permute(0, 3, 1, 2)               # 转换为卷积格式: [B, rank, H, W]
             delta = self.lora_dw_conv[part](delta)
             delta = self.lora_pw_conv[part](delta)
             delta = delta.permute(0, 2, 3, 1)               # 转换回原格式:[B, H, W, rank]
             delta = self.lora_b[part](delta) * self.scale
         else: # 标准 LoRA
-            delta = self.lora_b[part](self.lora_a[part](x)) * self.scale
+            delta = self.lora_b[part](self.lora_a[part](x_drop)) * self.scale
         return delta
 
     def forward(self, x):
-        if self.rank > 0 and self.merge:
+        if self.rank > 0 and self.enabled:
             qkv = self.linear(x)
             q, k, v = torch.chunk(qkv, 3, dim=-1)
             if self.ft_q:
@@ -175,10 +178,30 @@ class LoRASam_DepWiseConv(LoRACore):
             if self.ft_v:
                 v = v + self._get_delta(x, 'v')
 
-            qkv_adjusted = torch.cat((q, k, v), dim=-1)
-            return self.dropout(qkv_adjusted)
+            return torch.cat((q, k, v), dim=-1)
         else:
-            return self.dropout(self.linear(x))
+            return self.linear(x)
+
+
+class LoRASam_DepWiseConv_Residual(LoRASam_DepWiseConv):
+    """
+    LoRA-DSC with residual connection around the DSC block:
+    delta = lora_b( lora_a(x) + DSC(lora_a(x)) ) * scale
+
+    当 DSC 不提供有用信息时，残差路径保留纯 LoRA 信号；
+    DSC 仅需学习空间增量修正，降低优化难度。
+    """
+    def _get_delta(self, x, part: str):
+        x_drop = self.lora_dropout(x)
+        if self.add_dsc_conv:
+            h = self.lora_a[part](x_drop)                   # [B, H, W, rank]
+            conv_in = h.permute(0, 3, 1, 2)                 # [B, rank, H, W]
+            conv_out = self.lora_pw_conv[part](self.lora_dw_conv[part](conv_in))
+            conv_out = conv_out.permute(0, 2, 3, 1)         # [B, H, W, rank]
+            delta = self.lora_b[part](h + conv_out) * self.scale   # 残差: identity + DSC
+        else:
+            delta = self.lora_b[part](self.lora_a[part](x_drop)) * self.scale
+        return delta
 
 
 class LoRASam_DepWiseConv_Gated(LoRASam_DepWiseConv):
@@ -188,11 +211,11 @@ class LoRASam_DepWiseConv_Gated(LoRASam_DepWiseConv):
     - 在每个被微调分支(q/k/v)上引入可学习门控 gamma；
     - 提供 LoRA+ 参数组接口（A 与 B/Conv/Gate 分组不同学习率）。
     """
-    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout_rate=0,
+    def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
                  ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, gate_init: float = 1e-3):
         super().__init__(
             qkv_layer=qkv_layer,
-            merge=merge,
+            enabled=enabled,
             rank=rank,
             lora_alpha=lora_alpha,
             dropout_rate=dropout_rate,
@@ -633,11 +656,42 @@ def get_loradsc_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, add_dsc_
             param.requires_grad_(False)
     for layers in hgsam_model.vision_encoder.layers:
         # lora_alpha 默认应该等于 rank
-        layers.attn.qkv = LoRASam_DepWiseConv(qkv_layer = layers.attn.qkv, merge = True, 
-                                              rank=rank, lora_alpha=lora_alpha, dropout_rate=dropout_rate, 
+        layers.attn.qkv = LoRASam_DepWiseConv(qkv_layer = layers.attn.qkv, enabled = True,
+                                              rank=rank, lora_alpha=lora_alpha, dropout_rate=dropout_rate,
                                               ft_q = ft_q, ft_k = ft_k, ft_v = ft_v,
                                               add_dsc_conv=add_dsc_conv)
     return hgsam_model
+
+def get_loradsc_global_only_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, sam_type: str = "sam_base"):
+    """
+    仅在 global attention block 上注入 DSC，window attention block 使用纯 LoRA。
+    SAM ViT-B global_attn_indexes = [2, 5, 8, 11]
+    SAM ViT-L global_attn_indexes = [5, 11, 17, 23]
+    """
+    if sam_type == "sam_base":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+        global_attn_indexes = {2, 5, 8, 11}
+    elif sam_type == "sam_large":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
+        global_attn_indexes = {5, 11, 17, 23}
+
+    for name, param in hgsam_model.named_parameters():
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+
+    for i, layers in enumerate(hgsam_model.vision_encoder.layers):
+        use_dsc = i in global_attn_indexes
+        layers.attn.qkv = LoRASam_DepWiseConv(
+            qkv_layer=layers.attn.qkv, enabled=True,
+            rank=rank, lora_alpha=lora_alpha, dropout_rate=dropout_rate,
+            ft_q=ft_q, ft_k=ft_k, ft_v=ft_v,
+            add_dsc_conv=use_dsc)
+
+    dsc_count = len(global_attn_indexes)
+    total = len(list(hgsam_model.vision_encoder.layers))
+    print(f"--- DSC injected in {dsc_count}/{total} layers (global attention only) ---")
+    return hgsam_model
+
 
 def get_loradsc_gated_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, add_dsc_conv,
                             gate_init: float = 1e-3, sam_type: str = "sam_base"):
@@ -658,7 +712,7 @@ def get_loradsc_gated_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, ad
     for layers in hgsam_model.vision_encoder.layers:
         layers.attn.qkv = LoRASam_DepWiseConv_Gated(
             qkv_layer=layers.attn.qkv,
-            merge=True,
+            enabled=True,
             rank=rank,
             lora_alpha=lora_alpha,
             dropout_rate=dropout_rate,
@@ -691,7 +745,7 @@ def get_loraplus_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=False, ft
     for layers in hgsam_model.vision_encoder.layers:
         layers.attn.qkv = LoRASam_Plus(
             qkv_layer=layers.attn.qkv,
-            merge=True,
+            enabled=True,
             rank=rank,
             lora_alpha=lora_alpha,
             dropout_rate=dropout_rate,
@@ -757,6 +811,208 @@ def loraConv_attnqkv(lora_rank=16, lora_alpha=16, dropout_rate=0.0, add_std_conv
 #     for layers in hgsam_model.vision_encoder.layers:
 #         layers.attn.qkv = LoRA_Moe_DepwiseConv_Samqv(qkv_layer = layers.attn.qkv, merge = True, rank=rank, lora_alpha=rank, dropout=dropout, num_experts=3, kernel_sizes=[3, 5, 7])
 #     return hgsam_model
+
+def get_moelora_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_sizes=[3, 5, 7], sam_type="sam_base"):
+    """MoE-LoRA: 多专家DSC卷积 + 门控路由"""
+    if sam_type == "sam_base":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    elif sam_type == "sam_large":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
+    else:
+        raise ValueError(f"Unknown sam_type: {sam_type}")
+
+    for name, param in hgsam_model.named_parameters():
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+    for layers in hgsam_model.vision_encoder.layers:
+        layers.attn.qkv = LoRA_Moe_DepwiseConv_Samqv(
+            qkv_layer=layers.attn.qkv, merge=True,
+            rank=rank, lora_alpha=lora_alpha, dropout=dropout_rate,
+            num_experts=num_experts, kernel_sizes=kernel_sizes)
+    return hgsam_model
+
+
+def apply_lora_ga_init(model, train_dataloader, device, rank, lora_alpha):
+    """
+    LoRA-GA: 对已注入 LoRA 的模型，用首批数据的梯度 SVD 重新初始化 A/B，
+    并修正基底权重以维持零阶近似。
+    逐层串行计算梯度以避免 OOM。
+    """
+    import monai
+    model.to(device)
+    model.eval()  # 避免 dropout 干扰
+
+    loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+    batch = next(iter(train_dataloader))
+    images = batch["image"].to(device)
+    gt_masks = batch["mask"].unsqueeze(1).float().to(device)
+    bboxes = batch["bbox"].unsqueeze(1).to(device)
+
+    scale = lora_alpha / rank
+    out_per_part = model.vision_encoder.layers[0].attn.qkv.linear.out_features // 3
+
+    # 逐层串行：每次只解冻一个 qkv 层，计算梯度，SVD 初始化，再冻结
+    for layer_idx, layer in enumerate(model.vision_encoder.layers):
+        qkv_mod = layer.attn.qkv
+        # 临时解冻当前层的 qkv 基底权重
+        qkv_mod.linear.weight.requires_grad_(True)
+
+        # 前向 + 反向（只用 1 张图，节省显存）
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            outputs = model(pixel_values=images[:1], input_boxes=bboxes[:1], multimask_output=False)
+            predicted_masks = outputs.pred_masks.squeeze(1)
+            gt_down = F.interpolate(gt_masks[:1], size=(256, 256), mode="nearest")
+            loss = loss_fn(predicted_masks, gt_down)
+        loss.backward()
+
+        G = qkv_mod.linear.weight.grad  # (3*out, in)
+        if G is not None:
+            part_slices = {'q': slice(0, out_per_part), 'v': slice(2 * out_per_part, 3 * out_per_part)}
+            for part, sl in part_slices.items():
+                if part not in qkv_mod.lora_a:
+                    continue
+                G_part = G[sl, :].float()  # 确保 SVD 在 fp32
+
+                U, S, Vh = torch.linalg.svd(G_part, full_matrices=False)
+                A0 = U[:, :rank].contiguous()
+                B0 = Vh[rank:2 * rank, :].contiguous()
+
+                with torch.no_grad():
+                    qkv_mod.lora_a[part].weight.copy_(B0)
+                    qkv_mod.lora_b[part].weight.copy_(A0)
+                    qkv_mod.linear.weight.data[sl, :] -= scale * (A0 @ B0)
+
+        qkv_mod.linear.weight.requires_grad_(False)
+        model.zero_grad()
+        torch.cuda.empty_cache()
+
+    print(f"[LoRA-GA] SVD initialization complete for {len(model.vision_encoder.layers)} layers.")
+    return model
+
+
+def get_loraga_model(rank, lora_alpha, dropout_rate, train_dataloader, device, sam_type="sam_base"):
+    """LoRA-GA: 标准LoRA结构 + SVD梯度初始化"""
+    model = get_loradsc_model(rank=rank, lora_alpha=lora_alpha, dropout_rate=dropout_rate,
+                              ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False, sam_type=sam_type)
+    model = apply_lora_ga_init(model, train_dataloader, device, rank, lora_alpha)
+    return model
+
+
+class LoRAProGradHook:
+    """
+    LoRA-Pro: 每步训练后替换 LoRA 梯度为 Sylvester 方程的最优解。
+    通过 forward hook 保存输入，backward hook 获取输出梯度，
+    在 optimizer.step() 前调用 replace_gradients() 修正梯度。
+    """
+    def __init__(self, model, rank, lora_alpha):
+        self.model = model
+        self.rank = rank
+        self.scale = lora_alpha / rank
+        self._hooks = []
+        self._saved = {}  # layer_idx -> {'input': ..., 'grad_output': ...}
+
+        for idx, layer in enumerate(model.vision_encoder.layers):
+            qkv_mod = layer.attn.qkv
+            # Forward hook: 保存输入
+            h = qkv_mod.register_forward_hook(self._make_fwd_hook(idx))
+            self._hooks.append(h)
+            # Backward hook: 保存输出梯度
+            h = qkv_mod.register_full_backward_hook(self._make_bwd_hook(idx))
+            self._hooks.append(h)
+
+    def _make_fwd_hook(self, idx):
+        def hook(module, input, output):
+            self._saved.setdefault(idx, {})['input'] = input[0].detach()
+        return hook
+
+    def _make_bwd_hook(self, idx):
+        def hook(module, grad_input, grad_output):
+            self._saved.setdefault(idx, {})['grad_output'] = grad_output[0].detach()
+        return hook
+
+    def replace_gradients(self):
+        """在 loss.backward() 之后、optimizer.step() 之前调用"""
+        for idx, layer in enumerate(self.model.vision_encoder.layers):
+            qkv_mod = layer.attn.qkv
+            saved = self._saved.get(idx)
+            if saved is None or 'input' not in saved or 'grad_output' not in saved:
+                continue
+
+            X = saved['input']          # [B, H, W, in_features]
+            dY = saved['grad_output']   # [B, H, W, 3*out_per_part]
+
+            out_per_part = qkv_mod.linear.out_features // 3
+            # 分拆 dY 为 q/k/v 梯度
+            dY_parts = {'q': dY[..., :out_per_part], 'v': dY[..., 2*out_per_part:]}
+
+            for part in ['q', 'v']:
+                if part not in qkv_mod.lora_a:
+                    continue
+
+                A = qkv_mod.lora_b[part].weight.data  # (out_per_part, rank)
+                B = qkv_mod.lora_a[part].weight.data  # (rank, in_features)
+
+                # 重构全量梯度: G_t = dY_part^T @ X  但直接实例化太大
+                # 改用投影: 只需计算 H_A 和 H_B
+                dY_p = dY_parts[part]  # [B, H, W, out_per_part]
+
+                # Reshape for matmul: (N, out_per_part) and (N, in_features)
+                N = X.shape[0] * X.shape[1] * X.shape[2]
+                X_flat = X.reshape(N, -1).float()        # (N, in_features)
+                dY_flat = dY_p.reshape(N, -1).float()    # (N, out_per_part)
+
+                # G_t = dY_flat^T @ X_flat  → (out_per_part, in_features)
+                # 但不要实例化完整 G_t，用分块投影:
+                # H_B_raw = A^T @ G_t = A^T @ (dY^T @ X) = (dY @ A)^T @ X
+                AtdY = dY_flat @ A           # (N, rank)
+                H_B_raw = AtdY.T @ X_flat    # (rank, in_features)
+
+                # H_A_raw = G_t @ B^T = (dY^T @ X) @ B^T = dY^T @ (X @ B^T)
+                XBt = X_flat @ B.T           # (N, rank)
+                H_A_raw = dY_flat.T @ XBt    # (out_per_part, rank)
+
+                # Sylvester 修正: 从 H_A_raw 中减去 A 空间的投影，分配给 H_B
+                # P_A = A @ inv(A^T @ A) @ A^T
+                AtA = A.T @ A + 1e-6 * torch.eye(self.rank, device=A.device)  # 正则化
+                AtA_inv = torch.linalg.inv(AtA)
+                proj_A = A @ AtA_inv @ A.T  # (out_per_part, out_per_part) - 太大!
+
+                # 改用高效计算:
+                # proj_component = A @ inv(A^T@A) @ A^T @ H_A_raw = A @ (inv(A^T@A) @ (A^T @ H_A_raw))
+                proj_coeff = AtA_inv @ (A.T @ H_A_raw)  # (rank, rank)
+                H_A_proj = A @ proj_coeff               # (out_per_part, rank)
+
+                H_A = H_A_raw - H_A_proj  # 正交补: 去掉 A 列空间中的分量
+
+                # H_B: 将 H_A 解掉后的残差分配给 B
+                # residual G_t contribution not captured by H_A: G_res = G_t - H_A @ B
+                # H_B = inv(A^T A) @ A^T @ G_res = inv(A^T A) @ (A^T @ G_t - A^T @ H_A @ B)
+                # = H_B_raw/scale - inv(A^T A) @ A^T @ H_A @ B  (since H_B_raw = A^T @ G_t implicitly)
+                # 简化: 直接用伪逆 B 空间
+                BBt = B @ B.T + 1e-6 * torch.eye(self.rank, device=B.device)
+                BBt_inv = torch.linalg.inv(BBt)
+                H_B = BBt_inv @ H_B_raw
+
+                # 写入梯度 (除以 scale 因为 delta = lora_b(lora_a(x)) * scale)
+                if qkv_mod.lora_a[part].weight.grad is not None:
+                    qkv_mod.lora_a[part].weight.grad.copy_(H_B * self.scale)
+                if qkv_mod.lora_b[part].weight.grad is not None:
+                    qkv_mod.lora_b[part].weight.grad.copy_(H_A * self.scale)
+
+        self._saved.clear()
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+
+def get_lorapro_model(rank, lora_alpha, dropout_rate, train_dataloader, device, sam_type="sam_base"):
+    """LoRA-Pro: LoRA-GA 初始化 + Sylvester 梯度修正（返回模型和 hook 对象）"""
+    model = get_loraga_model(rank, lora_alpha, dropout_rate, train_dataloader, device, sam_type)
+    pro_hook = LoRAProGradHook(model, rank, lora_alpha)
+    return model, pro_hook
+
 
 def measure_inference_time(model, input_tensor, num_runs=10):
     """
@@ -855,75 +1111,3 @@ if __name__ == "__main__":
 
     img = torch.rand((1, 3, 1024, 1024))
     vs_encoder_output = model.vision_encoder(img)
-
-    # print("-------推理时间测试------")
-    # original_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    # for name, param in original_model.named_parameters():
-    #     if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
-    #         param.requires_grad_(False)
-
-    # img = img.to('cuda')
-    # # 测量原始模型推理时间
-    # original_model.to('cuda')
-    
-    # original_avg_time = measure_inference_time(original_model, img)
-    # print(f"原始模型平均推理时间: {original_avg_time:.6f} 秒")
-
-    # # 测量 LoRA 模型推理时间
-    # model.to('cuda')
-    # lora_avg_time = measure_inference_time(model, img)
-    # print(f"LoRA 模型平均推理时间: {lora_avg_time:.6f} 秒")
-
-
-    # print(vs_encoder_output)
-
-    # x = torch.rand((1, 3, 1024, 1024))
-
-    # output = hgsam_model.vision_encoder(x)
-    # print(type(output))
-
-    # # t_layer_0, block = hgsam_model.vision_encoder.layers[0]
-
-    # print(hgsam_model.vision_encoder.layers[0])
-
-    # for name, child in hgsam_model.vision_encoder.layers[0].named_children():
-    #     print('------')
-    #     print(name)
-    #     print('||')
-    #     print(child)
-    #     print('------')
-
-
-    # linear = hgsam_model.vision_encoder.layers[0].attn.qkv
-    # print(linear.bias)
-    # print(linear.weight)
-    # print(linear.in_features)
-    # print(linear.out_features)
-    # y = torch.rand(768)
-    # y_out = linear(y)
-    # print(y_out)
-
-    # for t_layer_i, blk in enumerate(hgsam_model.vision_encoder.layers):
-    #     w_qkv_linear = blk.attn.qkv.in_features
-    #     w_qkv_bias = blk.attn.qkv.bias
-    #     w_proj_linear = blk.attn.proj.weight
-    #     w_proj_bias = blk.attn.proj.bias
-    #     print(w_qkv_linear)
-    #     # print(w_qkv_linear.in_features)
-    #     print(w_qkv_bias.shape)
-    #     print(w_proj_linear.shape)
-    #     print(w_proj_bias.shape)
-    
-    # # 定义你的配置 (必须与训练时完全一致)
-    # LORA_RANK = 16
-    # LORA_ADD_CONV = True
-    # LORA_WEIGHTS_PATH = "./new_weights/neu_seg_output/neu_seg_finetue_loradsc_qv_encoder_20250712_044024.pth"
-    # DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
-
-    # # 使用我们封装好的函数一步创建模型
-    # final_model = create_model_for_inference(model = model,
-    #                                          lora_rank = None,
-    #                                          lora_add_conv = None,
-    #                                         lora_weights_path=LORA_WEIGHTS_PATH,
-    #                                         device=DEVICE
-    #                                     )
