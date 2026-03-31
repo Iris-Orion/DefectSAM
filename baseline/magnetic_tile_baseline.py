@@ -14,8 +14,7 @@ from weights.magnetic_wts import magnetic_dict
 if __name__ == "__main__":
     set_seed(42)
 
-    parser = get_bse_args()
-    args = parser.parse_args()  
+    args = get_bse_args()
     hyperparameters = vars(args)
 
     train_dataset, val_dataset, test_dataset = create_mag_dataset_baseline()
