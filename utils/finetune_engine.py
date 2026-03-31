@@ -40,6 +40,56 @@ from utils.sam_arch import (get_loradsc_model,
                             get_lorapro_model,
                             get_moelora_model)
 from utils.loratask import get_hf_lora_model, get_hf_adalora_model
+from utils.sam_arch import LoRA_Moe_DepwiseConv_Samqv
+
+
+def collect_moe_gate_stats(model):
+    """收集所有 MoE LoRA 层的 gate weights 分布统计，用于诊断门控坍塌。
+    返回 dict: {
+        'gate_q/layer_{i}/expert_{j}_mean': float,
+        'gate_v/layer_{i}/expert_{j}_mean': float,
+        'gate_q/layer_{i}/entropy': float,   # 越高=越均匀，log(3)≈1.099 为最大值
+        'gate_v/layer_{i}/entropy': float,
+        'gate_q/layer_{i}/max_prob': float,  # 最大专家概率均值，越接近1=越坍塌
+        'gate_v/layer_{i}/max_prob': float,
+    }
+    如果模型中没有 MoE 层或没有缓存的 gate probs，返回空 dict。
+    """
+    raw_model = model.module if hasattr(model, 'module') else model
+
+    # 收集所有子模块，包括 torch.compile 包装的子模块内部
+    all_modules = []
+    def _collect(m):
+        all_modules.append(m)
+        # torch.compile 包装后原始模块在 _orig_mod 中，需要递归进入
+        if hasattr(m, '_orig_mod'):
+            for sub in m._orig_mod.modules():
+                all_modules.append(sub)
+        else:
+            for child in m.children():
+                _collect(child)
+    _collect(raw_model)
+
+    stats = {}
+    layer_idx = 0
+    for module in all_modules:
+        if isinstance(module, LoRA_Moe_DepwiseConv_Samqv):
+            for prefix, attr in [('gate_q', '_last_gate_probs_q'), ('gate_v', '_last_gate_probs_v')]:
+                probs = getattr(module, attr, None)
+                if probs is None:
+                    continue
+                # probs: [batch, num_experts], 取 batch 均值
+                mean_probs = probs.mean(dim=0)  # [num_experts]
+                for j, p in enumerate(mean_probs):
+                    stats[f'{prefix}/layer_{layer_idx}/expert_{j}_mean'] = p.item()
+                # 熵: -sum(p * log(p))，衡量分布均匀度
+                entropy = -(mean_probs * torch.log(mean_probs + 1e-8)).sum().item()
+                stats[f'{prefix}/layer_{layer_idx}/entropy'] = entropy
+                # 最大概率均值: 每个 batch 样本的 max prob 的均值
+                max_prob = probs.max(dim=-1).values.mean().item()
+                stats[f'{prefix}/layer_{layer_idx}/max_prob'] = max_prob
+            layer_idx += 1
+    return stats
 
 
 def debug_print_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None:
@@ -853,6 +903,16 @@ def run_finetune_engine(train_dataloader,
         if master_process:
             print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val HD95: {val_hd95:.4f}')
 
+        # MoE gate 诊断：在终端打印门控分布摘要
+        if master_process:
+            moe_gate_stats = collect_moe_gate_stats(model)
+            if moe_gate_stats:
+                entropy_vals = [v for k, v in moe_gate_stats.items() if 'entropy' in k]
+                max_prob_vals = [v for k, v in moe_gate_stats.items() if 'max_prob' in k]
+                if entropy_vals:
+                    print(f'MoE Gate: avg_entropy={sum(entropy_vals)/len(entropy_vals):.4f} (max=1.099), '
+                          f'avg_max_prob={sum(max_prob_vals)/len(max_prob_vals):.4f}')
+
         history["train_loss"].append(train_loss)
         history["train_dice"].append(train_dice)
         history["train_iou"].append(train_iou)
@@ -877,6 +937,10 @@ def run_finetune_engine(train_dataloader,
             }
             if train_mfu >= 0:
                 log_dict["train/mfu_pct"] = train_mfu * 100
+            # MoE gate 诊断：收集门控权重分布并记录到 swanlab
+            moe_stats = collect_moe_gate_stats(model)
+            if moe_stats:
+                log_dict.update({f"moe/{k}": v for k, v in moe_stats.items()})
             swanlab.log(log_dict, step=epoch+1)
 
         improved = val_dice - best_val_dicescore > min_delta

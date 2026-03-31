@@ -251,6 +251,7 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
                 "train_loss": avg_train_loss,
                 "train_dice": avg_train_dice,
                 "train_iou": avg_train_iou,
+                "train_hd95": avg_train_hd95,
                 "val_loss": avg_val_loss,
                 "val_dice": avg_val_dice,
                 "val_iou": avg_val_iou,

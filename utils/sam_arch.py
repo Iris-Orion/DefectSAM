@@ -112,7 +112,9 @@ class LoRASam_Plus(LoRACore):
 
 class LoRASam_DepWiseConv(LoRACore):
     """
-    对sam的encoder的attention部分选中的q, k, v层的各种组合形式进行lora-dsc修改(refactor version)
+    构建LoRA_a -> dsc -> LoRA_B组件
+    对sam的encoder的attention部分选中的q, k, v层的各种组合形式进行lora-dsc修改
+    当add_dsc_conv=False时退化为标准LoRA
     """
     def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
                  ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True):
@@ -591,8 +593,9 @@ class LoRA_Moe_DepwiseConv_Samqv(nn.Module):
 
             # 计算门控权重
             gate_input_q = delta_q.mean(dim=[2,3])  # [batch, rank]
-            gate_weights_q = self.gate_q(gate_input_q)  # [batch, num_experts]
-            gate_weights_q = torch.softmax(gate_weights_q, dim=-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [batch, num_experts, 1, 1, 1]
+            gate_probs_q = torch.softmax(self.gate_q(gate_input_q), dim=-1)  # [batch, num_experts]
+            self._last_gate_probs_q = gate_probs_q.detach()  # 缓存用于诊断
+            gate_weights_q = gate_probs_q.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [batch, num_experts, 1, 1, 1]
 
             # 加权求和
             weighted_experts_q = (expert_outputs_q * gate_weights_q).sum(dim=1)  # [batch, rank, height, width]
@@ -611,8 +614,9 @@ class LoRA_Moe_DepwiseConv_Samqv(nn.Module):
 
             # 计算门控权重
             gate_input_v = delta_v.mean(dim=[2,3])  # [batch, rank]
-            gate_weights_v = self.gate_v(gate_input_v)  # [batch, num_experts]
-            gate_weights_v = torch.softmax(gate_weights_v, dim=-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [batch, num_experts, 1, 1, 1]
+            gate_probs_v = torch.softmax(self.gate_v(gate_input_v), dim=-1)  # [batch, num_experts]
+            self._last_gate_probs_v = gate_probs_v.detach()  # 缓存用于诊断
+            gate_weights_v = gate_probs_v.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [batch, num_experts, 1, 1, 1]
 
             # 加权求和
             weighted_experts_v = (expert_outputs_v * gate_weights_v).sum(dim=1)  # [batch, rank, height, width]
