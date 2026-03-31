@@ -17,6 +17,7 @@ def _add_base_args(parser):
     parser.add_argument('--device_id', type=int, default=0, help='gpu id')
     parser.add_argument('--num_workers', type=int, default=4, help='num_workers')
 
+    parser.add_argument('--no_compile', action='store_true', help='禁用 torch.compile 以节省显存')
     parser.add_argument('--infer_mode', action="store_true", help='推理模式')
     parser.add_argument('--use_swanlab', '--swanlab', action='store_true', help='是否使用 swanlab 记录')
     parser.add_argument('--swanlab_project', '--pj_name', type=str, default='input your project name', help='swanlab项目名称')
@@ -48,7 +49,6 @@ def _add_finetune_args(parser):
 
     # 环境与设备
     parser.add_argument('--local-rank', '--local_rank', type=int, default=-1, help='torchrun DDP 自动传入，无需手动设置')
-    parser.add_argument('--no_compile', action='store_true', help='禁用 torch.compile 以节省显存')
 
     # 微调与保存策略
     parser.add_argument('--ft_type', type=str, default="loradsc_qv", help='微调方法类型')

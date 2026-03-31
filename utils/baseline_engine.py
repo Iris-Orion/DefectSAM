@@ -183,11 +183,14 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
     model.to(device)
 
     # torch.compile：静态图优化，减少 kernel launch overhead
-    try:
-        model = torch.compile(model, mode='default')
-        print("torch.compile 已启用 (mode='default')")
-    except Exception as e:
-        print(f"torch.compile 不可用，跳过: {e}")
+    if hyperparameters.get('no_compile', False):
+        print("torch.compile 已被 --no_compile 禁用")
+    else:
+        try:
+            model = torch.compile(model, mode='default')
+            print("torch.compile 已启用 (mode='default')")
+        except Exception as e:
+            print(f"torch.compile 不可用，跳过: {e}")
 
     # BF16 GradScaler：BF16 指数范围与 FP32 相同，无需梯度缩放
     _use_bf16 = torch.cuda.is_bf16_supported()
