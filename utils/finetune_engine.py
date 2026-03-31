@@ -868,7 +868,7 @@ def run_finetune_engine(train_dataloader,
     # find_unused_parameters=True: SAM 的 prompt_encoder 等模块在某些前向路径中不参与 loss 计算，
     # DDP 默认会报错，开启此选项允许存在未使用的参数
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model  # 用于保存权重时获取未包装的模型
 
     model.train()

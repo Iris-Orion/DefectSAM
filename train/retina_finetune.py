@@ -11,7 +11,7 @@ from utils.helper_function import set_seed
 from utils.config import get_common_ft_args
 from data.retina_dataset import create_retina_dataset_ft, create_retina_dataset_ft_kfold
 
-from weights.weights_dict_dhs_sd900 import sd900_dict, scale_sd900_dict, new_sd900_dict, sam_sd900_dict
+from weights.sd900_wts import sd900_dict
 
 
 def build_retina_dataloaders(train_dataset, val_dataset, test_dataset, batch_size, num_workers):
@@ -256,7 +256,7 @@ if __name__ == '__main__':
         # checkpoints_to_evaluate = sd900_dict()
         # checkpoints_to_evaluate = scale_sd900_dict()
         # checkpoints_to_evaluate = new_sd900_dict()
-        checkpoints_to_evaluate = sam_sd900_dict()
+        checkpoints_to_evaluate = sd900_dict()
 
         device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
         for checkpoint_info in checkpoints_to_evaluate:

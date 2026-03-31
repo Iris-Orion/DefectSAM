@@ -9,7 +9,7 @@ from utils.utils import compute_dice_score, compute_iou_score
 from data.magnetic_tile_dataset import create_magnetic_dataset
 from utils.helper_function import set_seed
 from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, zero_shot, create_model_from_type
-from weights.weights_dict_dhs_magnetic import magnetic_tile_dict, scale_magnetic_tile_dict, mag_sam_dict, mag_dscqv_16_dict
+from weights.magnetic_wts import magnetic_dict
 
 def mag_inference(model, device, dataloader, scaler):
     model.to(device) 
@@ -59,6 +59,7 @@ if __name__ == "__main__":
     hyperparameters['optimizer'] = 'AdamW'
     hyperparameters['loss_function'] = 'monai.DiceCELoss'
     hyperparameters['scheduler'] = 'cosine'
+    hyperparameters['task_name'] = "magnetic_" + hyperparameters['ft_type']
 
     print(hyperparameters)
 
@@ -100,7 +101,7 @@ if __name__ == "__main__":
         seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
         # checkpoints_to_evaluate = magnetic_tile_dict()
         # checkpoints_to_evaluate = scale_magnetic_tile_dict()
-        checkpoints_to_evaluate = mag_dscqv_16_dict()
+        checkpoints_to_evaluate = magnetic_dict()
         for checkpoint_info in checkpoints_to_evaluate:
             checkpoint_path = checkpoint_info["path"]
             loading_type = checkpoint_info["type"]

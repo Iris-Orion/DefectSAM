@@ -11,7 +11,7 @@ from utils.baseline_engine import baseline_experiment, bsl_inference_engine, cre
 from utils.config import get_bse_args
 from data.sd900_dataset import sd900_bsl_create_dataset, get_label_distribution, test_sd900_info
 
-from weights.weights_dict_dhs_sd900 import bsl_sd900_dict
+from weights.sd900_wts import sd900_dict
 
 if __name__ == '__main__':
     args = get_bse_args()  
@@ -73,7 +73,7 @@ if __name__ == '__main__':
                             )
     
     else:
-        checkpoints_to_evaluate = bsl_sd900_dict()
+        checkpoints_to_evaluate = sd900_dict()
         for checkpoint_info in checkpoints_to_evaluate:
 
             checkpoint_path = checkpoint_info["path"]

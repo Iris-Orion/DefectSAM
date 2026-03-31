@@ -12,7 +12,7 @@ from utils.finetune_engine import (run_finetune_engine,
 from data.sd900_dataset import (sd900_finetune_create_dataset, 
                                 sd900_finetune_create_dataloader)
 
-from weights.weights_dict_dhs_sd900 import sd900_dict, scale_sd900_dict, new_sd900_dict, sam_sd900_dict
+from weights.sd900_wts import sd900_dict
 
 
 if __name__ == '__main__':
@@ -77,7 +77,7 @@ if __name__ == '__main__':
         # checkpoints_to_evaluate = sd900_dict()
         # checkpoints_to_evaluate = scale_sd900_dict()
         # checkpoints_to_evaluate = new_sd900_dict()
-        checkpoints_to_evaluate = sam_sd900_dict()
+        checkpoints_to_evaluate = sd900_dict()
 
         device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
         for checkpoint_info in checkpoints_to_evaluate:

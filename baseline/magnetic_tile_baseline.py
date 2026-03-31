@@ -7,9 +7,9 @@ from utils.helper_function import get_lr_scheduler
 from utils.helper_function import set_seed
 from utils.baseline_engine import baseline_experiment, bsl_inference_engine, create_bsl_model_from_type
 from utils.config import get_bse_args
-from data.data_utils_baseline import create_mag_dataset_baseline
+from data.magnetic_tile_dataset import create_mag_dataset_baseline
 
-from weights.weights_dict_dhs_magnetic import baseline_magnetic_tile_dict
+from weights.magnetic_wts import magnetic_dict
 
 if __name__ == "__main__":
     set_seed(42)
@@ -57,7 +57,7 @@ if __name__ == "__main__":
                                                     hyperparameters=hyperparameters, 
                                                     save_best_model=args.save_bse_model)
     else:
-        checkpoints_to_evaluate = baseline_magnetic_tile_dict()
+        checkpoints_to_evaluate = magnetic_dict()
         for checkpoint_info in checkpoints_to_evaluate:
 
             checkpoint_path = checkpoint_info["path"]

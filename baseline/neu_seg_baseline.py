@@ -9,7 +9,7 @@ from utils.config import get_bse_args
 from utils.helper_function import set_seed
 from data.neu_dataset import neu_bsl_create_dataset
 from utils.baseline_engine import baseline_experiment, bsl_inference_engine, create_bsl_model_from_type
-from weights.neu_weights import bsl_neu_dict
+from weights.neu_wts import neu_dict
 
 if __name__ == "__main__":
     set_seed(42)
@@ -73,7 +73,7 @@ if __name__ == "__main__":
                             hyperparameters = hyperparameters,
                             save_best_model = True)
     else:
-        checkpoints_to_evaluate = bsl_neu_dict()
+        checkpoints_to_evaluate = neu_dict()
         for checkpoint_info in checkpoints_to_evaluate:
 
             checkpoint_path = checkpoint_info["path"]

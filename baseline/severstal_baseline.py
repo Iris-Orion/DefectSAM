@@ -9,7 +9,7 @@ from data import severstal
 from utils.config import get_severstal_bsl_args
 from utils.helper_function import set_seed
 from utils.baseline_engine import baseline_experiment, bsl_inference_engine, create_bsl_model_from_type
-from weights.weights_dict_dhs_sever import bsl_sever_dict, bsl_sever_dict_2
+from weights.severstal_wts import severstal_dict
 
 if __name__ == '__main__':
     args = get_severstal_bsl_args()
@@ -80,7 +80,7 @@ if __name__ == '__main__':
                             save_best_model = args.save_bse_model)
     else:
         # checkpoints_to_evaluate = bsl_sever_dict()
-        checkpoints_to_evaluate = bsl_sever_dict_2()
+        checkpoints_to_evaluate = severstal_dict()
         for checkpoint_info in checkpoints_to_evaluate:
 
             checkpoint_path = checkpoint_info["path"]

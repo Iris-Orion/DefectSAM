@@ -23,7 +23,7 @@ from data.severstal import SteelDataset_WithBoxPrompt
 from utils.config import get_severstal_ft_args
 from utils.helper_function import set_seed, setup_ddp, cleanup_ddp
 from utils.finetune_engine import create_model_from_type, run_finetune_engine, inference_engine, _process_batch_severstal, zero_shot
-from weights.weights_dict_dhs_sever import difRank_sever_dict, scale_sever_dict
+from weights.severstal_wts import severstal_dict
 
 if __name__ == '__main__':
     # ---------- DDP 初始化 ----------
@@ -111,7 +111,7 @@ if __name__ == '__main__':
 
     else:
         if args.include_no_defect:
-            checkpoints_to_evaluate = difRank_sever_dict()
+            checkpoints_to_evaluate = severstal_dict()
         else:
             checkpoints_to_evaluate = None
         scaler = torch.amp.GradScaler(enabled=True)
