@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 
 from utils.config import get_common_ft_args
 from utils.utils import compute_dice_score, compute_iou_score
-from data.data_utils_ft import create_magnetic_dataset
+from data.magnetic_tile_dataset import create_magnetic_dataset
 from utils.helper_function import set_seed
 from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, zero_shot, create_model_from_type
 from weights.weights_dict_dhs_magnetic import magnetic_tile_dict, scale_magnetic_tile_dict, mag_sam_dict, mag_dscqv_16_dict
@@ -74,7 +74,7 @@ if __name__ == "__main__":
         results, fintuned_model = run_finetune_engine(train_dataloader, val_dataloader, test_dataloader, 
                                                       model, device, hyperparameters, 
                                                       process_batch_fn = _process_batch,
-                                                      save_dir = hyperparameters['output_dir'],
+                                                      save_dir = "./new_weights/finetune/mag_output/"+hyperparameters['ft_type'],
                                                       auto_seg = args.auto_seg)
     
     elif args.zero_shot:

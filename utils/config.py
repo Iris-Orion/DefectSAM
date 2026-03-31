@@ -45,6 +45,8 @@ def add_common_ft_args(parser):
     parser.add_argument('--lora_dropout', type=float, default=0.0, help='LoRA 的 dropout 比例')
     parser.add_argument('--use_loraplus_optim', action='store_true', help='是否启用 LoRA+ 优化器参数组')
     parser.add_argument('--lora_plus_lr_ratio', type=float, default=16.0, help='LoRA+ 中 B 组学习率相对 A 组的倍数')
+    parser.add_argument('--moe_expert_type', type=str, default='conv', choices=['conv', 'linear', 'lora_conv'],
+                        help='MoE专家类型: conv=DSC卷积(默认), linear=纯线性, lora_conv=线性+DSC串联')
 
     # 环境与设备
     parser.add_argument('--device_id', type=int, default=0, help='训练使用的设备ID (GPU)')

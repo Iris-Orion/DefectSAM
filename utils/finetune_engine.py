@@ -38,7 +38,8 @@ from utils.sam_arch import (get_loradsc_model,
                             get_loraplus_model,
                             get_loraga_model,
                             get_lorapro_model,
-                            get_moelora_model)
+                            get_moelora_model,
+                            get_moeloraplus_model)
 from utils.loratask import get_hf_lora_model, get_hf_adalora_model
 from utils.sam_arch import LoRA_Moe_DepwiseConv_Samqv
 
@@ -177,8 +178,17 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
         return model
 
     elif model_type == 'moelora_qv':
+        expert_type = getattr(args, 'moe_expert_type', 'conv')
         return get_moelora_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                 num_experts=3, kernel_sizes=[3, 5, 7], sam_type=sam_type)
+                                 num_experts=3, kernel_sizes=[3, 5, 7], sam_type=sam_type,
+                                 expert_type=expert_type)
+
+    elif model_type == 'moeloraplus_qv':
+        args.use_loraplus_optim = True  # 强制启用 LoRA+ 优化器
+        expert_type = getattr(args, 'moe_expert_type', 'conv')
+        return get_moeloraplus_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+                                     num_experts=3, kernel_sizes=[3, 5, 7], sam_type=sam_type,
+                                     expert_type=expert_type)
 
     elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'sam_fully', 'sam_decoder']:
         hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
@@ -836,8 +846,8 @@ def run_finetune_engine(train_dataloader,
 
     model.to(device)
 
-    # 保存未编译的原始模型引用，用于训练结束后加载最佳权重（避免对已编译模型做 load_state_dict 触发重新编译）
-    base_model = model
+    # 保存未编译的 vision_encoder 引用，用于保存/加载权重时还原
+    _orig_vision_encoder = model.vision_encoder
 
     # torch.compile：只编译计算量最大的 vision_encoder 子模块，
     # 避免 mask_decoder 中的条件分支导致 compile 失败或产生过大的中间缓存
@@ -962,9 +972,12 @@ def run_finetune_engine(train_dataloader,
             # DDP: 只在主进程保存模型，避免多进程同时写文件冲突
             if master_process:
                 print(f"验证 dice 改善到 {best_val_dicescore:.4f}, 保存模型...")
+                # 保存前还原 compiled vision_encoder，保存后恢复
+                if use_compile:
+                    raw_model.vision_encoder = _orig_vision_encoder
                 best_model_path = save_model( hyperparameters=hyperparameters,
                                                 start_timestamp = start_timestamp,
-                                                model=raw_model,  # DDP: 使用未包装的模型保存权重
+                                                model=raw_model,
                                                 optimizer=optimizer,
                                                 scaler=scaler,
                                                 epoch = epoch+1,
@@ -972,6 +985,8 @@ def run_finetune_engine(train_dataloader,
                                                 target_dir= save_dir,
                                                 SAVE_HUGGINGFACE_PRETRAINED_MODEL = SAVE_HUGGINGFACE_PRETRAINED_MODEL,
                                                 save_lora_only=save_lora_only)
+                if use_compile:
+                    raw_model.vision_encoder = torch.compile(_orig_vision_encoder, mode='default')
             if swanlab_run:
                 swanlab.log({
                     "best_epoch": best_epoch,
@@ -1009,6 +1024,10 @@ def run_finetune_engine(train_dataloader,
     if master_process:
         print("\n--- Training finished. Starting final evaluation with the best model. ---")
 
+    # 最终评估前先还原 compiled 模块，避免 state_dict key 不匹配
+    if use_compile:
+        raw_model.vision_encoder = _orig_vision_encoder
+
     if not best_model_path:
         if master_process:
             print("Warning: No best model was saved. Final evaluation will be on the last state of the model.")
@@ -1020,9 +1039,9 @@ def run_finetune_engine(train_dataloader,
             try:
                 config = PeftConfig.from_pretrained(best_model_path)
                 base_model_path = config.base_model_name_or_path
-                base_model = SamModel.from_pretrained(base_model_path)
+                fresh_base = SamModel.from_pretrained(base_model_path)
 
-                loaded_model = PeftModel.from_pretrained(base_model, best_model_path)
+                loaded_model = PeftModel.from_pretrained(fresh_base, best_model_path)
                 loaded_model.to(device)
             except Exception as e:
                 if master_process:
@@ -1031,15 +1050,14 @@ def run_finetune_engine(train_dataloader,
         elif save_lora_only:
             # 需要从最佳 epoch 的保存文件中读取 lora 参数，覆盖掉当前的过拟合参数
             lora_state_dict = torch.load(best_model_path, map_location=device)
-            lora_state_dict = {k.replace('_orig_mod.', ''): v for k, v in lora_state_dict.items()}
-            base_model.load_state_dict(lora_state_dict, strict=False)
-            
-            loaded_model = base_model
+            raw_model.load_state_dict(lora_state_dict, strict=False)
+
+            loaded_model = raw_model
             loaded_model.eval()
         else:
             checkpoint = torch.load(best_model_path, map_location=device)
-            base_model.load_state_dict(checkpoint['model_state_dict'])
-            loaded_model = base_model
+            raw_model.load_state_dict(checkpoint['model_state_dict'])
+            loaded_model = raw_model
 
     # 所有 rank 都跑评估（只有 master 显示进度条和打印结果）
     final_test_loss, final_test_dice, final_test_iou, final_test_hd95 = _evaluate(

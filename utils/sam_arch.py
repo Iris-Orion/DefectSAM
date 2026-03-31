@@ -290,7 +290,7 @@ class LoRA_encoder_attn_Conv(nn.Module):
         else:
             self.dropout = nn.Identity()
         self.initial_weights()
-    
+
     def initial_weights(self):
         if self.rank > 0:
             nn.init.kaiming_uniform_(self.lora_b, a=math.sqrt(5))
@@ -500,9 +500,32 @@ class LoRASam_qv_DepWiseConv(nn.Module):
         else:
             return self.dropout(self.linear(x))
 
+class _Reshape4d(nn.Module):
+    """[B, H, W, C] -> [B, C, H, W]"""
+    def forward(self, x):
+        return x.permute(0, 3, 1, 2)
+
+class _Reshape3d(nn.Module):
+    """[B, C, H, W] -> [B, H, W, C]"""
+    def forward(self, x):
+        return x.permute(0, 2, 3, 1)
+
 class LoRA_Moe_DepwiseConv_Samqv(nn.Module):
-    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout=0.05, num_experts=3, kernel_sizes=[3, 5, 7]):
+    """
+    MoE-LoRA for SAM's fused QKV projection.
+
+    expert_type controls the expert architecture in the low-rank space:
+        - 'conv'     : depthwise separable convolution experts (default, original behavior)
+        - 'linear'   : pure linear experts (rank→rank nn.Linear, no spatial ops)
+        - 'lora_conv': LoRA low-rank linear + DSC conv in each expert (sequential)
+    """
+    EXPERT_TYPES = ('conv', 'linear', 'lora_conv')
+
+    def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout=0.05,
+                 num_experts=3, kernel_sizes=[3, 5, 7], expert_type='conv'):
         super(LoRA_Moe_DepwiseConv_Samqv, self).__init__()
+        assert expert_type in self.EXPERT_TYPES, \
+            f"expert_type must be one of {self.EXPERT_TYPES}, got '{expert_type}'"
         self.in_features = qkv_layer.in_features
         self.out_features = qkv_layer.out_features
         self.merge = merge
@@ -511,6 +534,7 @@ class LoRA_Moe_DepwiseConv_Samqv(nn.Module):
         self.lora_alpha = lora_alpha
         self.num_experts = num_experts
         self.kernel_sizes = kernel_sizes
+        self.expert_type = expert_type
 
         self.linear = qkv_layer
         self.linear.bias = qkv_layer.bias
@@ -525,22 +549,11 @@ class LoRA_Moe_DepwiseConv_Samqv(nn.Module):
             self.lora_a_v = nn.Parameter(torch.zeros(rank, self.in_features))
             self.lora_b_v = nn.Parameter(torch.zeros(self.out_features // 3, rank))
 
-            self.scale = self.lora_alpha / self.rank  
+            self.scale = self.lora_alpha / self.rank
 
-            # 定义 Q 和 V 的多个深度可分离卷积专家
-            self.q_experts = nn.ModuleList([
-                nn.Sequential(
-                    nn.Conv2d(rank, rank, kernel_size=ks, padding=ks//2, groups=rank, bias=False),
-                    nn.Conv2d(rank, rank, kernel_size=1, padding=0, bias=False)
-                ) for ks in self.kernel_sizes
-            ])
-
-            self.v_experts = nn.ModuleList([
-                nn.Sequential(
-                    nn.Conv2d(rank, rank, kernel_size=ks, padding=ks//2, groups=rank, bias=False),
-                    nn.Conv2d(rank, rank, kernel_size=1, padding=0, bias=False)
-                ) for ks in self.kernel_sizes
-            ])
+            # 构建 Q/V 专家
+            self.q_experts = self._build_experts()
+            self.v_experts = self._build_experts()
 
             # 定义门控网络
             self.gate_q = nn.Linear(rank, self.num_experts)
@@ -552,21 +565,44 @@ class LoRA_Moe_DepwiseConv_Samqv(nn.Module):
             self.dropout = nn.Identity()
         self.initial_weights()
 
+    # ---- expert construction ----
+    def _build_experts(self):
+        if self.expert_type == 'conv':
+            return nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(self.rank, self.rank, kernel_size=ks, padding=ks//2, groups=self.rank, bias=False),
+                    nn.Conv2d(self.rank, self.rank, kernel_size=1, padding=0, bias=False)
+                ) for ks in self.kernel_sizes
+            ])
+        elif self.expert_type == 'linear':
+            return nn.ModuleList([
+                nn.Linear(self.rank, self.rank, bias=False)
+                for _ in range(self.num_experts)
+            ])
+        elif self.expert_type == 'lora_conv':
+            # 每个专家: 低秩线性 + DSC conv (串联)
+            return nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(self.rank, self.rank, bias=False),
+                    _Reshape4d(),  # [B, H, W, rank] -> [B, rank, H, W]
+                    nn.Conv2d(self.rank, self.rank, kernel_size=ks, padding=ks//2, groups=self.rank, bias=False),
+                    nn.Conv2d(self.rank, self.rank, kernel_size=1, padding=0, bias=False),
+                    _Reshape3d(),  # [B, rank, H, W] -> [B, H, W, rank]
+                ) for ks in self.kernel_sizes
+            ])
+
     def initial_weights(self):
         nn.init.kaiming_uniform_(self.lora_a_q, a=math.sqrt(5))
         nn.init.zeros_(self.lora_b_q)
         nn.init.kaiming_uniform_(self.lora_a_v, a=math.sqrt(5))
         nn.init.zeros_(self.lora_b_v)
 
-        for conv in self.q_experts:
-            for layer in conv:
-                if isinstance(layer, nn.Conv2d):
-                    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
-
-        for conv in self.v_experts:
-            for layer in conv:
-                if isinstance(layer, nn.Conv2d):
-                    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+        for expert_group in [self.q_experts, self.v_experts]:
+            for expert in expert_group:
+                for layer in expert.modules():
+                    if isinstance(layer, (nn.Conv2d, nn.Linear)) and layer is not self.linear:
+                        if hasattr(layer, 'weight'):
+                            nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
 
         nn.init.kaiming_uniform_(self.gate_q.weight, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.gate_v.weight, a=math.sqrt(5))
@@ -575,65 +611,86 @@ class LoRA_Moe_DepwiseConv_Samqv(nn.Module):
         if self.gate_v.bias is not None:
             nn.init.zeros_(self.gate_v.bias)
 
+    def get_loraplus_param_groups(self, base_lr: float, lora_plus_lr_ratio: float = 16.0, weight_decay: float = 0.0):
+        """
+        MoE-LoRA+ 参数组:
+        - A 矩阵使用 base_lr
+        - B 矩阵、专家卷积、门控网络使用 base_lr * ratio
+
+        这里的 LoRA+ 仍然以标准 LoRA 的 A/B 差异学习率为核心，
+        不额外引入独立 DSC 主干模块；MoE 仅作用于低秩空间。
+        """
+        if self.rank <= 0:
+            return []
+
+        a_params = [self.lora_a_q, self.lora_a_v]
+        b_side_params = [self.lora_b_q, self.lora_b_v]
+
+        for expert in self.q_experts:
+            b_side_params.extend(expert.parameters())
+        for expert in self.v_experts:
+            b_side_params.extend(expert.parameters())
+        b_side_params.extend(self.gate_q.parameters())
+        b_side_params.extend(self.gate_v.parameters())
+
+        return [
+            {"params": a_params, "lr": base_lr, "weight_decay": weight_decay},
+            {"params": b_side_params, "lr": base_lr * lora_plus_lr_ratio, "weight_decay": weight_decay},
+        ]
+
+    def _apply_experts(self, delta, experts, gate):
+        """
+        Apply MoE experts + gating on a low-rank representation.
+        delta: [B, H, W, rank]
+        Returns: weighted expert output [B, H, W, rank], gate_probs [B, num_experts]
+        """
+        if self.expert_type == 'linear':
+            # linear experts work on [B, H*W, rank] — no spatial reshape
+            B, H, W, R = delta.shape
+            flat = delta.reshape(B, H * W, R)          # [B, N, rank]
+            expert_outs = torch.stack([e(flat) for e in experts], dim=1)  # [B, E, N, rank]
+            gate_input = flat.mean(dim=1)               # [B, rank]
+            gate_probs = torch.softmax(gate(gate_input), dim=-1)  # [B, E]
+            weights = gate_probs.unsqueeze(-1).unsqueeze(-1)      # [B, E, 1, 1]
+            mixed = (expert_outs * weights).sum(dim=1)  # [B, N, rank]
+            return mixed.reshape(B, H, W, R), gate_probs
+        elif self.expert_type == 'lora_conv':
+            # lora_conv experts handle reshape internally
+            expert_outs = torch.stack([e(delta) for e in experts], dim=1)  # [B, E, H, W, rank]
+            gate_input = delta.mean(dim=[1, 2])         # [B, rank]
+            gate_probs = torch.softmax(gate(gate_input), dim=-1)
+            weights = gate_probs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            mixed = (expert_outs * weights).sum(dim=1)  # [B, H, W, rank]
+            return mixed, gate_probs
+        else:  # conv (original)
+            delta_4d = delta.permute(0, 3, 1, 2)       # [B, rank, H, W]
+            expert_outs = torch.stack([e(delta_4d) for e in experts], dim=1)  # [B, E, rank, H, W]
+            gate_input = delta_4d.mean(dim=[2, 3])      # [B, rank]
+            gate_probs = torch.softmax(gate(gate_input), dim=-1)
+            weights = gate_probs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            mixed = (expert_outs * weights).sum(dim=1)  # [B, rank, H, W]
+            return mixed.permute(0, 2, 3, 1), gate_probs
+
     def forward(self, x):
-        # print(f"x.shape: {x.shape}")  # e.g., [batch, height, width, in_features]
         if self.rank > 0 and self.merge:
             qkv = self.linear(x)
-            # print(f"qkv shape: {qkv.shape}")  # [batch, height, width, out_features]
             q, k, v = torch.chunk(qkv, 3, dim=-1)
-            # print(f"q shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}")  # [batch, height, width, out_features//3]
 
-            # Q 的 LoRA 调整
-            delta_q = (x @ self.lora_a_q.T)  # [batch, height, width, rank]
-            delta_q = delta_q.permute(0, 3, 1, 2)  # [batch, rank, height, width]
+            # Q branch
+            delta_q = x @ self.lora_a_q.T                          # [B, H, W, rank]
+            mixed_q, gate_probs_q = self._apply_experts(delta_q, self.q_experts, self.gate_q)
+            self._last_gate_probs_q = gate_probs_q.detach()
+            delta_q = (mixed_q @ self.lora_b_q.T) * self.scale
 
-            # 通过多个专家进行卷积，并使用门控权重加权
-            expert_outputs_q = [expert(delta_q) for expert in self.q_experts]  # List of [batch, rank, height, width]
-            expert_outputs_q = torch.stack(expert_outputs_q, dim=1)  # [batch, num_experts, rank, height, width]
+            # V branch
+            delta_v = x @ self.lora_a_v.T
+            mixed_v, gate_probs_v = self._apply_experts(delta_v, self.v_experts, self.gate_v)
+            self._last_gate_probs_v = gate_probs_v.detach()
+            delta_v = (mixed_v @ self.lora_b_v.T) * self.scale
 
-            # 计算门控权重
-            gate_input_q = delta_q.mean(dim=[2,3])  # [batch, rank]
-            gate_probs_q = torch.softmax(self.gate_q(gate_input_q), dim=-1)  # [batch, num_experts]
-            self._last_gate_probs_q = gate_probs_q.detach()  # 缓存用于诊断
-            gate_weights_q = gate_probs_q.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [batch, num_experts, 1, 1, 1]
-
-            # 加权求和
-            weighted_experts_q = (expert_outputs_q * gate_weights_q).sum(dim=1)  # [batch, rank, height, width]
-
-            # 转换回原始形状
-            weighted_experts_q = weighted_experts_q.permute(0, 2, 3, 1)  # [batch, height, width, rank]
-            delta_q = (weighted_experts_q @ self.lora_b_q.T) * self.scale  # [batch, height, width, out_features//3]
-
-            # V 的 LoRA 调整
-            delta_v = (x @ self.lora_a_v.T)  # [batch, height, width, rank]
-            delta_v = delta_v.permute(0, 3, 1, 2)  # [batch, rank, height, width]
-
-            # 通过多个专家进行卷积，并使用门控权重加权
-            expert_outputs_v = [expert(delta_v) for expert in self.v_experts]  # List of [batch, rank, height, width]
-            expert_outputs_v = torch.stack(expert_outputs_v, dim=1)  # [batch, num_experts, rank, height, width]
-
-            # 计算门控权重
-            gate_input_v = delta_v.mean(dim=[2,3])  # [batch, rank]
-            gate_probs_v = torch.softmax(self.gate_v(gate_input_v), dim=-1)  # [batch, num_experts]
-            self._last_gate_probs_v = gate_probs_v.detach()  # 缓存用于诊断
-            gate_weights_v = gate_probs_v.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [batch, num_experts, 1, 1, 1]
-
-            # 加权求和
-            weighted_experts_v = (expert_outputs_v * gate_weights_v).sum(dim=1)  # [batch, rank, height, width]
-
-            # 转换回原始形状
-            weighted_experts_v = weighted_experts_v.permute(0, 2, 3, 1)  # [batch, height, width, rank]
-            delta_v = (weighted_experts_v @ self.lora_b_v.T) * self.scale  # [batch, height, width, out_features//3]
-
-            # 将 LoRA 调整添加到 q 和 v
             q = q + delta_q
             v = v + delta_v
-
-            # 拼接调整后的 q, k, v
-            qkv_adjusted = torch.cat((q, k, v), dim=-1)  # [batch, height, width, out_features]
-            output = self.dropout(qkv_adjusted)
-            # print(f"Adjusted qkv shape: {output.shape}")  # [batch, height, width, out_features]
-            return output
+            return self.dropout(torch.cat((q, k, v), dim=-1))
         else:
             return self.dropout(self.linear(x))
 
@@ -816,8 +873,9 @@ def loraConv_attnqkv(lora_rank=16, lora_alpha=16, dropout_rate=0.0, add_std_conv
 #         layers.attn.qkv = LoRA_Moe_DepwiseConv_Samqv(qkv_layer = layers.attn.qkv, merge = True, rank=rank, lora_alpha=rank, dropout=dropout, num_experts=3, kernel_sizes=[3, 5, 7])
 #     return hgsam_model
 
-def get_moelora_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_sizes=[3, 5, 7], sam_type="sam_base"):
-    """MoE-LoRA: 多专家DSC卷积 + 门控路由"""
+def get_moelora_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_sizes=[3, 5, 7],
+                      sam_type="sam_base", expert_type='conv'):
+    """MoE-LoRA: 多专家 + 门控路由。expert_type: 'conv' | 'linear' | 'lora_conv'"""
     if sam_type == "sam_base":
         hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
     elif sam_type == "sam_large":
@@ -832,8 +890,29 @@ def get_moelora_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_size
         layers.attn.qkv = LoRA_Moe_DepwiseConv_Samqv(
             qkv_layer=layers.attn.qkv, merge=True,
             rank=rank, lora_alpha=lora_alpha, dropout=dropout_rate,
-            num_experts=num_experts, kernel_sizes=kernel_sizes)
+            num_experts=num_experts, kernel_sizes=kernel_sizes,
+            expert_type=expert_type)
     return hgsam_model
+
+
+def get_moeloraplus_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_sizes=[3, 5, 7],
+                          sam_type="sam_base", expert_type='conv'):
+    """
+    MoE-LoRA+：沿用 MoE-LoRA 的低秩专家结构，但训练时使用 LoRA+ 的差异学习率。
+
+    说明：
+    - LoRA+ 基线是标准 LoRA（A/B 两组不同学习率），不包含 DSC 主干模块；
+    - MoE 版本仅在低秩表示上加入专家卷积与门控，优化器分组仍按 LoRA+ 思路处理。
+    """
+    return get_moelora_model(
+        rank=rank,
+        lora_alpha=lora_alpha,
+        dropout_rate=dropout_rate,
+        num_experts=num_experts,
+        kernel_sizes=kernel_sizes,
+        sam_type=sam_type,
+        expert_type=expert_type,
+    )
 
 
 def apply_lora_ga_init(model, train_dataloader, device, rank, lora_alpha):
