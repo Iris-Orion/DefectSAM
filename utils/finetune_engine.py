@@ -1,8 +1,8 @@
 # 适配 severstal neu sd900 magnetic_tile flood数据集
 import torch
 import torch._dynamo
-torch._dynamo.config.capture_scalar_outputs = True
-torch._dynamo.config.suppress_errors = True   # 符号形状推导失败时静默回退到 eager，不打印警告
+# torch._dynamo.config.capture_scalar_outputs = True
+# torch._dynamo.config.suppress_errors = True   # 符号形状推导失败时静默回退到 eager，不打印警告
 
 import torch.nn.functional as F
 import pytz
@@ -31,10 +31,9 @@ from utils.mfu import SAMMFUEstimator, MFUTracker
 
 from utils.sam_arch import (get_loradsc_model,
                             get_loradsc_global_only_model,
+                            get_loradsc_residual_model,
                             get_loradsc_gated_model,
-                            get_sam_loraDSC_qv_vision_encoder,
                             create_model_for_inference,
-                            loraConv_attnqkv,
                             get_loraplus_model,
                             get_loraga_model,
                             get_lorapro_model,
@@ -134,11 +133,19 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
     print(f"--- Creating model of type: {model_type} with rank: {lora_rank} ---")
 
     if model_type == 'loradsc_qv':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
+        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, 
+        ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
+    
+    elif model_type == 'lora_attn_qv':
+        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False)
 
     elif model_type == 'loradsc_qv_global':
         return get_loradsc_global_only_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
                                              ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
+
+    elif model_type == 'loradsc_qv_residual':
+        return get_loradsc_residual_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+                                          ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
 
     elif model_type == 'loradsc_qv_gated':
         return get_loradsc_gated_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
@@ -153,12 +160,6 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
     
     elif model_type == 'loradsc_qkv':
         return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True)
-    
-    elif model_type == 'lora_attn':
-        return loraConv_attnqkv(lora_rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, add_std_conv=False)
-    
-    elif model_type == 'lora_attn_qv':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False)
 
     elif model_type == 'loraplus_qv':
         args.use_loraplus_optim = True  # 强制启用 LoRA+ 优化器
@@ -193,13 +194,7 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
     elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'sam_fully', 'sam_decoder']:
         hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
 
-        if model_type == 'lora_encoder':
-            return get_hf_lora_model(model=hgsam_model, target_part='vision_encoder')
-        
-        elif model_type == 'lora_decoder':
-            return get_hf_lora_model(model=hgsam_model, target_part='mask_decoder')
-
-        elif model_type == 'adalora_encoder':
+        if model_type == 'adalora_encoder':
             if train_dataloader is None:
                 raise ValueError("train_dataloader must be provided for 'adalora_encoder' type.")
             ada_target_r = lora_rank
@@ -214,9 +209,17 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
                 lora_alpha=lora_alpha,
             )
 
+        elif model_type == 'lora_encoder':
+            return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
+                                     lora_dropout=lora_dropout, target_part='vision_encoder')
+
+        elif model_type == 'lora_decoder':
+            return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
+                                     lora_dropout=lora_dropout, target_part='mask_decoder')
+
         elif model_type == 'sam_fully':
             return hgsam_model
-        
+
         elif model_type == 'sam_decoder':
             for name, param in hgsam_model.named_parameters():
                 if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
@@ -620,11 +623,20 @@ def _train_one_epoch(model,
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
     use_amp = scaler is not None
 
+    # 计时收集
+    timings = {'data_wait': [], 'forward_backward': [], 'optimizer_step': [], 'hd95': []}
+
     pbar = tqdm(CUDAPrefetcher(dataloader, device), desc="Training", total=len(dataloader), disable=not master_process)
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
+        torch.cuda.synchronize()
+        t_start = time.time()
+        
         optimizer.zero_grad()
 
-        t0 = time.time()
+        torch.cuda.synchronize()
+        t_after_zero_grad = time.time()
+        timings['data_wait'].append(t_after_zero_grad - t_start)
+
         loss, pred_masks, gt = procees_batch_fn(batch,
                                                 model,
                                                 loss_fn,
@@ -650,11 +662,15 @@ def _train_one_epoch(model,
                 _pro_hook.replace_gradients()
             optimizer.step()
 
-        scheduler.step()  # 学习率调度，根据选择的scheduler需要判断scheduler在每个batch中更新还是在一轮epoch之后再更新
+        torch.cuda.synchronize()
+        t_after_optimizer = time.time()
+        timings['forward_backward'].append(t_after_optimizer - t_after_zero_grad)
+
+        scheduler.step()  # 学习率调度，默认根据每个batch更新一次，而不是一个epoch完之后更新一次
 
         # MFU 更新：在 optimizer.step() 之后计时，包含完整的前向+反向
         if mfu_tracker is not None:
-            dt = time.time() - t0
+            dt = t_after_optimizer - t_after_zero_grad
             mfu_tracker.update(dt)
             pbar.set_postfix_str(mfu_tracker.status())
 
@@ -662,7 +678,23 @@ def _train_one_epoch(model,
         with torch.no_grad():
             total_dice += compute_dice_score(pred_masks, gt)
             total_iou += compute_iou_score(pred_masks, gt)
+            
+            t_before_hd95 = time.time()
             hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().detach().cpu(), y=gt.detach().cpu())
+            torch.cuda.synchronize()
+            t_after_hd95 = time.time()
+            timings['hd95'].append(t_after_hd95 - t_before_hd95)
+
+    # 打印计时统计
+    if master_process:
+        import numpy as np
+        print("\n" + "="*60)
+        print("训练阶段计时统计 (每 batch 平均):")
+        print(f"  Data wait (zero_grad): {np.mean(timings['data_wait'])*1000:.2f}ms (std: {np.std(timings['data_wait'])*1000:.2f}ms)")
+        print(f"  Forward+Backward:      {np.mean(timings['forward_backward'])*1000:.2f}ms (std: {np.std(timings['forward_backward'])*1000:.2f}ms)")
+        print(f"  HD95 compute:          {np.mean(timings['hd95'])*1000:.2f}ms (std: {np.std(timings['hd95'])*1000:.2f}ms)")
+        print(f"  Total per batch:       {np.mean(timings['data_wait'])+np.mean(timings['forward_backward'])+np.mean(timings['hd95'])*1000:.2f}ms")
+        print("="*60 + "\n")
 
     avg_loss = total_loss / len(dataloader)
     avg_dice = total_dice / len(dataloader)

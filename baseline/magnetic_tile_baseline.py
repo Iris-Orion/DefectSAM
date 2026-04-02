@@ -54,7 +54,8 @@ if __name__ == "__main__":
                                                     optimizer, 
                                                     scheduler=cosine_scheduler, 
                                                     hyperparameters=hyperparameters, 
-                                                    save_best_model=args.save_bse_model)
+                                                    save_best_model=args.save_bse_model,
+                                                    scheduler_per_batch=True)
     else:
         checkpoints_to_evaluate = magnetic_dict()
         for checkpoint_info in checkpoints_to_evaluate:

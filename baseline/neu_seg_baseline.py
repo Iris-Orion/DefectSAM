@@ -71,7 +71,8 @@ if __name__ == "__main__":
                             optimizer = optimizer,
                             scheduler = cosine_scheduler,
                             hyperparameters = hyperparameters,
-                            save_best_model = True)
+                            save_best_model = True,
+                            scheduler_per_batch = True)
     else:
         checkpoints_to_evaluate = neu_dict()
         for checkpoint_info in checkpoints_to_evaluate:

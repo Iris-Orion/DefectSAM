@@ -77,7 +77,8 @@ if __name__ == '__main__':
                             optimizer=optimizer,
                             scheduler = cosine_scheduler, 
                             hyperparameters = hyperparameters, 
-                            save_best_model = args.save_bse_model)
+                            save_best_model = args.save_bse_model,
+                            scheduler_per_batch = True)
     else:
         # checkpoints_to_evaluate = bsl_sever_dict()
         checkpoints_to_evaluate = severstal_dict()

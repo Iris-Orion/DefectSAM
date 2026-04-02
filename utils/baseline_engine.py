@@ -143,7 +143,10 @@ def evaluate(model, data_loader, criterion, device, scaler=None):
 
     return avg_loss, avg_dice, avg_iou, avg_hd95
 
-def baseline_experiment(model, device, train_loader, val_loader, test_loader, criterion, optimizer, scheduler, hyperparameters, save_best_model=True, scheduler_per_batch=False):
+def baseline_experiment(model, device, 
+                        train_loader, val_loader, test_loader, 
+                        criterion, optimizer, scheduler, 
+                        hyperparameters, save_best_model=True, scheduler_per_batch=False):
     print("Hyperparameters:", hyperparameters)
     shanghai_tz = pytz.timezone('Asia/Shanghai')
     start_timestamp = datetime.now(shanghai_tz).strftime("%Y%m%d_%H%M%S")
@@ -216,11 +219,13 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
         )
         print(f'Validation Results: Loss: {avg_val_loss:.4f}, Dice: {avg_val_dice:.4f}, IoU: {avg_val_iou:.4f}, HD95: {avg_val_hd95:.4f}')
 
+        # 若未设定scheduler_per_batch = True进入下面这个分支，按照epoch来更新？
         if not scheduler_per_batch and scheduler is not None:
             scheduler.step()
         for i, param_group in enumerate(optimizer.param_groups):
             print(f"Current learning rate (param_group {i}): {param_group['lr']:.6e}")
 
+        # 手动log每一轮的训练训练数据
         history["train_loss"].append(avg_train_loss)
         history["train_dice"].append(avg_train_dice)
         history["train_iou"].append(avg_train_iou)
@@ -232,6 +237,7 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
         history["val_hd95"].append(avg_val_hd95)
 
         if swanlab_run:
+            # swanlab log每一轮的训练训练数据
             swanlab.log({
                 "train/loss": avg_train_loss,
                 "train/dice": avg_train_dice,
@@ -250,6 +256,8 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
             no_improve_epochs = 0
             best_epoch = epoch + 1
             history['best_epoch'] = best_epoch
+
+            # 手动额外log验证集指标最好的那一轮的训练数据
             history['best_metrics'] = {
                 "train_loss": avg_train_loss,
                 "train_dice": avg_train_dice,
@@ -272,6 +280,7 @@ def baseline_experiment(model, device, train_loader, val_loader, test_loader, cr
                 )
             
             if swanlab_run:
+                # log最好的轮次和最好的轮次对应的训练集和验证集上的指标
                 swanlab.log({
                     "best_epoch": best_epoch,
                     "best/train_loss": avg_train_loss,

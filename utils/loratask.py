@@ -6,6 +6,28 @@ import peft
 import copy
 from utils.utils import print_trainable_parameters
 
+def get_hf_adalora_model(
+                        model,
+                        total_step,
+                        target_part='vision_encoder',
+                        target_r=8,
+                        init_r=12,
+                        lora_alpha=8):
+    target_modules = get_sam_target_modules(model, target_part=target_part)
+    config = AdaLoraConfig(
+        target_r=target_r,
+        init_r=init_r,
+        lora_alpha=lora_alpha,
+        tinit=int(total_step * 0.1),
+        tfinal=int(total_step * 0.8),
+        deltaT=10,
+        target_modules=target_modules,
+        total_step=total_step,
+        # modules_to_save=["classifier"],
+    )
+    model = get_peft_model(model, config)
+    return model
+
 def get_hf_lora_model(model, lora_rank=16, lora_alpha=16, lora_dropout=0.0, target_part='vision_encoder'):
     target_modules = get_sam_target_modules(model, target_part=target_part)
     config = LoraConfig(
@@ -42,29 +64,6 @@ def get_hf_lokr_model(model):
     )
     model = get_peft_model(model, config)
     model.print_trainable_parameters()
-    return model
-
-def get_hf_adalora_model(
-    model,
-    total_step,
-    target_part='vision_encoder',
-    target_r=8,
-    init_r=12,
-    lora_alpha=8,
-):
-    target_modules = get_sam_target_modules(model, target_part=target_part)
-    config = AdaLoraConfig(
-        target_r=target_r,
-        init_r=init_r,
-        lora_alpha=lora_alpha,
-        tinit=int(total_step * 0.1),
-        tfinal=int(total_step * 0.8),
-        deltaT=10,
-        target_modules=target_modules,
-        total_step=total_step,
-        # modules_to_save=["classifier"],
-    )
-    model = get_peft_model(model, config)
     return model
 
 
@@ -229,28 +228,3 @@ if __name__ == '__main__':
     # print_trainable_parameters(get_hf_lora_model(model=hgsam_model, target_part='mask_decoder'))
 
 
-
-####---------------------- archive code ---------------------------------####
-# def get_sam_target_modules(model, target_part = 'vision_encoder'):
-#     # 动态选择 vision encoder中 所有名为 'q_proj', 'k_proj', 'v_proj', 'qkv' 的线性层作为 LoRA 的目标模块
-#     target_modules = []
-#     if target_part == 'vision_encoder':
-#         for name, module in model.vision_encoder.named_modules():
-#             if isinstance(module, torch.nn.Linear):
-#                 if any(sub in name for sub in ['q_proj', 'k_proj', 'v_proj', 'qkv']):
-#                     target_modules.append(name)
-#     elif target_part == 'mask_decoder':
-#     # # 选择mask decoder中的qkv
-#         for name, module in model.mask_decoder.named_modules():
-#             if isinstance(module, torch.nn.Linear):
-#                 if any(sub in name for sub in ['q_proj', 'k_proj', 'v_proj', 'qkv']):
-#                     target_modules.append(name)
-
-#     print("\n选择的目标模块：")
-#     for module_name in target_modules:
-#         print(module_name)
-
-#     # 确保至少选择了一个目标模块
-#     if not target_modules:
-#         raise ValueError("未找到任何匹配的目标模块，请检查模型结构和目标模块名称。")
-#     return target_modules
