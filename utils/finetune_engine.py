@@ -276,7 +276,25 @@ def severstal_get_offset():
     crop_x_end = int((x_offset + new_w) * (pred_w / target_w))
     return (crop_y_start, crop_x_start, crop_y_end, crop_x_end)
 
-def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None):
+def _select_best_mask(pred_masks, iou_scores):
+    """从 multimask 输出中选取 model 预测 IoU 最高的 mask。
+    Args:
+        pred_masks: [B, 1, 3, H, W] (squeeze point_batch 前) 或 [B, 3, H, W]
+        iou_scores: [B, 1, 3] 或 [B, 3]
+    Returns:
+        selected: [B, 1, H, W]
+    """
+    if pred_masks.dim() == 5:
+        pred_masks = pred_masks.squeeze(1)   # [B, 3, H, W]
+    if iou_scores.dim() == 3:
+        iou_scores = iou_scores.squeeze(1)   # [B, 3]
+    best_idx = iou_scores.argmax(dim=1)      # [B]
+    B = pred_masks.shape[0]
+    selected = pred_masks[torch.arange(B, device=pred_masks.device), best_idx]  # [B, H, W]
+    return selected.unsqueeze(1)  # [B, 1, H, W]
+
+
+def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None, multimask=False):
     """
     处理severstal数据集单个批次的数据，执行前向传播和损失计算。
     """
@@ -288,17 +306,18 @@ def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = 
         bboxes = batch["bbox"].unsqueeze(1).to(device)   #box prompt
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-        outputs = model(pixel_values=images, input_boxes=bboxes, multimask_output=False)
-        predicted_masks = outputs.pred_masks.squeeze(1)  # predicted_masks: [B, 1, 256, 256]
+        outputs = model(pixel_values=images, input_boxes=bboxes, multimask_output=multimask)
+        if multimask:
+            predicted_masks = _select_best_mask(outputs.pred_masks, outputs.iou_scores)  # [B, 1, 256, 256]
+        else:
+            predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
 
         orig_h, orig_w = (256, 1600)
         crop_y_start, crop_x_start, crop_y_end, crop_x_end = offset_info
 
-        # print(f"crop_y_start, crop_x_start, crop_y_end, crop_x_end: {crop_y_start, crop_x_start, crop_y_end, crop_x_end}")
-
         # 在256，256的尺寸内提取有效区域 (使用 Tensor slicing，这会保留计算图)
         masks_cropped_small = predicted_masks[:, :, crop_y_start:crop_y_end, crop_x_start:crop_x_end]
-        
+
         # 使用 PyTorch 的 interpolate 缩放到原始尺寸
         predicted_masks_256_1600 = F.interpolate(
             masks_cropped_small,
@@ -311,7 +330,7 @@ def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = 
         loss = loss_fn(predicted_masks_256_1600, ground_truth_masks)
     return loss, predicted_masks_256_1600, ground_truth_masks
 
-def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None):
+def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None, multimask=False):
     """
     处理单个批次的数据，执行前向传播和损失计算。
     此函数可用于sd900, magnetic, neu,训练和验证。
@@ -324,17 +343,13 @@ def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, off
         bboxes = batch["bbox"].unsqueeze(1).to(device)   #box prompt
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-        outputs = model(pixel_values=images, input_boxes=bboxes, multimask_output=False)
-        predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
+        outputs = model(pixel_values=images, input_boxes=bboxes, multimask_output=multimask)
+        if multimask:
+            predicted_masks = _select_best_mask(outputs.pred_masks, outputs.iou_scores)  # [B, 1, 256, 256]
+        else:
+            predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
 
-        ## 第一种选择，将预测结果进行上采样  # [B, 1, 256, 256]  ---interpolate---> [B, 1, 1024, 1024]
-        # ori_res_masks = F.interpolate(predicted_masks, size=(1024, 1024), mode="bilinear", align_corners=False)
-        # assert ori_res_masks.shape == ground_truth_masks.shape, \
-        # f"Shape mismatch: ori_res_masks shape is {ori_res_masks.shape}, " \
-        # f"but ground_truth_masks shape is {ground_truth_masks.shape}."
-        # loss = loss_fn(ori_res_masks, ground_truth_masks)
-
-        # 第二种选择，将gt进行下采样到(256, 256)，在256x256的低分辨率空间计算损失，效率更高
+        # 将gt进行下采样到(256, 256)，在256x256的低分辨率空间计算损失，效率更高
         gt_downsampled = F.interpolate(ground_truth_masks, size=(256, 256), mode="nearest")
         loss = loss_fn(predicted_masks, gt_downsampled)      # [B, 1, 256, 256]
 
@@ -428,7 +443,8 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
                              auto_seg=False, offset_info=None,
                              prompt_probs=(0.5, 0.3, 0.2),
                              num_iter_rounds=3,
-                             num_points=1):
+                             num_points=1,
+                             multimask=False):
     """
     复刻SAM原始训练流程的process_batch分支。
 
@@ -514,16 +530,20 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
                     input_boxes=input_boxes,
                     input_points=input_points,
                     input_labels=input_labels,
-                    multimask_output=False,
+                    multimask_output=multimask,
                 )
-                predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
+                if multimask:
+                    predicted_masks = _select_best_mask(outputs.pred_masks, outputs.iou_scores)
+                else:
+                    predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
                 loss = loss_fn(predicted_masks, gt_downsampled)
 
     return loss, predicted_masks, gt_downsampled
 
 
 def _process_batch_with_point_grid(batch, model, loss_fn, device, use_amp,
-                                   auto_seg=True, points_per_side=16, offset_info = None):
+                                   auto_seg=True, points_per_side=16, offset_info = None,
+                                   multimask=False):
     """
     使用密集点网格作为提示进行边缘检测微调
     """
@@ -612,7 +632,8 @@ def _train_one_epoch(model,
                      auto_seg=False,
                      offset_info=None,
                      mfu_tracker: MFUTracker = None,
-                     master_process: bool = True):
+                     master_process: bool = True,
+                     multimask: bool = False):
     """
     执行一个完整的训练 epoch。
     mfu_tracker: 可选，传入后每个 batch 会更新 MFU 并在 tqdm 后缀中显示。
@@ -643,7 +664,8 @@ def _train_one_epoch(model,
                                                 device,
                                                 use_amp,
                                                 auto_seg=auto_seg,
-                                                offset_info=offset_info)
+                                                offset_info=offset_info,
+                                                multimask=multimask)
 
         # 获取 LoRA-Pro hook（如果存在）
         _raw = getattr(model, 'module', model)  # DDP unwrap
@@ -712,7 +734,8 @@ def _evaluate(model,
               device, scaler,
               auto_seg = False,
               offset_info = None,
-              master_process: bool = True):
+              master_process: bool = True,
+              multimask: bool = False):
     """
     评估模型。
     master_process: DDP 模式下只在主进程显示进度条。
@@ -724,13 +747,14 @@ def _evaluate(model,
 
     with torch.no_grad():
         for batch in tqdm(CUDAPrefetcher(dataloader, device), desc="Evaluating", total=len(dataloader), disable=not master_process):
-            loss, pred_masks, gt = procees_batch_fn(batch, 
-                                                    model, 
-                                                    loss_fn, 
-                                                    device, 
-                                                    use_amp, 
-                                                    auto_seg = auto_seg, 
-                                                    offset_info = offset_info)
+            loss, pred_masks, gt = procees_batch_fn(batch,
+                                                    model,
+                                                    loss_fn,
+                                                    device,
+                                                    use_amp,
+                                                    auto_seg = auto_seg,
+                                                    offset_info = offset_info,
+                                                    multimask = multimask)
             
             total_loss += loss.item()
             total_dice += compute_dice_score(pred_masks, gt)
@@ -905,6 +929,10 @@ def run_finetune_engine(train_dataloader,
 
     model.train()
 
+    use_multimask = hyperparameters.get('multimask', False)
+    if master_process and use_multimask:
+        print("multimask_output=True + best IoU selection 已启用")
+
     # CHANGE: 仅在需要时计算 offset_info
     offset_info = None
     if process_batch_fn == _process_batch_severstal:
@@ -929,7 +957,7 @@ def run_finetune_engine(train_dataloader,
             model, train_dataloader, optimizer,
             cosine_scheduler, loss_fn, process_batch_fn, scaler, device,
             auto_seg=auto_seg, offset_info=offset_info, mfu_tracker=mfu_tracker,
-            master_process=master_process)
+            master_process=master_process, multimask=use_multimask)
 
         if master_process:
             mfu_str = f"{train_mfu*100:.2f}%" if train_mfu >= 0 else "N/A"
@@ -941,7 +969,7 @@ def run_finetune_engine(train_dataloader,
 
         val_loss, val_dice, val_iou, val_hd95 = _evaluate(model, val_dataloader, loss_fn, process_batch_fn,
                                                       device, scaler, auto_seg = auto_seg, offset_info=offset_info,
-                                                      master_process=master_process)
+                                                      master_process=master_process, multimask=use_multimask)
         if master_process:
             print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val HD95: {val_hd95:.4f}')
 
@@ -1094,7 +1122,8 @@ def run_finetune_engine(train_dataloader,
     # 所有 rank 都跑评估（只有 master 显示进度条和打印结果）
     final_test_loss, final_test_dice, final_test_iou, final_test_hd95 = _evaluate(
         loaded_model, test_dataloader, loss_fn, process_batch_fn, device, scaler,
-        auto_seg=auto_seg, offset_info=offset_info, master_process=master_process)
+        auto_seg=auto_seg, offset_info=offset_info, master_process=master_process,
+        multimask=use_multimask)
 
     if master_process:
         print(f'Final Test Set Evaluation: Loss: {final_test_loss:.4f}, Dice: {final_test_dice:.4f}, IoU: {final_test_iou:.4f}, HD95: {final_test_hd95:.4f}')

@@ -17,37 +17,79 @@ from albumentations.pytorch import ToTensorV2
 from typing import List, Tuple, Dict
 from sklearn.model_selection import train_test_split
 
-def rle2mask(image_id, df):
+_MASK_CACHE: dict[str, np.ndarray] = {}  # 内存级缓存，同一进程内不重复 np.load
+
+
+def build_mask_cache(df, cache_dir="./data/severstal_steel_defect_detection/mask_cache"):
+    """一次性将所有 RLE 解码为 .npy 文件，后续直接 np.load。
+    只需首次运行一次（约 1-2 分钟），之后自动跳过已有缓存。
     """
-    输入: img_id   xxxxxxx.jpg
-    输出: jpg对应的四通道的掩码
-    输出的np.shape: [256, 1600, 4]   [H, W, C]
-    """
-    # 4 : 对应四种缺陷      RLE 的数据编码方式一般是“列优先”格式（Fortran-style）,即先填充列
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fnames = df['ImageId'].unique()
+    new_count = 0
+    for image_id in fnames:
+        npy_path = cache_dir / f"{Path(image_id).stem}.npy"
+        if npy_path.exists():
+            continue
+        mask = _rle2mask_raw(image_id, df)
+        np.save(npy_path, mask)
+        new_count += 1
+    if new_count > 0:
+        print(f"[mask_cache] 新生成 {new_count} 个缓存文件 → {cache_dir}")
+    else:
+        print(f"[mask_cache] 缓存已就绪 ({len(fnames)} 张) → {cache_dir}")
+
+
+def _rle2mask_raw(image_id, df):
+    """原始 RLE 解码逻辑（无缓存）。"""
     mask = np.zeros((256, 1600, 4), dtype=np.float32)
-    
+
     image_df = df[df['ImageId'] == image_id]
     if (image_df['ClassId'] == 0).all():
-        return mask 
+        return mask
 
     for _, row in image_df.iterrows():
         class_id = int(row['ClassId']) - 1  # numpy channel: 0 - 3
         rle = row['EncodedPixels']
 
-        # 处理EncodedPixels为空，但是若不修改原始的train.csv，是不会存在nan情况的
         if pd.isna(rle):
             continue
 
-        label = rle.split(" ")     # 这会return一个list
-        positions = map(int, label[0::2])    # 起始位置
-        lengths = map(int, label[1::2])      # 长度
+        label = rle.split(" ")
+        positions = map(int, label[0::2])
+        lengths = map(int, label[1::2])
 
         mask_flat = np.zeros(256 * 1600, dtype=np.float32)
         for pos, le in zip(positions, lengths):
             mask_flat[pos:(pos+le)] = 1
 
         mask[:, :, class_id] = mask_flat.reshape((256, 1600), order='F')
-    
+
+    return mask
+
+
+def rle2mask(image_id, df, cache_dir="./data/severstal_steel_defect_detection/mask_cache"):
+    """
+    输入: img_id   xxxxxxx.jpg
+    输出: jpg对应的四通道的掩码
+    输出的np.shape: [256, 1600, 4]   [H, W, C]
+    优先从 .npy 缓存加载，未命中时走 RLE 解码。
+    """
+    # 1. 进程内存缓存
+    if image_id in _MASK_CACHE:
+        return _MASK_CACHE[image_id]
+
+    # 2. 磁盘 .npy 缓存
+    npy_path = Path(cache_dir) / f"{Path(image_id).stem}.npy"
+    if npy_path.exists():
+        mask = np.load(npy_path)
+        _MASK_CACHE[image_id] = mask
+        return mask
+
+    # 3. 回退到原始 RLE 解码
+    mask = _rle2mask_raw(image_id, df)
+    _MASK_CACHE[image_id] = mask
     return mask
 
 def traindf_preprocess( split_seed: int = 42, 
@@ -124,6 +166,10 @@ def traindf_preprocess( split_seed: int = 42,
 
     print("\nTest Class Distribution:")
     print(test_class_counts)
+
+    # 自动构建 mask 缓存（首次约 1-2 分钟，之后秒级跳过）
+    build_mask_cache(full_df)
+
     return train_df, val_df, test_df
 
 def get_bounding_box(ground_truth_map):

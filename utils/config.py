@@ -67,6 +67,10 @@ def _add_finetune_args(parser):
 
     # sam模型大小选择
     parser.add_argument('--sam_type', type=str, default="sam_base", help='sam模型大小选择')
+
+    # multimask 消融实验
+    parser.add_argument('--multimask', action='store_true',
+                        help='使用 multimask_output=True + best IoU selection (默认 False, 即 single mask)')
     return parser
 
 
