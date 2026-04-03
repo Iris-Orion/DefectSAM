@@ -51,7 +51,7 @@ if __name__ == '__main__':
                                                         device=device,
                                                         process_batch_fn = batch_fn,
                                                         hyperparameters=hyperparameters,
-                                                        save_dir = "./new_weights/finetune/sd900_output/"+hyperparameters['ft_type'],
+                                                        save_dir = "./new_weights/finetune/sd900_output/" + hyperparameters['ft_type'],
                                                         auto_seg = args.auto_seg)
     
     elif args.zero_shot:

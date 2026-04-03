@@ -86,7 +86,7 @@ if __name__ == '__main__':
         run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
                             model, device, hyperparameters,
                             process_batch_fn=_process_batch_severstal,
-                            save_dir = os.path.join(hyperparameters['output_dir'], hyperparameters['ft_type']),
+                            save_dir = "./new_weights/finetune/severstal_output/" + hyperparameters['ft_type'],
                             auto_seg=args.auto_seg,
                             ddp_info=ddp_info,
                             train_sampler=train_sampler)
