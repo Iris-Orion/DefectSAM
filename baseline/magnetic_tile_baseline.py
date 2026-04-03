@@ -25,8 +25,8 @@ if __name__ == "__main__":
     hyperparameters['optimizer'] = "AdamW"
     hyperparameters['scheduler'] = "cosine_scheduler"
     hyperparameters['loss_function'] = "monai.DiceCELoss",
-    hyperparameters['task_name']= "magtile_baseline" + hyperparameters['bse_model']
-    hyperparameters['output_dir'] = './new_weights/magnetic_tile_output'
+    hyperparameters['task_name']= "mag_" + hyperparameters['bse_model']
+    hyperparameters['output_dir'] = './new_weights/baseline/magnetic_tile_output'
 
     if not args.infer_mode:
         model = create_bsl_model_from_type(args=args)

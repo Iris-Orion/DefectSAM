@@ -57,10 +57,11 @@ class Retina_Dataset_Bsl(Dataset):
 class Retina_Dataset_ft(SegDatasetForFinetune):
     """Retina dataset for fine-tuning"""
 
-    def __init__(self, images_dir, annotations_dir, transforms: A.Compose):
+    def __init__(self, images_dir, annotations_dir, transforms: A.Compose, is_train=True):
         self.images_dir = images_dir
         self.annotations_dir = annotations_dir
         self.transforms = transforms
+        self.is_train = is_train
         self.image_files = sorted([f for f in os.listdir(images_dir) if f.endswith('.png')])
         self.mask_files = sorted([f for f in os.listdir(annotations_dir) if f.endswith('.png')])
 
@@ -97,7 +98,7 @@ class Retina_Dataset_ft(SegDatasetForFinetune):
 
         # bbox 必须在增强之后从变换后的 mask 上计算，否则翻转后 bbox 与 mask 不一致
         mask_np_for_bbox = mask_tensor.squeeze().numpy().astype(np.uint8)
-        bbox = get_bounding_box(mask_np_for_bbox)
+        bbox = get_bounding_box(mask_np_for_bbox, perturb=self.is_train)
         bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
 
         return {
@@ -193,12 +194,14 @@ def create_retina_dataset_ft():
         retina_train_images_dir,
         retina_train_annotations_dir,
         transforms=train_transforms,
+        is_train=True,
     )
 
     val_dataset_no_aug = Retina_Dataset_ft(
         retina_train_images_dir,
         retina_train_annotations_dir,
         transforms=test_transforms,
+        is_train=False,
     )
 
     dataset_size = len(train_dataset_with_aug)
@@ -217,6 +220,7 @@ def create_retina_dataset_ft():
         retina_test_images_dir,
         retina_test_annotations_dir,
         transforms=test_transforms,
+        is_train=False,
     )
 
     print(f"训练集大小: {len(retina_train_subset)}")
@@ -247,12 +251,14 @@ def create_retina_dataset_ft_kfold(num_folds=5, fold_index=0, random_state=42, s
         retina_train_images_dir,
         retina_train_annotations_dir,
         transforms=train_transforms,
+        is_train=True,
     )
 
     val_dataset_no_aug = Retina_Dataset_ft(
         retina_train_images_dir,
         retina_train_annotations_dir,
         transforms=test_transforms,
+        is_train=False,
     )
 
     kfold = KFold(n_splits=num_folds, shuffle=shuffle, random_state=random_state)
@@ -267,6 +273,7 @@ def create_retina_dataset_ft_kfold(num_folds=5, fold_index=0, random_state=42, s
         retina_test_images_dir,
         retina_test_annotations_dir,
         transforms=test_transforms,
+        is_train=False,
     )
 
     print(f"Retina K 折验证: fold {fold_index + 1}/{num_folds}")

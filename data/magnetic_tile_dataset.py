@@ -50,11 +50,12 @@ class MagneticTileDataset_Baseline(Dataset):
 
 
 class MagneticTileDatasetWithBoxPrompt(Dataset):
-    def __init__(self, image_paths, mask_paths, labels, transforms: A.Compose):
+    def __init__(self, image_paths, mask_paths, labels, transforms: A.Compose, is_train=True):
         self.image_paths = image_paths
         self.mask_paths = mask_paths
         self.transforms = transforms
         self.labels = labels
+        self.is_train = is_train
 
     def letterbox_image(self, image, size):
         return letterbox_image_np(image, size)
@@ -74,7 +75,7 @@ class MagneticTileDatasetWithBoxPrompt(Dataset):
 
         resize_img_np = self.letterbox_image(aug_img_np, [1024, 1024])
         resize_mask_np = self.letterbox_mask_1ch(aug_mask_1ch_np, [1024, 1024])
-        bbox = get_bounding_box(resize_mask_np)
+        bbox = get_bounding_box(resize_mask_np, perturb=self.is_train)
         bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
 
         resize_img_tensor = torch.from_numpy(resize_img_np).permute(2, 0, 1).float() / 255.0
@@ -244,8 +245,8 @@ def create_magnetic_dataset():
 
     print("\n" + "=" * 50 + "\n")
 
-    train_dataset = MagneticTileDatasetWithBoxPrompt(train_image_paths, train_mask_paths, train_labels, transforms=train_transforms)
-    val_dataset = MagneticTileDatasetWithBoxPrompt(val_image_paths, val_mask_paths, val_labels, transforms=val_transforms)
-    test_dataset = MagneticTileDatasetWithBoxPrompt(test_image_paths, test_mask_paths, test_labels, transforms=val_transforms)
+    train_dataset = MagneticTileDatasetWithBoxPrompt(train_image_paths, train_mask_paths, train_labels, transforms=train_transforms, is_train=True)
+    val_dataset = MagneticTileDatasetWithBoxPrompt(val_image_paths, val_mask_paths, val_labels, transforms=val_transforms, is_train=False)
+    test_dataset = MagneticTileDatasetWithBoxPrompt(test_image_paths, test_mask_paths, test_labels, transforms=val_transforms, is_train=False)
 
     return train_dataset, val_dataset, test_dataset

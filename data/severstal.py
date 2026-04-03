@@ -18,35 +18,54 @@ from typing import List, Tuple, Dict
 from sklearn.model_selection import train_test_split
 
 _MASK_CACHE: dict[str, np.ndarray] = {}  # 内存级缓存，同一进程内不重复 np.load
+_OLD_CACHE_WARNING_SHOWN = False
+
+
+def _empty_mask() -> np.ndarray:
+    return np.zeros((256, 1600, 4), dtype=np.uint8)
+
+
+def _is_no_defect_image(image_df: pd.DataFrame) -> bool:
+    return image_df.empty or (image_df['ClassId'] == 0).all()
 
 
 def build_mask_cache(df, cache_dir="./data/severstal_steel_defect_detection/mask_cache"):
-    """一次性将所有 RLE 解码为 .npy 文件，后续直接 np.load。
+    """一次性将所有 RLE 解码为 .npz 压缩文件，后续直接 np.load。
     只需首次运行一次（约 1-2 分钟），之后自动跳过已有缓存。
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     fnames = df['ImageId'].unique()
     new_count = 0
+    skipped_no_defect_count = 0
+    existing_count = 0
     for image_id in fnames:
-        npy_path = cache_dir / f"{Path(image_id).stem}.npy"
-        if npy_path.exists():
+        image_df = df[df['ImageId'] == image_id]
+        if _is_no_defect_image(image_df):
+            skipped_no_defect_count += 1
             continue
-        mask = _rle2mask_raw(image_id, df)
-        np.save(npy_path, mask)
+
+        npz_path = cache_dir / f"{Path(image_id).stem}.npz"
+        if npz_path.exists():
+            existing_count += 1
+            continue
+        mask = _rle2mask_raw(image_id, image_df)
+        np.savez_compressed(npz_path, mask=mask)
         new_count += 1
-    if new_count > 0:
-        print(f"[mask_cache] 新生成 {new_count} 个缓存文件 → {cache_dir}")
-    else:
-        print(f"[mask_cache] 缓存已就绪 ({len(fnames)} 张) → {cache_dir}")
+
+    print(
+        f"[mask_cache] 新生成 {new_count} 个 uint8 压缩缓存文件，"
+        f"跳过无缺陷 {skipped_no_defect_count} 张，"
+        f"已存在 {existing_count} 个 → {cache_dir}"
+    )
 
 
 def _rle2mask_raw(image_id, df):
     """原始 RLE 解码逻辑（无缓存）。"""
-    mask = np.zeros((256, 1600, 4), dtype=np.float32)
+    mask = _empty_mask()
 
     image_df = df[df['ImageId'] == image_id]
-    if (image_df['ClassId'] == 0).all():
+    if _is_no_defect_image(image_df):
         return mask
 
     for _, row in image_df.iterrows():
@@ -60,7 +79,7 @@ def _rle2mask_raw(image_id, df):
         positions = map(int, label[0::2])
         lengths = map(int, label[1::2])
 
-        mask_flat = np.zeros(256 * 1600, dtype=np.float32)
+        mask_flat = np.zeros(256 * 1600, dtype=np.uint8)
         for pos, le in zip(positions, lengths):
             mask_flat[pos:(pos+le)] = 1
 
@@ -74,21 +93,39 @@ def rle2mask(image_id, df, cache_dir="./data/severstal_steel_defect_detection/ma
     输入: img_id   xxxxxxx.jpg
     输出: jpg对应的四通道的掩码
     输出的np.shape: [256, 1600, 4]   [H, W, C]
-    优先从 .npy 缓存加载，未命中时走 RLE 解码。
+    优先从 .npz 缓存加载，未命中时走 RLE 解码。
     """
+    global _OLD_CACHE_WARNING_SHOWN
+
     # 1. 进程内存缓存
     if image_id in _MASK_CACHE:
         return _MASK_CACHE[image_id]
 
-    # 2. 磁盘 .npy 缓存
+    # 2. 磁盘 .npz 缓存
+    npz_path = Path(cache_dir) / f"{Path(image_id).stem}.npz"
+    if npz_path.exists():
+        mask = np.load(npz_path)['mask']
+        _MASK_CACHE[image_id] = mask
+        return mask
+        
+    # 兼容老的 .npy 缓存
     npy_path = Path(cache_dir) / f"{Path(image_id).stem}.npy"
     if npy_path.exists():
         mask = np.load(npy_path)
+        if mask.dtype != np.uint8 and not _OLD_CACHE_WARNING_SHOWN:
+            print("[mask_cache] 检测到旧版非 uint8 缓存，可继续读取；若需回收空间可手动重建缓存目录。")
+            _OLD_CACHE_WARNING_SHOWN = True
         _MASK_CACHE[image_id] = mask
         return mask
 
     # 3. 回退到原始 RLE 解码
-    mask = _rle2mask_raw(image_id, df)
+    image_df = df[df['ImageId'] == image_id]
+    if _is_no_defect_image(image_df):
+        mask = _empty_mask()
+        _MASK_CACHE[image_id] = mask
+        return mask
+
+    mask = _rle2mask_raw(image_id, image_df)
     _MASK_CACHE[image_id] = mask
     return mask
 
@@ -172,7 +209,7 @@ def traindf_preprocess( split_seed: int = 42,
 
     return train_df, val_df, test_df
 
-def get_bounding_box(ground_truth_map):
+def get_bounding_box(ground_truth_map, perturb=True):
     """
     从ground_truth中获得bbox
     输入:ground_truth_map 是一个合并的掩码 (256, 1600)   tensor格式
@@ -191,10 +228,11 @@ def get_bounding_box(ground_truth_map):
         y_min, y_max = np.min(y_indices), np.max(y_indices)
 
         H, W = ground_truth_map.shape
-        x_min = max(0, x_min - np.random.randint(0, 20))
-        x_max = min(W, x_max + np.random.randint(0, 20))
-        y_min = max(0, y_min - np.random.randint(0, 20))
-        y_max = min(H, y_max + np.random.randint(0, 20))
+        if perturb:
+            x_min = max(0, x_min - np.random.randint(0, 20))
+            x_max = min(W, x_max + np.random.randint(0, 20))
+            y_min = max(0, y_min - np.random.randint(0, 20))
+            y_max = min(H, y_max + np.random.randint(0, 20))
         bbox = [x_min, y_min, x_max, y_max]
     return bbox
 
@@ -222,7 +260,7 @@ class SteelDataset(Dataset):
         augmented = self.transforms(image=img, mask=mask)   # 调用的是albumentations库
         img = augmented["image"].float() / 255.0            # 调用albumentations库需要手动归一化
         mask = augmented["mask"].permute(2, 0, 1)           # 对mask手动执行[h, w, c] ---> [c, h, w]
-        mask = torch.sum(mask, dim=0, keepdim=True)
+        mask = torch.sum(mask, dim=0, keepdim=True).float()
         return img, mask, image_id
     
     def __len__(self):
@@ -241,10 +279,11 @@ class SteelDataset_WithBoxPrompt(Dataset):
     3. 保留增强后的(256, 1600)掩码作为Ground Truth，用于计算损失。
     4. 返回逆向letterbox所需的元数据。
     """
-    def __init__(self, df, data_path, transforms: transforms.Compose):
+    def __init__(self, df, data_path, transforms: transforms.Compose, is_train=True):
         self.df = df
         self.root = data_path
         self.transforms = transforms
+        self.is_train = is_train
         self.fnames = self.df['ImageId'].unique()
     
     def preprocess(self, original_image: torch.Tensor):
@@ -352,16 +391,16 @@ class SteelDataset_WithBoxPrompt(Dataset):
 
         letterboxed_img_np = self.letterbox_img_np(aug_img_np, [1024, 1024])                                # (1024, 1024, 3)
         model_input_tensor = torch.from_numpy(letterboxed_img_np).permute(2, 0, 1).float() / 255.0          # (3, 1024, 1024)  输入图像
-        gt_mask_1ch_tensor = torch.from_numpy(aug_mask_1ch_np).permute(2, 0, 1)                             # (1, 256, 1600)
+        gt_mask_1ch_tensor = torch.from_numpy(aug_mask_1ch_np).permute(2, 0, 1).float()                     # (1, 256, 1600)
 
         # 为了获得box提示，需要对mask进行letterbox操作
         letterboxed_mask_np = self.letterbox_mask(aug_mask_1ch_np, [1024, 1024])          # (1024, 1024, 1)
 
-        letterboxed_mask_tensor = torch.from_numpy(letterboxed_mask_np).permute(2, 0, 1)    # (1, 1024, 1024)
+        letterboxed_mask_tensor = torch.from_numpy(letterboxed_mask_np).permute(2, 0, 1).float()    # (1, 1024, 1024)
     
         # combined_letterboxed_mask = torch.sum(letterboxed_mask_tensor, dim=0)
 
-        bbox = get_bounding_box(letterboxed_mask_tensor.squeeze())                         
+        bbox = get_bounding_box(letterboxed_mask_tensor.squeeze(), perturb=self.is_train)
         bbox_tensor = torch.tensor(bbox, dtype=torch.float32)           # torch.tensor([x_min, y_min, x_max, y_max]): size=(4)s
 
         # 返回图像, mask, image_id，以及boxes作为prompt
@@ -401,9 +440,9 @@ def create_dataset_with_prompt(include_no_defect=True):
     train_transforms, val_transforms = get_severstal_ft_albumentations_transforms()
 
     print('#'*20 + ' test_dataset_with_prompt ' + '#'*20)
-    train_dataset = SteelDataset_WithBoxPrompt(train_df, data_path=data_path, transforms=train_transforms)
-    val_dataset = SteelDataset_WithBoxPrompt(val_df, data_path=data_path, transforms=val_transforms)
-    test_dataset = SteelDataset_WithBoxPrompt(test_df, data_path=data_path, transforms=val_transforms)
+    train_dataset = SteelDataset_WithBoxPrompt(train_df, data_path=data_path, transforms=train_transforms, is_train=True)
+    val_dataset = SteelDataset_WithBoxPrompt(val_df, data_path=data_path, transforms=val_transforms, is_train=False)
+    test_dataset = SteelDataset_WithBoxPrompt(test_df, data_path=data_path, transforms=val_transforms, is_train=False)
 
     # idx = random.randint(0, len(train_dataset)-1)
     # sample = train_dataset[idx]

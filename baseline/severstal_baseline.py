@@ -45,7 +45,7 @@ if __name__ == '__main__':
     hyperparameters['scheduler_name'] = "cosine_scheduler"
     hyperparameters['loss_fn_name'] = "monai.DiceCELoss"
     hyperparameters['task_name']= "severstal_" + args.bse_model
-    hyperparameters['output_dir'] = './new_weights'
+    hyperparameters['output_dir'] = "./new_weights/baseline/severstal_output"
     if not args.infer_mode:
         model = create_bsl_model_from_type(args=args)
 

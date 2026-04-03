@@ -51,10 +51,11 @@ class NEU_SEG_Dataset_BSL(Dataset):
 class NEU_SEG_Dataset(Dataset):
     """SAM finetune 使用"""
 
-    def __init__(self, images_dir, annotations_dir, transforms: A.Compose):
+    def __init__(self, images_dir, annotations_dir, transforms: A.Compose, is_train=True):
         self.images_dir = images_dir
         self.annotations_dir = annotations_dir
         self.transforms = transforms
+        self.is_train = is_train
         self.image_files = sorted([f for f in os.listdir(images_dir) if f.endswith('.jpg')])
         self.mask_files = sorted([f for f in os.listdir(annotations_dir) if f.endswith('.png')])
 
@@ -88,7 +89,7 @@ class NEU_SEG_Dataset(Dataset):
 
         # bbox 必须在增强之后从变换后的 mask 上计算，否则翻转后 bbox 与 mask 不一致
         mask_np_for_bbox = mask_tensor.squeeze().numpy().astype(np.uint8)
-        bbox = get_bounding_box(mask_np_for_bbox)
+        bbox = get_bounding_box(mask_np_for_bbox, perturb=self.is_train)
         bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
 
         return {
@@ -203,9 +204,9 @@ def create_neu_dataset_stratified():
     print(f"\n划分后训练集的分布: \n{Counter(train_keys)}")
     print(f"\n划分后验证集的分布: \n{Counter(val_keys)}")
 
-    full_train_dataset = NEU_SEG_Dataset(train_images_dir, train_annotations_dir, transforms=train_transforms)
-    full_val_dataset = NEU_SEG_Dataset(train_images_dir, train_annotations_dir, transforms=test_transforms)
-    test_dataset = NEU_SEG_Dataset(test_images_dir, test_annotations_dir, transforms=test_transforms)
+    full_train_dataset = NEU_SEG_Dataset(train_images_dir, train_annotations_dir, transforms=train_transforms, is_train=True)
+    full_val_dataset = NEU_SEG_Dataset(train_images_dir, train_annotations_dir, transforms=test_transforms, is_train=False)
+    test_dataset = NEU_SEG_Dataset(test_images_dir, test_annotations_dir, transforms=test_transforms, is_train=False)
 
     train_dataset = Subset(full_train_dataset, train_indices)
     val_dataset = Subset(full_val_dataset, val_indices)
