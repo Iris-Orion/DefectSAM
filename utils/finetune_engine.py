@@ -633,11 +633,13 @@ def _train_one_epoch(model,
                      offset_info=None,
                      mfu_tracker: MFUTracker = None,
                      master_process: bool = True,
-                     multimask: bool = False):
+                     multimask: bool = False,
+                     global_step: int = 0):
     """
     执行一个完整的训练 epoch。
     mfu_tracker: 可选，传入后每个 batch 会更新 MFU 并在 tqdm 后缀中显示。
     master_process: DDP 模式下只在主进程显示进度条。
+    global_step: 当前全局训练步数，用于 AdaLoRA 的 update_and_allocate。
     """
     model.train()
     total_loss, total_dice, total_iou = 0, 0, 0
@@ -684,6 +686,11 @@ def _train_one_epoch(model,
                 _pro_hook.replace_gradients()
             optimizer.step()
 
+        # AdaLoRA rank 分配：必须在 optimizer.step() 之后、scheduler.step() 之前调用
+        if hasattr(_raw, 'update_and_allocate'):
+            _raw.update_and_allocate(global_step)
+        global_step += 1
+
         torch.cuda.synchronize()
         t_after_optimizer = time.time()
         timings['forward_backward'].append(t_after_optimizer - t_after_zero_grad)
@@ -725,7 +732,7 @@ def _train_one_epoch(model,
     hd95_metric.reset()
 
     avg_mfu = mfu_tracker.mfu if mfu_tracker is not None else -1.0
-    return avg_loss, avg_dice, avg_iou, avg_hd95, avg_mfu
+    return avg_loss, avg_dice, avg_iou, avg_hd95, avg_mfu, global_step
 
 def _evaluate(model,
               dataloader,
@@ -889,6 +896,7 @@ def run_finetune_engine(train_dataloader,
     no_improve_epochs = 0
     best_epoch = -1
     best_model_path = None
+    global_step = 0  # 用于 AdaLoRA update_and_allocate
 
     if master_process:
         if use_early_stop:
@@ -907,7 +915,9 @@ def run_finetune_engine(train_dataloader,
 
     # torch.compile：只编译计算量最大的 vision_encoder 子模块，
     # 避免 mask_decoder 中的条件分支导致 compile 失败或产生过大的中间缓存
-    use_compile = not hyperparameters.get('no_compile', False)
+    # AdaLoRA 在 update_and_allocate 时对参数做 in-place SVD 截断，与静态图不兼容，必须跳过
+    _is_adalora = hyperparameters.get('ft_type', '') == 'adalora_encoder'
+    use_compile = not hyperparameters.get('no_compile', False) and not _is_adalora
     if use_compile:
         try:
             model.vision_encoder = torch.compile(model.vision_encoder, mode='default')
@@ -918,7 +928,10 @@ def run_finetune_engine(train_dataloader,
                 print(f"torch.compile 不可用，跳过: {e}")
     else:
         if master_process:
-            print("torch.compile 已禁用 (--no_compile)")
+            if _is_adalora:
+                print("torch.compile 已禁用 (AdaLoRA 与静态图不兼容)")
+            else:
+                print("torch.compile 已禁用 (--no_compile)")
 
     # ---------- DDP 包装（仿照 nanoGPT，在 compile 之后包装）----------
     # find_unused_parameters=True: SAM 的 prompt_encoder 等模块在某些前向路径中不参与 loss 计算，
@@ -953,11 +966,12 @@ def run_finetune_engine(train_dataloader,
         batch_size = hyperparameters.get('batch_size', 4)
         mfu_tracker = MFUTracker(mfu_estimator, batch_size=batch_size, ema_alpha=0.9)
 
-        train_loss, train_dice, train_iou, train_hd95, train_mfu = _train_one_epoch(
+        train_loss, train_dice, train_iou, train_hd95, train_mfu, global_step = _train_one_epoch(
             model, train_dataloader, optimizer,
             cosine_scheduler, loss_fn, process_batch_fn, scaler, device,
             auto_seg=auto_seg, offset_info=offset_info, mfu_tracker=mfu_tracker,
-            master_process=master_process, multimask=use_multimask)
+            master_process=master_process, multimask=use_multimask,
+            global_step=global_step)
 
         if master_process:
             mfu_str = f"{train_mfu*100:.2f}%" if train_mfu >= 0 else "N/A"
