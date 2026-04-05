@@ -12,10 +12,9 @@ from data.magnetic_tile_dataset import create_mag_dataset_baseline
 from weights.magnetic_wts import magnetic_dict
 
 if __name__ == "__main__":
-    set_seed(42)
-
     args = get_bse_args()
     hyperparameters = vars(args)
+    set_seed(args.seed)
 
     train_dataset, val_dataset, test_dataset = create_mag_dataset_baseline()
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)

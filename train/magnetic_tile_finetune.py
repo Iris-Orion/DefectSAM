@@ -36,7 +36,7 @@ def mag_inference(model, device, dataloader, scaler):
 if __name__ == "__main__":
     args = get_common_ft_args()
 
-    set_seed(42)
+    set_seed(args.seed)
     hyperparameters = vars(args)
 
     train_dataset, val_dataset, test_dataset = create_magnetic_dataset()

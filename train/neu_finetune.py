@@ -33,8 +33,8 @@ if __name__ == '__main__':
     ddp = ddp_info['ddp']
     master_process = ddp_info['master_process']
 
-    set_seed(42, seed_offset=ddp_info['rank'])  # 每个进程使用不同的随机种子
     args = get_common_ft_args()
+    set_seed(args.seed, seed_offset=ddp_info['rank'])  # 每个进程使用不同的随机种子
 
     hyperparameters = vars(args)
 

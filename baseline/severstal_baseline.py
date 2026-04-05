@@ -15,7 +15,7 @@ if __name__ == '__main__':
     args = get_severstal_bsl_args()
     hyperparameters = vars(args)
     print(hyperparameters)
-    set_seed(42)
+    set_seed(args.seed)
 
     batch_size = args.batch_size
     create_mini_dataset = args.mini_dataset

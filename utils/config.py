@@ -14,6 +14,7 @@ def _add_base_args(parser):
     parser.add_argument('--min_delta', type=float, default=0.0001, help='验证指标提升的最小阈值')
     parser.add_argument('--disable_early_stop', action='store_true', help='关闭早停以进行全周期训练')
 
+    parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--device_id', type=int, default=0, help='gpu id')
     parser.add_argument('--num_workers', type=int, default=4, help='num_workers')
 

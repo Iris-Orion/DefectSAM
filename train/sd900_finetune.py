@@ -16,8 +16,8 @@ from weights.sd900_wts import sd900_dict
 
 
 if __name__ == '__main__':
-    set_seed(42)
     args = get_common_ft_args()
+    set_seed(args.seed)
     hyperparameters = vars(args)
     hyperparameters['optimizer'] = 'AdamW'
     hyperparameters['loss_function'] = 'monai.DiceCELoss'

@@ -14,9 +14,9 @@ from data.sd900_dataset import sd900_bsl_create_dataset, get_label_distribution,
 from weights.sd900_wts import sd900_dict
 
 if __name__ == '__main__':
-    args = get_bse_args()  
+    args = get_bse_args()
     hyperparameters = vars(args)
-    set_seed(42)
+    set_seed(args.seed)
 
     train_dataset, val_dataset, test_dataset, fullset_labels = sd900_bsl_create_dataset()
 

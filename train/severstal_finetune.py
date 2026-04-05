@@ -31,8 +31,8 @@ if __name__ == '__main__':
     ddp = ddp_info['ddp']
     master_process = ddp_info['master_process']
 
-    set_seed(42, seed_offset=ddp_info['rank'])
     args = get_severstal_ft_args()
+    set_seed(args.seed, seed_offset=ddp_info['rank'])
     hyperparameters = vars(args)
 
     mini_dataset = args.mini_dataset            # for debugging purposes

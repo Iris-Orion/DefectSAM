@@ -12,10 +12,9 @@ from utils.baseline_engine import baseline_experiment, bsl_inference_engine, cre
 from weights.neu_wts import neu_dict
 
 if __name__ == "__main__":
-    set_seed(42)
-
     args = get_bse_args()
     hyperparameters = vars(args)
+    set_seed(args.seed)
 
     train_dataset, val_dataset, test_dataset = neu_bsl_create_dataset()
     
