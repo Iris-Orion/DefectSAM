@@ -33,6 +33,7 @@ from utils.sam_arch import (get_loradsc_model,
                             get_loradsc_global_only_model,
                             get_loradsc_residual_model,
                             get_loradsc_gated_model,
+                            get_loradsc_residual_gated_model,
                             create_model_for_inference,
                             get_loraplus_model,
                             get_loraga_model,
@@ -151,7 +152,13 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
         return get_loradsc_gated_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
                                        ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
                                        gate_init=1e-3, sam_type=sam_type)
-    
+
+    elif model_type == 'loradsc_qv_residual_gated':
+        return get_loradsc_residual_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
+            gate_init=0.0, sam_type=sam_type)
+
     elif model_type == 'loradsc_q':
         return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True)
     

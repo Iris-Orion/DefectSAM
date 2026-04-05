@@ -258,6 +258,57 @@ class LoRASam_DepWiseConv_Gated(LoRASam_DepWiseConv):
             {"params": b_side_params, "lr": base_lr * lora_plus_lr_ratio, "weight_decay": weight_decay},
         ]
 
+
+class LoRASam_DepWiseConv_ResidualGated(LoRASam_DepWiseConv):
+    """
+    合并 Residual + Gated 设计：delta = B(A(x) + gate * DSC(A(x))) * scale
+    gate_init=0.0 → 训练初期等价于标准 LoRA，自然三阶段课程：B → gate → DSC。
+
+    与 Residual 的区别：DSC 贡献受 gate 控制，不会在初期强制参与。
+    与 Gated 的区别：gate 只控制 DSC 分支，残差路径 A(x) 始终保证 B 有梯度。
+    """
+    def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
+                 ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, gate_init: float = 0.0):
+        super().__init__(qkv_layer, enabled, rank, lora_alpha, dropout_rate,
+                         ft_q, ft_k, ft_v, add_dsc_conv)
+        self.gate = nn.ParameterDict({
+            part: nn.Parameter(torch.tensor(float(gate_init)))
+            for part in self.lora_a.keys()
+        })
+
+    def _get_delta(self, x, part: str):
+        x_drop = self.lora_dropout(x)
+        if self.add_dsc_conv:
+            h = self.lora_a[part](x_drop)                        # [B, H, W, rank]
+            conv_in = h.permute(0, 3, 1, 2)                      # [B, rank, H, W]
+            conv_out = self.lora_pw_conv[part](
+                           self.lora_dw_conv[part](conv_in))
+            conv_out = conv_out.permute(0, 2, 3, 1)              # [B, H, W, rank]
+            # 残差保证 B 始终有梯度；gate 控制 DSC 贡献，初始为 0
+            delta = self.lora_b[part](h + self.gate[part] * conv_out) * self.scale
+        else:
+            delta = self.lora_b[part](self.lora_a[part](x_drop)) * self.scale
+        return delta
+
+    def get_loraplus_param_groups(self, base_lr: float, lora_plus_lr_ratio: float = 16.0,
+                                   weight_decay: float = 0.0):
+        """A: base_lr；B + DSC conv + gate: base_lr * ratio"""
+        if self.rank <= 0:
+            return []
+        a_params, b_side_params = [], []
+        for part in self.lora_a.keys():
+            a_params.extend(self.lora_a[part].parameters())
+            b_side_params.extend(self.lora_b[part].parameters())
+            if self.add_dsc_conv:
+                b_side_params.extend(self.lora_dw_conv[part].parameters())
+                b_side_params.extend(self.lora_pw_conv[part].parameters())
+            b_side_params.append(self.gate[part])
+        return [
+            {"params": a_params,      "lr": base_lr,                      "weight_decay": weight_decay},
+            {"params": b_side_params, "lr": base_lr * lora_plus_lr_ratio,  "weight_decay": weight_decay},
+        ]
+
+
 class _Reshape4d(nn.Module):
     """[B, H, W, C] -> [B, C, H, W]"""
     def forward(self, x):
@@ -576,6 +627,35 @@ def get_loradsc_gated_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, ad
             gate_init=gate_init,
         )
     return hgsam_model
+
+def get_loradsc_residual_gated_model(rank, lora_alpha, dropout_rate,
+                                      ft_q=True, ft_k=False, ft_v=True,
+                                      add_dsc_conv=True, gate_init: float = 0.0,
+                                      sam_type: str = "sam_base"):
+    """
+    构建 ResidualGated LoRA-DSC 版本 SAM。
+    公式: delta = B(A(x) + gate * DSC(A(x))) * scale，gate_init=0.0
+    """
+    if sam_type == "sam_base":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    elif sam_type == "sam_large":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
+    else:
+        raise ValueError(f"Unknown sam_type: {sam_type}")
+
+    for name, param in hgsam_model.named_parameters():
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") \
+                or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+
+    for layers in hgsam_model.vision_encoder.layers:
+        layers.attn.qkv = LoRASam_DepWiseConv_ResidualGated(
+            qkv_layer=layers.attn.qkv, enabled=True, rank=rank, lora_alpha=lora_alpha,
+            dropout_rate=dropout_rate, ft_q=ft_q, ft_k=ft_k, ft_v=ft_v,
+            add_dsc_conv=add_dsc_conv, gate_init=gate_init,
+        )
+    return hgsam_model
+
 
 def get_loraplus_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=False, ft_v=True, sam_type: str = "sam_base"):
     """
