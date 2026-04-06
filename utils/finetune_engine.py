@@ -923,8 +923,22 @@ def run_finetune_engine(train_dataloader,
     # torch.compile：只编译计算量最大的 vision_encoder 子模块，
     # 避免 mask_decoder 中的条件分支导致 compile 失败或产生过大的中间缓存
     # AdaLoRA 在 update_and_allocate 时对参数做 in-place SVD 截断，与静态图不兼容，必须跳过
-    _is_adalora = hyperparameters.get('ft_type', '') == 'adalora_encoder'
-    use_compile = not hyperparameters.get('no_compile', False) and not _is_adalora
+    _ft_type = hyperparameters.get('ft_type', '')
+    _is_adalora = _ft_type == 'adalora_encoder'
+    # 只有 sam_fully 的 prompt_encoder 存在 requires_grad=True 但 forward 不触达的参数
+    # （box-only prompt 路径下 point/mask embedding 未被激活），需要 find_unused_parameters=True。
+    # 其他 ft_type（LoRA 系列 / sam_decoder / AdaLoRA 等）可训练参数都分布在每步 forward
+    # 必经的模块里，开启 find_unused_parameters 既无必要，又会与 torch.compile 的静态图
+    # /autograd graph 遍历冲突，触发 NCCL reducer 的 illegal memory access。
+    needs_find_unused = _ft_type == 'sam_fully'
+    # DDP + sam_fully 组合下 find_unused_parameters=True 与 torch.compile 不兼容
+    # （会触发 NCCL watchdog 的 illegal memory access），此时强制禁用 compile。
+    _ddp_needs_no_compile = ddp and needs_find_unused
+    use_compile = (
+        not hyperparameters.get('no_compile', False)
+        and not _is_adalora
+        and not _ddp_needs_no_compile
+    )
     if use_compile:
         try:
             model.vision_encoder = torch.compile(model.vision_encoder, mode='default')
@@ -937,14 +951,21 @@ def run_finetune_engine(train_dataloader,
         if master_process:
             if _is_adalora:
                 print("torch.compile 已禁用 (AdaLoRA 与静态图不兼容)")
+            elif _ddp_needs_no_compile:
+                print(f"torch.compile 已禁用 (DDP + {_ft_type} 需要 find_unused_parameters，与 compile 冲突)")
             else:
                 print("torch.compile 已禁用 (--no_compile)")
 
     # ---------- DDP 包装（仿照 nanoGPT，在 compile 之后包装）----------
-    # find_unused_parameters=True: SAM 的 prompt_encoder 等模块在某些前向路径中不参与 loss 计算，
-    # DDP 默认会报错，开启此选项允许存在未使用的参数
+    # find_unused_parameters 只在 sam_fully 时需要（prompt_encoder 的 point/mask embedding
+    # 可训练但 box-only forward 未触达）；其他 ft_type 开启此选项既无必要，又会与
+    # torch.compile 冲突导致 NCCL illegal memory access。
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+        model = DDP(
+            model,
+            device_ids=[ddp_local_rank],
+            find_unused_parameters=needs_find_unused,
+        )
     raw_model = model.module if ddp else model  # 用于保存权重时获取未包装的模型
 
     model.train()
