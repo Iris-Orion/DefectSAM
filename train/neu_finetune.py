@@ -34,7 +34,8 @@ if __name__ == '__main__':
     master_process = ddp_info['master_process']
 
     args = get_common_ft_args()
-    set_seed(args.seed, seed_offset=ddp_info['rank'])  # 每个进程使用不同的随机种子
+    # 模型初始化前所有 rank 使用相同 seed，保证各进程初始权重一致（DDP 正确性前提）
+    set_seed(args.seed, seed_offset=0)
 
     hyperparameters = vars(args)
 
@@ -79,6 +80,8 @@ if __name__ == '__main__':
     if not args.infer_mode and not args.zero_shot:
         # Training and finetune
         model = create_model_from_type(args=args, train_dataloader=train_dataloader)
+        # 模型创建完成后切换为 per-rank seed，保证各 rank 数据增强多样性
+        set_seed(args.seed, seed_offset=ddp_info['rank'])
         results, fintuned_model = run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
                                                       model, device, hyperparameters,
                                                       process_batch_fn = _process_batch,
