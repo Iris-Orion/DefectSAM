@@ -1,6 +1,7 @@
 # 适配 severstal neu sd900 magnetic_tile flood数据集
 import torch
 import torch._dynamo
+import torch.distributed as dist
 # torch._dynamo.config.capture_scalar_outputs = True
 # torch._dynamo.config.suppress_errors = True   # 符号形状推导失败时静默回退到 eager，不打印警告
 
@@ -749,13 +750,23 @@ def _evaluate(model,
               auto_seg = False,
               offset_info = None,
               master_process: bool = True,
-              multimask: bool = False):
+              multimask: bool = False,
+              ddp: bool = False):
     """
     评估模型。
-    master_process: DDP 模式下只在主进程显示进度条。
+
+    Args:
+        master_process: DDP 模式下只在主进程显示进度条。
+        ddp: 是否在 DDP 模式下运行。开启后会在结尾用 all_reduce 把各 rank 的
+             loss/dice/iou/hd95 汇总到全局平均。要求 dataloader 使用
+             DistributedSampler(shuffle=False)，保证每 rank batch 数相同。
     """
     model.eval()
-    total_loss, total_dice, total_iou = 0, 0, 0
+    # 用 GPU tensor 累积，便于结尾做一次 all_reduce
+    total_loss = torch.zeros(1, dtype=torch.float32, device=device)
+    total_dice = torch.zeros(1, dtype=torch.float32, device=device)
+    total_iou = torch.zeros(1, dtype=torch.float32, device=device)
+    num_batches = 0
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
     use_amp = scaler is not None
 
@@ -769,17 +780,44 @@ def _evaluate(model,
                                                     auto_seg = auto_seg,
                                                     offset_info = offset_info,
                                                     multimask = multimask)
-            
-            total_loss += loss.item()
-            total_dice += compute_dice_score(pred_masks, gt)
-            total_iou += compute_iou_score(pred_masks, gt)
+
+            total_loss += loss.detach().float()
+            total_dice += float(compute_dice_score(pred_masks, gt))
+            total_iou += float(compute_iou_score(pred_masks, gt))
+            num_batches += 1
             hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().detach().cpu(), y=gt.detach().cpu())
 
-    avg_loss = total_loss / len(dataloader)
-    avg_dice = total_dice / len(dataloader)
-    avg_iou = total_iou / len(dataloader)
-    avg_hd95 = hd95_metric.aggregate().item()
+    # HD95：先在本 rank 内 aggregate，得到本地样本均值；
+    # 乘以本 rank batch 数后汇总，再除以全局 batch 数，等价于跨 rank 的加权平均。
+    # （DistributedSampler 会把样本均匀分片/补齐，保证每 rank batch 数相同，故加权与非加权等价。）
+    local_hd95 = hd95_metric.aggregate().item()
     hd95_metric.reset()
+
+    # 打包所有标量到一个 tensor，单次 all_reduce 最省通信
+    stats = torch.tensor(
+        [
+            total_loss.item(),
+            total_dice.item(),
+            total_iou.item(),
+            float(num_batches),
+            local_hd95 * num_batches,
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+
+    if ddp and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    loss_sum, dice_sum, iou_sum, n_batches_global, hd95_weighted_sum = stats.tolist()
+
+    if n_batches_global <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    avg_loss = loss_sum / n_batches_global
+    avg_dice = dice_sum / n_batches_global
+    avg_iou = iou_sum / n_batches_global
+    avg_hd95 = hd95_weighted_sum / n_batches_global
 
     return avg_loss, avg_dice, avg_iou, avg_hd95
 
@@ -849,6 +887,8 @@ def run_finetune_engine(train_dataloader,
     lora_plus_lr_ratio = hyperparameters.get('lora_plus_lr_ratio', 16.0)
     use_early_stop = not hyperparameters.get('disable_early_stop', False)
 
+    model.to(device)
+
     trainable_parameters = [param for param in model.parameters() if param.requires_grad]      # 收集所有可训练的参数
 
     optimizer = None
@@ -915,8 +955,6 @@ def run_finetune_engine(train_dataloader,
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    model.to(device)
-
     # 保存未编译的 vision_encoder 引用，用于保存/加载权重时还原
     _orig_vision_encoder = model.vision_encoder
 
@@ -927,39 +965,15 @@ def run_finetune_engine(train_dataloader,
     _is_adalora = _ft_type == 'adalora_encoder'
     # 只有 sam_fully 的 prompt_encoder 存在 requires_grad=True 但 forward 不触达的参数
     # （box-only prompt 路径下 point/mask embedding 未被激活），需要 find_unused_parameters=True。
-    # 其他 ft_type（LoRA 系列 / sam_decoder / AdaLoRA 等）可训练参数都分布在每步 forward
-    # 必经的模块里，开启 find_unused_parameters 既无必要，又会与 torch.compile 的静态图
-    # /autograd graph 遍历冲突，触发 NCCL reducer 的 illegal memory access。
     needs_find_unused = _ft_type == 'sam_fully'
-    # DDP + sam_fully 组合下 find_unused_parameters=True 与 torch.compile 不兼容
-    # （会触发 NCCL watchdog 的 illegal memory access），此时强制禁用 compile。
-    _ddp_needs_no_compile = ddp and needs_find_unused
     use_compile = (
         not hyperparameters.get('no_compile', False)
         and not _is_adalora
-        and not _ddp_needs_no_compile
     )
-    if use_compile:
-        try:
-            model.vision_encoder = torch.compile(model.vision_encoder, mode='default')
-            if master_process:
-                print("torch.compile 已启用 (仅 vision_encoder, mode='default')")
-        except Exception as e:
-            if master_process:
-                print(f"torch.compile 不可用，跳过: {e}")
-    else:
-        if master_process:
-            if _is_adalora:
-                print("torch.compile 已禁用 (AdaLoRA 与静态图不兼容)")
-            elif _ddp_needs_no_compile:
-                print(f"torch.compile 已禁用 (DDP + {_ft_type} 需要 find_unused_parameters，与 compile 冲突)")
-            else:
-                print("torch.compile 已禁用 (--no_compile)")
 
-    # ---------- DDP 包装（仿照 nanoGPT，在 compile 之后包装）----------
-    # find_unused_parameters 只在 sam_fully 时需要（prompt_encoder 的 point/mask embedding
-    # 可训练但 box-only forward 未触达）；其他 ft_type 开启此选项既无必要，又会与
-    # torch.compile 冲突导致 NCCL illegal memory access。
+    # ---------- DDP 包装 ----------
+    # 对 DDP 路径，优先完成 reducer / gradient hook 注册，再只编译 raw_model.vision_encoder。
+    # 这样单卡与多卡都能共享 compile 加速路径，同时避免对 DDP wrapper 本身做编译。
     if ddp:
         model = DDP(
             model,
@@ -967,6 +981,24 @@ def run_finetune_engine(train_dataloader,
             find_unused_parameters=needs_find_unused,
         )
     raw_model = model.module if ddp else model  # 用于保存权重时获取未包装的模型
+
+    if use_compile:
+        try:
+            raw_model.vision_encoder = torch.compile(raw_model.vision_encoder, mode='default')
+            if master_process:
+                if ddp:
+                    print("torch.compile 已启用 (DDP + 仅 vision_encoder, mode='default')")
+                else:
+                    print("torch.compile 已启用 (仅 vision_encoder, mode='default')")
+        except Exception as e:
+            if master_process:
+                print(f"torch.compile 不可用，跳过: {e}")
+    else:
+        if master_process:
+            if _is_adalora:
+                print("torch.compile 已禁用 (AdaLoRA 与静态图不兼容)")
+            else:
+                print("torch.compile 已禁用 (--no_compile)")
 
     model.train()
 
@@ -1011,7 +1043,8 @@ def run_finetune_engine(train_dataloader,
 
         val_loss, val_dice, val_iou, val_hd95 = _evaluate(model, val_dataloader, loss_fn, process_batch_fn,
                                                       device, scaler, auto_seg = auto_seg, offset_info=offset_info,
-                                                      master_process=master_process, multimask=use_multimask)
+                                                      master_process=master_process, multimask=use_multimask,
+                                                      ddp=ddp)
         if master_process:
             print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val HD95: {val_hd95:.4f}')
 
@@ -1165,7 +1198,7 @@ def run_finetune_engine(train_dataloader,
     final_test_loss, final_test_dice, final_test_iou, final_test_hd95 = _evaluate(
         loaded_model, test_dataloader, loss_fn, process_batch_fn, device, scaler,
         auto_seg=auto_seg, offset_info=offset_info, master_process=master_process,
-        multimask=use_multimask)
+        multimask=use_multimask, ddp=ddp)
 
     if master_process:
         print(f'Final Test Set Evaluation: Loss: {final_test_loss:.4f}, Dice: {final_test_dice:.4f}, IoU: {final_test_iou:.4f}, HD95: {final_test_hd95:.4f}')

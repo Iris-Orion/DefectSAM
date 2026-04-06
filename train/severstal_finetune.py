@@ -9,7 +9,7 @@
     torchrun --standalone --nproc_per_node=4 train/severstal_finetune.py --batch_size 2
 
 多卡训练 (指定 GPU):
-    CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train/severstal_finetune.py --batch_size 2
+    CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.severstal_finetune --batch_size 2 --num_epochs 2
 """
 import os
 import monai
@@ -57,12 +57,18 @@ if __name__ == '__main__':
                                                                 mini_size=256)
     train_transforms, val_transforms = severstal.get_severstal_ft_albumentations_transforms()
 
-    train_dataset = SteelDataset_WithBoxPrompt(train_df, data_path=data_path, transforms=train_transforms)
-    val_dataset = SteelDataset_WithBoxPrompt(val_df, data_path=data_path, transforms=val_transforms)
-    test_dataset = SteelDataset_WithBoxPrompt(test_df, data_path=data_path, transforms=val_transforms)
+    train_dataset = SteelDataset_WithBoxPrompt(train_df, data_path=data_path, transforms=train_transforms, is_train=True)
+    val_dataset = SteelDataset_WithBoxPrompt(val_df, data_path=data_path, transforms=val_transforms, is_train=False)
+    test_dataset = SteelDataset_WithBoxPrompt(test_df, data_path=data_path, transforms=val_transforms, is_train=False)
 
-    # ---------- DataLoader：DDP 模式使用 DistributedSampler ----------
+    # ---------- DataLoader：DDP 模式下所有 split 都使用 DistributedSampler ----------
+    # val/test 用 shuffle=False 保证迭代顺序确定；DistributedSampler 默认会对末尾
+    # 不能整除 world_size 的样本做 padding（重复），保证每 rank batch 数相同，
+    # 这样 _evaluate 结尾的 all_reduce 汇总是正确的加权平均。
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False) if ddp else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, drop_last=False) if ddp else None
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -72,8 +78,24 @@ if __name__ == '__main__':
         num_workers=args.num_workers,
         persistent_workers=(args.num_workers > 0)
     )
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.num_workers, persistent_workers=(args.num_workers > 0))
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.num_workers, persistent_workers=(args.num_workers > 0))
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        persistent_workers=(args.num_workers > 0),
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=test_sampler,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        persistent_workers=(args.num_workers > 0),
+    )
 
     # ---------- 设备选择 ----------
     if ddp:

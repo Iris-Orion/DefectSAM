@@ -7,6 +7,44 @@ import matplotlib.pyplot as plt
 import numpy as np
 import random
 
+
+def _configure_nccl_compat_env():
+    """为 Blackwell / RTX 50 系列双卡训练设置更稳的 NCCL 默认项。
+
+    这些环境变量只在用户没有显式设置时才注入，避免覆盖手动调参。
+    """
+    if not torch.cuda.is_available():
+        return {}
+    if int(os.environ.get('WORLD_SIZE', '1')) <= 1:
+        return {}
+
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    try:
+        device_name = torch.cuda.get_device_name(local_rank)
+        major, _ = torch.cuda.get_device_capability(local_rank)
+    except Exception:
+        return {}
+
+    is_rtx50 = any(tag in device_name for tag in ('RTX 5090', 'RTX 5080', 'RTX 5070', 'RTX 5060'))
+    is_blackwell = major >= 12
+    if not (is_rtx50 or is_blackwell):
+        return {}
+
+    compat_env = {
+        'NCCL_P2P_DISABLE': '1',
+        'NCCL_SHM_DISABLE': '1',
+    }
+    applied = {}
+    for key, value in compat_env.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            applied[key] = value
+
+    if applied and int(os.environ.get('RANK', '0')) == 0:
+        print(f"[DDP compat] Detected {device_name}; auto-set NCCL env: {applied}")
+    return applied
+
+
 def set_device(gpu_idx: int=0):
     device = torch.device(f"cuda:{gpu_idx}" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)
@@ -33,6 +71,7 @@ def setup_ddp():
     """
     ddp = int(os.environ.get('RANK', -1)) != -1  # 通过 RANK 环境变量判断是否为 DDP 运行
     if ddp:
+        _configure_nccl_compat_env()
         init_process_group(backend='nccl')
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
