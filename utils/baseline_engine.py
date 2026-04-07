@@ -49,10 +49,13 @@ def create_bsl_model_from_type(args: argparse.Namespace):
 
     return model_map[model_choice]()
 
-def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, device, scaler, scheduler_per_batch=False):
+def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, device, scaler,
+                    scheduler_per_batch=False, compute_hd95: bool = False):
     model.train()
     total_loss, total_dice, total_iou = 0, 0, 0
-    hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
+    # 训练阶段默认不计算 HD95：CPU 上的 EDT 既慢又占内存，
+    # 容易把 DataLoader worker 拖到 OOM 被 SIGKILL。需要时可通过 --train_hd95 打开。
+    hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0) if compute_hd95 else None
     use_amp = scaler is not None
 
     # nanoGPT 风格：pin_memory + non_blocking，由 CUDA 内部 copy stream 重叠传输与计算
@@ -98,7 +101,8 @@ def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, device,
         with torch.no_grad():
             total_dice += compute_dice_score(outputs, masks)
             total_iou += compute_iou_score(outputs, masks)
-            hd95_metric(y_pred=(torch.sigmoid(outputs) > 0.5).float().cpu(), y=masks.cpu())
+            if hd95_metric is not None:
+                hd95_metric(y_pred=(torch.sigmoid(outputs) > 0.5).float().cpu(), y=masks.cpu())
         pbar.update(1)
         if not has_next:
             break
@@ -107,8 +111,11 @@ def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, device,
     avg_loss = total_loss / len(data_loader)
     avg_dice = total_dice / len(data_loader)
     avg_iou = total_iou / len(data_loader)
-    avg_hd95 = hd95_metric.aggregate().item()
-    hd95_metric.reset()
+    if hd95_metric is not None:
+        avg_hd95 = hd95_metric.aggregate().item()
+        hd95_metric.reset()
+    else:
+        avg_hd95 = float('nan')
     return avg_loss, avg_dice, avg_iou, avg_hd95
 
 def evaluate(model, data_loader, criterion, device, scaler=None):
@@ -206,11 +213,15 @@ def baseline_experiment(model, device,
     best_epoch = -1
     print_trainable_parameters(model)
 
+    train_compute_hd95 = hyperparameters.get('train_hd95', False)
+    print(f"训练阶段 HD95 计算: {'启用' if train_compute_hd95 else '关闭 (默认)'}")
+
     for epoch in range(num_epochs):
         print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
 
         avg_train_loss, avg_train_dice, avg_train_iou, avg_train_hd95 = train_one_epoch(
-            model, train_loader, criterion, optimizer, scheduler, device, scaler, scheduler_per_batch
+            model, train_loader, criterion, optimizer, scheduler, device, scaler,
+            scheduler_per_batch, compute_hd95=train_compute_hd95
         )
         print(f'Train Results: Loss: {avg_train_loss:.4f}, Dice: {avg_train_dice:.4f}, IoU: {avg_train_iou:.4f}, HD95: {avg_train_hd95:.4f}')
 

@@ -657,19 +657,14 @@ def _train_one_epoch(model,
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0) if compute_hd95 else None
     use_amp = scaler is not None
 
-    # 计时收集
-    timings = {'data_wait': [], 'forward_backward': [], 'optimizer_step': [], 'hd95': []}
-
     pbar = tqdm(CUDAPrefetcher(dataloader, device), desc="Training", total=len(dataloader), disable=not master_process)
     for batch_idx, batch in enumerate(pbar):
-        torch.cuda.synchronize()
-        t_start = time.time()
-        
         optimizer.zero_grad()
 
-        torch.cuda.synchronize()
-        t_after_zero_grad = time.time()
-        timings['data_wait'].append(t_after_zero_grad - t_start)
+        # MFU 计时起点：仅当 MFU 启用时 sync 一次确保上一步 GPU 工作已完成
+        if mfu_tracker is not None:
+            torch.cuda.synchronize()
+            t_step_start = time.time()
 
         loss, pred_masks, gt = procees_batch_fn(batch,
                                                 model,
@@ -702,42 +697,21 @@ def _train_one_epoch(model,
             _raw.update_and_allocate(global_step)
         global_step += 1
 
-        torch.cuda.synchronize()
-        t_after_optimizer = time.time()
-        timings['forward_backward'].append(t_after_optimizer - t_after_zero_grad)
+        # MFU 更新：sync 一次取 step 结束时间，dt 覆盖完整的 forward+backward+optimizer
+        if mfu_tracker is not None:
+            torch.cuda.synchronize()
+            mfu_tracker.update(time.time() - t_step_start)
+            pbar.set_postfix_str(mfu_tracker.status())
 
         scheduler.step()  # 学习率调度，默认根据每个batch更新一次，而不是一个epoch完之后更新一次
-
-        # MFU 更新：在 optimizer.step() 之后计时，包含完整的前向+反向
-        if mfu_tracker is not None:
-            dt = t_after_optimizer - t_after_zero_grad
-            mfu_tracker.update(dt)
-            pbar.set_postfix_str(mfu_tracker.status())
 
         total_loss += loss.item()
         with torch.no_grad():
             total_dice += compute_dice_score(pred_masks, gt)
             total_iou += compute_iou_score(pred_masks, gt)
-            
-            if hd95_metric is not None:
-                t_before_hd95 = time.time()
-                hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().detach().cpu(), y=gt.detach().cpu())
-                torch.cuda.synchronize()
-                t_after_hd95 = time.time()
-                timings['hd95'].append(t_after_hd95 - t_before_hd95)
 
-    # 打印计时统计
-    if master_process:
-        import numpy as np
-        print("\n" + "="*60)
-        print("训练阶段计时统计 (每 batch 平均):")
-        print(f"  Data wait (zero_grad): {np.mean(timings['data_wait'])*1000:.2f}ms (std: {np.std(timings['data_wait'])*1000:.2f}ms)")
-        print(f"  Forward+Backward:      {np.mean(timings['forward_backward'])*1000:.2f}ms (std: {np.std(timings['forward_backward'])*1000:.2f}ms)")
-        if timings['hd95']:
-            print(f"  HD95 compute:          {np.mean(timings['hd95'])*1000:.2f}ms (std: {np.std(timings['hd95'])*1000:.2f}ms)")
-        hd95_mean = np.mean(timings['hd95']) if timings['hd95'] else 0.0
-        print(f"  Total per batch:       {np.mean(timings['data_wait'])+np.mean(timings['forward_backward'])+hd95_mean*1000:.2f}ms")
-        print("="*60 + "\n")
+            if hd95_metric is not None:
+                hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().detach().cpu(), y=gt.detach().cpu())
 
     avg_loss = total_loss / len(dataloader)
     avg_dice = total_dice / len(dataloader)
