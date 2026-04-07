@@ -17,8 +17,10 @@ from albumentations.pytorch import ToTensorV2
 from typing import List, Tuple, Dict
 from sklearn.model_selection import train_test_split
 
-_MASK_CACHE: dict[str, np.ndarray] = {}  # 内存级缓存，同一进程内不重复 np.load
 _OLD_CACHE_WARNING_SHOWN = False
+# 注意：曾存在进程级 _MASK_CACHE 内存缓存，与 persistent_workers=True 叠加会导致
+# 每个 DataLoader worker 内存随 epoch 单调增长，最终被 cgroup OOM killer SIGKILL。
+# 现已移除，仅保留磁盘 .npz 缓存。请勿再添加进程内缓存。
 
 
 def _empty_mask() -> np.ndarray:
@@ -93,41 +95,32 @@ def rle2mask(image_id, df, cache_dir="./data/severstal_steel_defect_detection/ma
     输入: img_id   xxxxxxx.jpg
     输出: jpg对应的四通道的掩码
     输出的np.shape: [256, 1600, 4]   [H, W, C]
-    优先从 .npz 缓存加载，未命中时走 RLE 解码。
+    优先从 .npz / .npy 磁盘缓存加载，未命中时走 RLE 解码。
+    注意：不使用进程级内存缓存，避免在 persistent_workers=True 下
+    worker 内存随 epoch 单调增长导致 OOM 被 SIGKILL。
     """
     global _OLD_CACHE_WARNING_SHOWN
 
-    # 1. 进程内存缓存
-    if image_id in _MASK_CACHE:
-        return _MASK_CACHE[image_id]
-
-    # 2. 磁盘 .npz 缓存
+    # 1. 磁盘 .npz 缓存
     npz_path = Path(cache_dir) / f"{Path(image_id).stem}.npz"
     if npz_path.exists():
-        mask = np.load(npz_path)['mask']
-        _MASK_CACHE[image_id] = mask
-        return mask
-        
-    # 兼容老的 .npy 缓存
+        return np.load(npz_path)['mask']
+
+    # 2. 兼容老的 .npy 缓存
     npy_path = Path(cache_dir) / f"{Path(image_id).stem}.npy"
     if npy_path.exists():
         mask = np.load(npy_path)
         if mask.dtype != np.uint8 and not _OLD_CACHE_WARNING_SHOWN:
             print("[mask_cache] 检测到旧版非 uint8 缓存，可继续读取；若需回收空间可手动重建缓存目录。")
             _OLD_CACHE_WARNING_SHOWN = True
-        _MASK_CACHE[image_id] = mask
         return mask
 
     # 3. 回退到原始 RLE 解码
     image_df = df[df['ImageId'] == image_id]
     if _is_no_defect_image(image_df):
-        mask = _empty_mask()
-        _MASK_CACHE[image_id] = mask
-        return mask
+        return _empty_mask()
 
-    mask = _rle2mask_raw(image_id, image_df)
-    _MASK_CACHE[image_id] = mask
-    return mask
+    return _rle2mask_raw(image_id, image_df)
 
 def traindf_preprocess( split_seed: int = 42, 
                         csv_path: str = "./data/severstal_steel_defect_detection/train.csv",
@@ -141,7 +134,7 @@ def traindf_preprocess( split_seed: int = 42,
     处理原始的train.csv, 返回train_df和val_df dataframe
     并且决定是否将未有缺陷的图片也加入dataframe中
     """
-    if train_ratio + val_ratio + test_ratio != 1.0:
+    if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
         raise ValueError("训练、验证和测试的比例总和必须为1.0")
     
     trainfolder_df = pd.read_csv(csv_path)

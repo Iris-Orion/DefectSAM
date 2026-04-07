@@ -5,9 +5,6 @@
     python train/severstal_finetune.py --batch_size 2
     python -m train.severstal_finetune --batch_size 4 --device_id 0 --num_epoch 2
 
-多卡训练 (单机 4 卡):
-    torchrun --standalone --nproc_per_node=4 train/severstal_finetune.py --batch_size 2
-
 多卡训练 (指定 GPU):
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.severstal_finetune --batch_size 2 --num_epochs 2
 """
@@ -25,7 +22,7 @@ from utils.helper_function import set_seed, setup_ddp, cleanup_ddp
 from utils.finetune_engine import create_model_from_type, run_finetune_engine, inference_engine, _process_batch_severstal, zero_shot
 from weights.severstal_wts import severstal_dict
 
-if __name__ == '__main__':
+def main():
     # ---------- DDP 初始化 ----------
     ddp_info = setup_ddp()
     ddp = ddp_info['ddp']
@@ -62,12 +59,14 @@ if __name__ == '__main__':
     test_dataset = SteelDataset_WithBoxPrompt(test_df, data_path=data_path, transforms=val_transforms, is_train=False)
 
     # ---------- DataLoader：DDP 模式下所有 split 都使用 DistributedSampler ----------
-    # val/test 用 shuffle=False 保证迭代顺序确定；DistributedSampler 默认会对末尾
-    # 不能整除 world_size 的样本做 padding（重复），保证每 rank batch 数相同，
-    # 这样 _evaluate 结尾的 all_reduce 汇总是正确的加权平均。
+    # val/test 用 drop_last=True：DistributedSampler 默认 drop_last=False 时，
+    # 末尾不能整除 world_size 的样本会被**重复填充**到其他 rank。
+    # 这些重复样本在 _evaluate 的 all_reduce 加权汇总里会被双重计入，
+    # 导致 DDP 下 val/test 指标与单卡有偏差，影响早停判断和 best checkpoint 选择。
+    # 代价：每 rank 末尾最多丢 (world_size - 1) 个样本，对 ~1000+ 验证集 < 0.3%。
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if ddp else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False) if ddp else None
-    test_sampler = DistributedSampler(test_dataset, shuffle=False, drop_last=False) if ddp else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=True) if ddp else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, drop_last=True) if ddp else None
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -180,5 +179,13 @@ if __name__ == '__main__':
                                                         )
             print(f"\n==> [INFERENCE COMPLETE] for: {checkpoint_path}\n\n")
 
-    # ---------- DDP 清理 ----------
-    cleanup_ddp()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    finally:
+        # ---------- DDP 清理 ----------
+        # 放在 finally 里：训练异常退出（如 worker SIGKILL）时也要 destroy_process_group，
+        # 否则 torchrun 会报 "destroy_process_group() was not called before program exit"。
+        cleanup_ddp()

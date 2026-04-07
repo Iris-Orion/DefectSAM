@@ -798,7 +798,9 @@ def _evaluate(model,
 
     # HD95：先在本 rank 内 aggregate，得到本地样本均值；
     # 乘以本 rank batch 数后汇总，再除以全局 batch 数，等价于跨 rank 的加权平均。
-    # （DistributedSampler 会把样本均匀分片/补齐，保证每 rank batch 数相同，故加权与非加权等价。）
+    # 前提：val/test 的 DistributedSampler 必须使用 drop_last=True，
+    # 否则末尾 padding 重复样本会被双重计入 → 跨 rank 指标与单卡不一致。
+    # （drop_last=True 时每 rank 都丢掉相同数量的尾部样本，batch 数严格相等。）
     local_hd95 = hd95_metric.aggregate().item()
     hd95_metric.reset()
 
