@@ -3,7 +3,7 @@
 
 单卡训练:
     python train/severstal_finetune.py --batch_size 2
-    python -m train.severstal_finetune --batch_size 2 --device_id 0
+    python -m train.severstal_finetune --batch_size 4 --device_id 0 --num_epoch 2
 
 多卡训练 (单机 4 卡):
     torchrun --standalone --nproc_per_node=4 train/severstal_finetune.py --batch_size 2

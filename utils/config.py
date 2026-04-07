@@ -19,6 +19,8 @@ def _add_base_args(parser):
     parser.add_argument('--num_workers', type=int, default=4, help='num_workers')
 
     parser.add_argument('--no_compile', action='store_true', help='禁用 torch.compile 以节省显存')
+    parser.add_argument('--train_hd95', action='store_true',
+                        help='训练阶段是否计算 HD95（默认关闭，HD95 仅在 val/test 计算，避免 CPU 负担与内存问题）')
     parser.add_argument('--infer_mode', action="store_true", help='推理模式')
     parser.add_argument('--use_swanlab', '--swanlab', action='store_true', help='是否使用 swanlab 记录')
     parser.add_argument('--swanlab_project', '--pj_name', type=str, default='input your project name', help='swanlab项目名称')

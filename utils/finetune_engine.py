@@ -642,7 +642,8 @@ def _train_one_epoch(model,
                      mfu_tracker: MFUTracker = None,
                      master_process: bool = True,
                      multimask: bool = False,
-                     global_step: int = 0):
+                     global_step: int = 0,
+                     compute_hd95: bool = False):
     """
     执行一个完整的训练 epoch。
     mfu_tracker: 可选，传入后每个 batch 会更新 MFU 并在 tqdm 后缀中显示。
@@ -651,7 +652,9 @@ def _train_one_epoch(model,
     """
     model.train()
     total_loss, total_dice, total_iou = 0, 0, 0
-    hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
+    # 训练阶段默认不计算 HD95：CPU 上的 EDT 既慢又占内存，
+    # 容易把 DataLoader worker 拖到 OOM 被 SIGKILL。需要时可通过 --train_hd95 打开。
+    hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0) if compute_hd95 else None
     use_amp = scaler is not None
 
     # 计时收集
@@ -716,11 +719,12 @@ def _train_one_epoch(model,
             total_dice += compute_dice_score(pred_masks, gt)
             total_iou += compute_iou_score(pred_masks, gt)
             
-            t_before_hd95 = time.time()
-            hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().detach().cpu(), y=gt.detach().cpu())
-            torch.cuda.synchronize()
-            t_after_hd95 = time.time()
-            timings['hd95'].append(t_after_hd95 - t_before_hd95)
+            if hd95_metric is not None:
+                t_before_hd95 = time.time()
+                hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().detach().cpu(), y=gt.detach().cpu())
+                torch.cuda.synchronize()
+                t_after_hd95 = time.time()
+                timings['hd95'].append(t_after_hd95 - t_before_hd95)
 
     # 打印计时统计
     if master_process:
@@ -729,15 +733,20 @@ def _train_one_epoch(model,
         print("训练阶段计时统计 (每 batch 平均):")
         print(f"  Data wait (zero_grad): {np.mean(timings['data_wait'])*1000:.2f}ms (std: {np.std(timings['data_wait'])*1000:.2f}ms)")
         print(f"  Forward+Backward:      {np.mean(timings['forward_backward'])*1000:.2f}ms (std: {np.std(timings['forward_backward'])*1000:.2f}ms)")
-        print(f"  HD95 compute:          {np.mean(timings['hd95'])*1000:.2f}ms (std: {np.std(timings['hd95'])*1000:.2f}ms)")
-        print(f"  Total per batch:       {np.mean(timings['data_wait'])+np.mean(timings['forward_backward'])+np.mean(timings['hd95'])*1000:.2f}ms")
+        if timings['hd95']:
+            print(f"  HD95 compute:          {np.mean(timings['hd95'])*1000:.2f}ms (std: {np.std(timings['hd95'])*1000:.2f}ms)")
+        hd95_mean = np.mean(timings['hd95']) if timings['hd95'] else 0.0
+        print(f"  Total per batch:       {np.mean(timings['data_wait'])+np.mean(timings['forward_backward'])+hd95_mean*1000:.2f}ms")
         print("="*60 + "\n")
 
     avg_loss = total_loss / len(dataloader)
     avg_dice = total_dice / len(dataloader)
     avg_iou = total_iou / len(dataloader)
-    avg_hd95 = hd95_metric.aggregate().item()
-    hd95_metric.reset()
+    if hd95_metric is not None:
+        avg_hd95 = hd95_metric.aggregate().item()
+        hd95_metric.reset()
+    else:
+        avg_hd95 = float('nan')
 
     avg_mfu = mfu_tracker.mfu if mfu_tracker is not None else -1.0
     return avg_loss, avg_dice, avg_iou, avg_hd95, avg_mfu, global_step
@@ -923,7 +932,6 @@ def run_finetune_engine(train_dataloader,
 
     # 学习率调度策略 
     total_steps = len(train_dataloader) * num_epochs
-    warmup_ratio = 0.1
     warmup_steps = int(warmup_ratio * total_steps)
 
     cosine_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps)
@@ -973,7 +981,7 @@ def run_finetune_engine(train_dataloader,
 
     # ---------- DDP 包装 ----------
     # 对 DDP 路径，优先完成 reducer / gradient hook 注册，再只编译 raw_model.vision_encoder。
-    # 这样单卡与多卡都能共享 compile 加速路径，同时避免对 DDP wrapper 本身做编译。
+    # 单卡与多卡都能共享 compile 加速路径，同时避免对 DDP wrapper 本身做编译。
     if ddp:
         model = DDP(
             model,
@@ -1006,7 +1014,11 @@ def run_finetune_engine(train_dataloader,
     if master_process and use_multimask:
         print("multimask_output=True + best IoU selection 已启用")
 
-    # CHANGE: 仅在需要时计算 offset_info
+    train_compute_hd95 = hyperparameters.get('train_hd95', False)
+    if master_process:
+        print(f"训练阶段 HD95 计算: {'启用' if train_compute_hd95 else '关闭 (默认)'}")
+
+    # severstal需要计算 offset_info
     offset_info = None
     if process_batch_fn == _process_batch_severstal:
         if master_process:
@@ -1031,7 +1043,7 @@ def run_finetune_engine(train_dataloader,
             cosine_scheduler, loss_fn, process_batch_fn, scaler, device,
             auto_seg=auto_seg, offset_info=offset_info, mfu_tracker=mfu_tracker,
             master_process=master_process, multimask=use_multimask,
-            global_step=global_step)
+            global_step=global_step, compute_hd95=train_compute_hd95)
 
         if master_process:
             mfu_str = f"{train_mfu*100:.2f}%" if train_mfu >= 0 else "N/A"
@@ -1217,86 +1229,6 @@ def run_finetune_engine(train_dataloader,
         print("--- Training finished ---")
 
     return history, model
-
-
-def evaluate_all_metrics_profiler(model, dataloader, loss_fn, process_batch_fn, device, auto_seg=False, offset_info=None):
-    """
-    在给定的数据集上评估模型，并使用 PROFILER 分析性能。
-    """
-    model.eval()
-
-    # --- 您的原始指标初始化代码保持不变 ---
-    iou_metric = MeanIoU(include_background=True, reduction="mean")
-    dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
-    hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
-    total_dice, total_iou = 0, 0
-    
-    # CHANGE 2: 设置分析参数 (预热1个批次，记录接下来的3个批次)
-    warmup_steps = 1
-    active_steps = 3
-    total_steps_to_profile = warmup_steps + active_steps
-
-    # CHANGE 3: 初始化 Profiler 上下文管理器
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], # 同时记录 CPU 和 GPU 活动
-        record_shapes=True, # 记录张量的形状
-        profile_memory=True, # 记录显存使用情况
-        with_stack=True, # 记录调用堆栈，便于追溯源头
-        schedule=torch.profiler.schedule(wait=0, warmup=warmup_steps, active=active_steps, repeat=1) # 使用schedule来自动控制
-    ) as prof:
-        with torch.no_grad():
-            for step, batch in enumerate(tqdm(dataloader, desc="Profiling & Final Evaluation")):
-                
-                # CHANGE 4: 在循环内部使用 record_function 标记关键代码块，使报告更清晰
-                with record_function("process_batch_and_metrics"):
-                    _, pred_masks_logits, gt_masks = process_batch_fn(
-                        batch, model, loss_fn=loss_fn, device=device, use_amp=False, auto_seg=auto_seg, offset_info=offset_info
-                    )
-
-                    # 手动计算的指标
-                    total_dice += compute_dice_score(pred_masks_logits, gt_masks)
-                    total_iou += compute_iou_score(pred_masks_logits, gt_masks)
-                
-                    # MONAI 指标
-                    pred_masks_binary = (torch.sigmoid(pred_masks_logits) > 0.5).float()
-                    hd95_metric(y_pred=pred_masks_binary.detach().cpu(), y=gt_masks.detach().cpu())
-
-                # CHANGE 5: 通知 profiler 已完成一步
-                prof.step()
-
-                # CHANGE 6: 如果只想分析几个批次，可以提前中断循环
-                if step >= total_steps_to_profile -1 :
-                     # 注意：为了得到完整的评估结果，这里我们不中断。
-                     # Profiler在达到active_steps后会自动停止记录。
-                     # 如果你只想快速分析，可以取消下面这行注释:
-                     # break 
-                     pass
-
-    # CHANGE 7: 在循环结束后，打印分析结果
-    # 按照 CUDA 总耗时降序排列，显示前 15 个最耗时的操作
-    print("\n" + "="*80)
-    print("PYTORCH PROFILER RESULTS:")
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
-    print("="*80 + "\n")
-
-    # --- 您的原始结果计算和打印代码保持不变 ---
-    mean_iou = total_iou / len(dataloader)
-    mean_dice = total_dice / len(dataloader)
-    mean_hd95 = hd95_metric.aggregate().item()
-    
-    # 重置计算器状态
-    hd95_metric.reset()
-    
-    print(f"Evaluation Results:")
-    print(f"  Mean IoU: {mean_iou:.4f}")
-    print(f"  Mean Dice: {mean_dice:.4f}")
-    print(f"  95% Hausdorff Distance (HD95): {mean_hd95:.4f}")
-
-    return {
-        "iou": mean_iou,
-        "dice": mean_dice,
-        "hd95": mean_hd95,
-    }
 
 def evaluate_all_metrics(model, dataloader, loss_fn, process_batch_fn, device, auto_seg=False, offset_info=None):
     """
@@ -1501,8 +1433,3 @@ def zero_shot(model_path,
     with torch.cuda.device(device):
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-
-
-
-
-
