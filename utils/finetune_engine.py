@@ -160,6 +160,20 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
             ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
             gate_init=0.0, sam_type=sam_type)
 
+    elif model_type == 'loradsc_qv_adaptive':
+        args.use_loraplus_optim = True
+        from utils.sam_arch import get_loradsc_adaptive_gated_model
+        return get_loradsc_adaptive_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
+
+    elif model_type == 'loradsc_qkv_adaptive':
+        args.use_loraplus_optim = True
+        from utils.sam_arch import get_loradsc_adaptive_gated_model
+        return get_loradsc_adaptive_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
+
     elif model_type == 'loradsc_q':
         return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True)
     

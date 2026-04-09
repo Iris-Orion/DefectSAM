@@ -309,6 +309,69 @@ class LoRASam_DepWiseConv_ResidualGated(LoRASam_DepWiseConv):
         ]
 
 
+class LoRASam_DepWiseConv_AdaptiveGated(LoRASam_DepWiseConv):
+    """
+    Channel-wise Adaptive Gated LoRA-DSC:
+    - 废弃静态标量门控，使用基于全局上下文的自适应 MLP 门控。
+    - 门控网络: Squeeze(AvgPool) -> Excitation(MLP) -> Sigmoid，针对低秩空间的 rank 维度。
+    - 使得模型能按需激活 DSC，不同输入图像有不同的通道权重。
+    """
+    def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
+                 ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True):
+        super().__init__(qkv_layer, enabled, rank, lora_alpha, dropout_rate,
+                         ft_q, ft_k, ft_v, add_dsc_conv)
+        self.adaptive_gate = nn.ModuleDict({})
+        for part in self.lora_a.keys():
+            gate_net = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),          # [B, rank, H, W] -> [B, rank, 1, 1]
+                nn.Flatten(),                     # -> [B, rank]
+                nn.Linear(rank, max(1, rank // 4)), # 降维
+                nn.ReLU(inplace=True),
+                nn.Linear(max(1, rank // 4), rank), # 升维
+                nn.Sigmoid()
+            )
+            # 初始化，保证初期 Sigmoid 输出接近 0
+            nn.init.constant_(gate_net[4].weight, 0.0)
+            nn.init.constant_(gate_net[4].bias, -4.0) # sigmoid(-4.0) ≈ 0.018
+            self.adaptive_gate[part] = gate_net
+
+    def _get_delta(self, x, part: str):
+        x_drop = self.lora_dropout(x)
+        if self.add_dsc_conv:
+            h = self.lora_a[part](x_drop)                        # [B, H, W, rank]
+            conv_in = h.permute(0, 3, 1, 2)                      # [B, rank, H, W]
+            
+            # 生成自适应门控权重
+            dynamic_weight = self.adaptive_gate[part](conv_in)   # [B, rank]
+            dynamic_weight = dynamic_weight.view(-1, 1, 1, self.rank) # [B, 1, 1, rank]
+            
+            conv_out = self.lora_pw_conv[part](
+                           self.lora_dw_conv[part](conv_in))
+            conv_out = conv_out.permute(0, 2, 3, 1)              # [B, H, W, rank]
+            
+            delta = self.lora_b[part](h + dynamic_weight * conv_out) * self.scale
+        else:
+            delta = self.lora_b[part](self.lora_a[part](x_drop)) * self.scale
+        return delta
+
+    def get_loraplus_param_groups(self, base_lr: float, lora_plus_lr_ratio: float = 16.0,
+                                   weight_decay: float = 0.0):
+        if self.rank <= 0:
+            return []
+        a_params, b_side_params = [], []
+        for part in self.lora_a.keys():
+            a_params.extend(self.lora_a[part].parameters())
+            b_side_params.extend(self.lora_b[part].parameters())
+            if self.add_dsc_conv:
+                b_side_params.extend(self.lora_dw_conv[part].parameters())
+                b_side_params.extend(self.lora_pw_conv[part].parameters())
+            b_side_params.extend(self.adaptive_gate[part].parameters())
+        return [
+            {"params": a_params,      "lr": base_lr,                      "weight_decay": weight_decay},
+            {"params": b_side_params, "lr": base_lr * lora_plus_lr_ratio,  "weight_decay": weight_decay},
+        ]
+
+
 class _Reshape4d(nn.Module):
     """[B, H, W, C] -> [B, C, H, W]"""
     def forward(self, x):
@@ -653,6 +716,33 @@ def get_loradsc_residual_gated_model(rank, lora_alpha, dropout_rate,
             qkv_layer=layers.attn.qkv, enabled=True, rank=rank, lora_alpha=lora_alpha,
             dropout_rate=dropout_rate, ft_q=ft_q, ft_k=ft_k, ft_v=ft_v,
             add_dsc_conv=add_dsc_conv, gate_init=gate_init,
+        )
+    return hgsam_model
+
+
+def get_loradsc_adaptive_gated_model(rank, lora_alpha, dropout_rate,
+                                     ft_q=True, ft_k=False, ft_v=True,
+                                     add_dsc_conv=True, sam_type: str = "sam_base"):
+    """
+    构建 Channel-wise Adaptive Gated LoRA-DSC 版本 SAM。
+    """
+    if sam_type == "sam_base":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+    elif sam_type == "sam_large":
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
+    else:
+        raise ValueError(f"Unknown sam_type: {sam_type}")
+
+    for name, param in hgsam_model.named_parameters():
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") \
+                or name.startswith("mask_decoder"):
+            param.requires_grad_(False)
+
+    for layers in hgsam_model.vision_encoder.layers:
+        layers.attn.qkv = LoRASam_DepWiseConv_AdaptiveGated(
+            qkv_layer=layers.attn.qkv, enabled=True, rank=rank, lora_alpha=lora_alpha,
+            dropout_rate=dropout_rate, ft_q=ft_q, ft_k=ft_k, ft_v=ft_v,
+            add_dsc_conv=add_dsc_conv,
         )
     return hgsam_model
 
