@@ -309,6 +309,55 @@ class LoRASam_DepWiseConv_ResidualGated(LoRASam_DepWiseConv):
         ]
 
 
+def apply_residual_gated_symmetric_init(model, init_std: float = 1e-3):
+    """
+    对 ResidualGated LoRA-DSC 执行对称非零初始化，并补偿基底权重以保持初始函数不变。
+
+    约束：
+    - 仅支持 LoRA dropout = 0，否则训练态下无法保持与预训练模型严格一致。
+    - 仅支持 gate_init = 0，使 DSC 分支在初始化时不参与前向。
+    """
+    if init_std <= 0:
+        raise ValueError(f"init_std must be positive, got {init_std}.")
+
+    for layer in model.vision_encoder.layers:
+        qkv_mod = layer.attn.qkv
+        if not isinstance(qkv_mod, LoRASam_DepWiseConv_ResidualGated):
+            continue
+
+        if qkv_mod.rank <= 0:
+            continue
+        if qkv_mod.dropout_rate > 0:
+            raise ValueError(
+                "Symmetric initialization for ResidualGated LoRA-DSC requires "
+                "dropout_rate == 0.0 to preserve the pretrained function at init."
+            )
+
+        out_per_part = qkv_mod.out_features // 3
+        part_slices = {
+            "q": slice(0, out_per_part),
+            "k": slice(out_per_part, 2 * out_per_part),
+            "v": slice(2 * out_per_part, 3 * out_per_part),
+        }
+
+        with torch.no_grad():
+            for part, a_layer in qkv_mod.lora_a.items():
+                gate_value = float(qkv_mod.gate[part].item())
+                if gate_value != 0.0:
+                    raise ValueError(
+                        f"Symmetric initialization requires gate[{part}] == 0.0, got {gate_value}."
+                    )
+
+                a0 = torch.empty_like(a_layer.weight)
+                b0 = torch.empty_like(qkv_mod.lora_b[part].weight)
+                nn.init.normal_(a0, mean=0.0, std=init_std)
+                nn.init.normal_(b0, mean=0.0, std=init_std)
+
+                qkv_mod.lora_a[part].weight.copy_(a0)
+                qkv_mod.lora_b[part].weight.copy_(b0)
+                qkv_mod.linear.weight.data[part_slices[part], :] -= qkv_mod.scale * (b0 @ a0)
+
+
 class LoRASam_DepWiseConv_AdaptiveGated(LoRASam_DepWiseConv):
     """
     Channel-wise Adaptive Gated LoRA-DSC:
@@ -694,6 +743,8 @@ def get_loradsc_gated_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, ad
 def get_loradsc_residual_gated_model(rank, lora_alpha, dropout_rate,
                                       ft_q=True, ft_k=False, ft_v=True,
                                       add_dsc_conv=True, gate_init: float = 0.0,
+                                      use_symmetric_init: bool = False,
+                                      symmetric_init_std: float = 1e-3,
                                       sam_type: str = "sam_base"):
     """
     构建 ResidualGated LoRA-DSC 版本 SAM。
@@ -717,6 +768,8 @@ def get_loradsc_residual_gated_model(rank, lora_alpha, dropout_rate,
             dropout_rate=dropout_rate, ft_q=ft_q, ft_k=ft_k, ft_v=ft_v,
             add_dsc_conv=add_dsc_conv, gate_init=gate_init,
         )
+    if use_symmetric_init:
+        apply_residual_gated_symmetric_init(hgsam_model, init_std=symmetric_init_std)
     return hgsam_model
 
 

@@ -158,7 +158,10 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
         return get_loradsc_residual_gated_model(
             rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
             ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
-            gate_init=0.0, sam_type=sam_type)
+            gate_init=0.0,
+            use_symmetric_init=args.use_residual_gated_symmetric_init,
+            symmetric_init_std=args.residual_gated_symmetric_init_std,
+            sam_type=sam_type)
 
     elif model_type == 'loradsc_qv_adaptive':
         args.use_loraplus_optim = True
@@ -604,8 +607,8 @@ def _process_batch_with_point_grid(batch, model, loss_fn, device, use_amp,
                             multimask_output=False)
             predicted_masks = outputs.pred_masks.squeeze(1)
             
-            print(f"predicted_masks shape: {predicted_masks.shape}")
-            print(f"ground_truth_masks shape: {ground_truth_masks.shape}")
+            # print(f"predicted_masks shape: {predicted_masks.shape}")
+            # print(f"ground_truth_masks shape: {ground_truth_masks.shape}")
             gt_downsampled = F.interpolate(ground_truth_masks, size=(256, 256), mode="nearest")
             loss = loss_fn(predicted_masks, gt_downsampled)
     else:
@@ -876,7 +879,11 @@ def run_finetune_engine(train_dataloader,
         print(f"权重保存格式: hugging face格式:{SAVE_HUGGINGFACE_PRETRAINED_MODEL} || lora格式:{save_lora_only}")
 
     # 从超参数中获取值
-    lr = hyperparameters['learning_rate']
+    # DDP: 等效 batch_size = per_gpu_bs × world_size，按线性缩放规则同比扩大 lr
+    _world_size = ddp_info['world_size'] if ddp else 1
+    lr = hyperparameters['learning_rate'] * _world_size
+    if master_process and _world_size > 1:
+        print(f"DDP lr scaling: base_lr={hyperparameters['learning_rate']:.2e} × world_size={_world_size} → effective_lr={lr:.2e}")
     wd = hyperparameters['weight_decay']
     num_epochs = hyperparameters['num_epochs']
     warmup_ratio = hyperparameters['warmup_ratio']
