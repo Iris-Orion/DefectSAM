@@ -163,6 +163,24 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
             symmetric_init_std=args.residual_gated_symmetric_init_std,
             sam_type=sam_type)
 
+    elif model_type == 'loradsc_qkv_residual_gated':
+        return get_loradsc_residual_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True,
+            gate_init=0.0,
+            use_symmetric_init=args.use_residual_gated_symmetric_init,
+            symmetric_init_std=args.residual_gated_symmetric_init_std,
+            sam_type=sam_type)
+
+    elif model_type == 'loradsc_q_residual_gated':
+        return get_loradsc_residual_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True,
+            gate_init=0.0,
+            use_symmetric_init=args.use_residual_gated_symmetric_init,
+            symmetric_init_std=args.residual_gated_symmetric_init_std,
+            sam_type=sam_type)
+
     elif model_type == 'loradsc_qv_adaptive':
         args.use_loraplus_optim = True
         from utils.sam_arch import get_loradsc_adaptive_gated_model

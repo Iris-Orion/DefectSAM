@@ -772,7 +772,6 @@ def get_loradsc_residual_gated_model(rank, lora_alpha, dropout_rate,
         apply_residual_gated_symmetric_init(hgsam_model, init_std=symmetric_init_std)
     return hgsam_model
 
-
 def get_loradsc_adaptive_gated_model(rank, lora_alpha, dropout_rate,
                                      ft_q=True, ft_k=False, ft_v=True,
                                      add_dsc_conv=True, sam_type: str = "sam_base"):
