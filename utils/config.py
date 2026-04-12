@@ -67,11 +67,6 @@ def _add_finetune_args(parser):
     parser.add_argument('--sam_style_train', action="store_true", help='使用SAM原始多prompt多轮迭代训练策略')
     parser.add_argument('--zero_shot', action="store_true", help='是否进行zero-shot评估')
 
-    # 交叉验证
-    parser.add_argument('--use_kfold', action='store_true', help='是否启用 K 折交叉验证')
-    parser.add_argument('--num_folds', type=int, default=5, help='K 折交叉验证中的折数')
-    parser.add_argument('--fold_index', type=int, default=-1, help='指定运行某一折，-1 表示运行全部折')
-
     # sam模型大小选择
     parser.add_argument('--sam_type', type=str, default="sam_base", help='sam模型大小选择')
 
