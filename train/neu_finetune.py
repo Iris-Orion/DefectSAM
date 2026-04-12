@@ -3,21 +3,12 @@
 
 单卡训练:
     python train/neu_finetune.py --batch_size 2
-    c
 
-多卡训练 (单机 4 卡):
-    torchrun --standalone --nproc_per_node=4 train/neu_finetune.py --batch_size 2
-
-多卡训练 (多机, 例如 2 节点各 8 卡):
-    # 主节点:
-    torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=<IP> --master_port=1234 train/neu_finetune.py
-    # 工作节点:
-    torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=<IP> --master_port=1234 train/neu_finetune.py
+多卡训练 (单机 2 卡):
+    torchrun --standalone --nproc_per_node=2 train/neu_finetune.py --batch_size 2
 """
-import os
 import torch
 import monai
-import copy
 from transformers import SamModel
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -25,10 +16,8 @@ from data.neu_dataset import create_neu_dataset_stratified, debug_neu_dataset_in
 from utils.config import get_common_ft_args
 from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, create_model_from_type, zero_shot
 from utils.helper_function import set_seed, setup_ddp, cleanup_ddp
-# from weights.neu_weights import ft_neu_dict, dif_rank_neu_dict, alpha_scale_neu_dict, autoseg_neu_dict
 
-if __name__ == '__main__':
-    # ---------- DDP 初始化（仿照 nanoGPT）----------
+def main():
     ddp_info = setup_ddp()
     ddp = ddp_info['ddp']
     master_process = ddp_info['master_process']
@@ -51,24 +40,36 @@ if __name__ == '__main__':
     train_dataset, val_dataset, test_dataset = create_neu_dataset_stratified()
 
     # ---------- DataLoader：DDP 模式使用 DistributedSampler ----------
+    # val/test 用 drop_last=True：DistributedSampler 默认 drop_last=False 时，
+    # 末尾不能整除 world_size 的样本会被重复填充到其他 rank。
+    # 这些重复样本在 _evaluate 的 all_reduce 加权汇总里会被双重计入，
+    # 导致 DDP 下 val/test 指标偏高，影响早停判断和 best checkpoint 选择。
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=True) if ddp else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, drop_last=True) if ddp else None
     train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=hyperparameters['batch_size'],
-        shuffle=(train_sampler is None),  # DDP 时由 sampler 控制 shuffle，不在 DataLoader 层设置
-        sampler=train_sampler,
-        num_workers=hyperparameters['num_workers'],
-        pin_memory=True,
-        persistent_workers=(hyperparameters['num_workers'] > 0)
-    )
-    val_dataloader = DataLoader(val_dataset, batch_size=hyperparameters['batch_size'], shuffle=False, num_workers=hyperparameters['num_workers'], pin_memory=True, persistent_workers=(hyperparameters['num_workers'] > 0))
-    test_dataloader = DataLoader(test_dataset, batch_size=hyperparameters['batch_size'], shuffle=False, num_workers=hyperparameters['num_workers'], pin_memory=True, persistent_workers=(hyperparameters['num_workers'] > 0))
+                                    train_dataset,
+                                    batch_size=hyperparameters['batch_size'],
+                                    shuffle=(train_sampler is None),  # DDP 时由 sampler 控制 shuffle，不在 DataLoader 层设置
+                                    sampler=train_sampler,
+                                    num_workers=hyperparameters['num_workers'],
+                                    pin_memory=True,
+                                    persistent_workers=(hyperparameters['num_workers'] > 0)
+                                )
+    val_dataloader = DataLoader( val_dataset, 
+                                batch_size=hyperparameters['batch_size'], 
+                                shuffle=False, 
+                                sampler=val_sampler, 
+                                num_workers=hyperparameters['num_workers'], 
+                                pin_memory=True, 
+                                persistent_workers=(hyperparameters['num_workers'] > 0))
+    test_dataloader = DataLoader( test_dataset, 
+                                 batch_size=hyperparameters['batch_size'], 
+                                 shuffle=False, sampler=test_sampler, 
+                                 num_workers=hyperparameters['num_workers'], 
+                                 pin_memory=True, 
+                                 persistent_workers=(hyperparameters['num_workers'] > 0))
 
-    lora_rank = args.lora_rank
-    lora_alpha = args.lora_alpha
-    lora_dropout = args.lora_dropout
-
-    # ---------- 设备选择：DDP 时由 setup_ddp 自动设置，单卡时使用 device_id ----------
     if ddp:
         device = ddp_info['device']
     else:
@@ -110,5 +111,11 @@ if __name__ == '__main__':
                     auto_seg=False,
                     eval_traindataset=True)
 
-    # ---------- DDP 清理 ----------
-    cleanup_ddp()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    finally:
+        # 放在 finally 里：训练异常退出时也要 destroy_process_group，
+        cleanup_ddp()
