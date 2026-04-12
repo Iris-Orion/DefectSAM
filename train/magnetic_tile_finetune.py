@@ -1,13 +1,17 @@
+"""
+支持单卡和 DDP 多卡训练
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.magnetic_tile_finetune --batch_size 4 --ft_type loradsc_qkv_residual_gated
+"""
 import copy
 import torch
 import monai
 from tqdm import tqdm
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 from utils.config import get_common_ft_args
 from utils.utils import compute_dice_score, compute_iou_score
 from data.magnetic_tile_dataset import create_magnetic_dataset
-from utils.helper_function import set_seed
+from utils.helper_function import set_seed, setup_ddp, cleanup_ddp
 from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, zero_shot, create_model_from_type
 from weights.magnetic_wts import magnetic_dict
 
@@ -33,57 +37,98 @@ def mag_inference(model, device, dataloader, scaler):
         # print(f'Validation Loss: {test_loss:.4f}, Val Dice: {test_dicescore:.4f}, Val IoU: {test_ious:.4f}')
     return test_dicescore, test_ious
 
-if __name__ == "__main__":
-    args = get_common_ft_args()
+def main():
+    ddp_info = setup_ddp()
+    ddp = ddp_info['ddp']
+    master_process = ddp_info['master_process']
 
-    set_seed(args.seed)
+    args = get_common_ft_args()
+    # 模型初始化前所有 rank 使用相同 seed，保证各进程初始权重一致（DDP 正确性前提）
+    set_seed(args.seed, seed_offset=0)
+    
     hyperparameters = vars(args)
 
     train_dataset, val_dataset, test_dataset = create_magnetic_dataset()
 
-    sample = train_dataset[0]
-    img, mask, bbox, label = sample['image'], sample['mask'], sample['bbox'], sample['label']
+    if master_process:
+        sample = train_dataset[0]
+        img, mask, bbox, label = sample['image'], sample['mask'], sample['bbox'], sample['label']
 
-    print(f"img shape: {img.shape}, mask.shape: {mask.shape}")
-    print(f"img dtype: {img.dtype}, mask dtype: {mask.dtype}")
-    print(f"img min: {img.min()}, img max: {img.max()}")
-    print(f"img unique: {img.unique()}")
-    print(f"mask min: {mask.min()}, mask max: {mask.max()}")
-    print(f"label: {label}")
+        print(f"img shape: {img.shape}, mask.shape: {mask.shape}")
+        print(f"img dtype: {img.dtype}, mask dtype: {mask.dtype}")
+        print(f"img min: {img.min()}, img max: {img.max()}")
+        print(f"img unique: {img.unique()}")
+        print(f"mask min: {mask.min()}, mask max: {mask.max()}")
+        print(f"label: {label}")
 
-    # 创建 DataLoader
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
+    # ---------- DataLoader：DDP 模式使用 DistributedSampler ----------
+    train_sampler = DistributedSampler(train_dataset, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=True) if ddp else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, drop_last=True) if ddp else None
+    
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=hyperparameters['batch_size'],
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=hyperparameters['num_workers'],
+        pin_memory=True,
+        persistent_workers=(hyperparameters['num_workers'] > 0)
+    )
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=hyperparameters['batch_size'],
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=hyperparameters['num_workers'],
+        pin_memory=True,
+        persistent_workers=(hyperparameters['num_workers'] > 0)
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=hyperparameters['batch_size'],
+        shuffle=False,
+        sampler=test_sampler,
+        num_workers=hyperparameters['num_workers'],
+        pin_memory=True,
+        persistent_workers=(hyperparameters['num_workers'] > 0)
+    )
 
     hyperparameters['optimizer'] = 'AdamW'
     hyperparameters['loss_function'] = 'monai.DiceCELoss'
     hyperparameters['scheduler'] = 'cosine'
     hyperparameters['task_name'] = "magnetic_" + hyperparameters['ft_type']
 
-    print(hyperparameters)
+    if master_process:
+        print(hyperparameters)
 
-    lora_rank = args.lora_rank
-    lora_alpha = args.lora_alpha
-    lora_dropout = args.lora_dropout
-
-    device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
+    if ddp:
+        device = ddp_info['device']
+    else:
+        device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
 
     # 微调任务
-    if not args.infer_mode:
+    if not args.infer_mode and not args.zero_shot:
         model = create_model_from_type(args=args, train_dataloader=train_dataloader)
+        # 模型创建完成后切换为 per-rank seed，保证各 rank 数据增强多样性
+        set_seed(args.seed, seed_offset=ddp_info['rank'])
+        
         results, fintuned_model = run_finetune_engine(train_dataloader, val_dataloader, test_dataloader, 
                                                       model, device, hyperparameters, 
                                                       process_batch_fn = _process_batch,
                                                       save_dir = "./new_weights/finetune/mag_output/"+hyperparameters['ft_type'],
-                                                      auto_seg = args.auto_seg)
+                                                      auto_seg = args.auto_seg,
+                                                      ddp_info=ddp_info,
+                                                      train_sampler=train_sampler)
     
     elif args.zero_shot:
         seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-        device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
+        if not ddp:
+            device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
 
         SambPath = "./HuggingfaceModel/sam_vit_base/model"
         MedSamPath = "./HuggingfaceModel/wanglab/medsam-vit-base/model"
+
         zero_shot(model_path = SambPath,
                   train_dataloader=train_dataloader,
                     val_dataloader=val_dataloader,
@@ -102,6 +147,10 @@ if __name__ == "__main__":
         # checkpoints_to_evaluate = magnetic_tile_dict()
         # checkpoints_to_evaluate = scale_magnetic_tile_dict()
         checkpoints_to_evaluate = magnetic_dict()
+        
+        if not ddp:
+            device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
+        
         for checkpoint_info in checkpoints_to_evaluate:
             checkpoint_path = checkpoint_info["path"]
             loading_type = checkpoint_info["type"]
@@ -109,11 +158,12 @@ if __name__ == "__main__":
             current_model = None # 初始化    
 
             # description = checkpoint_info["description"]
-            print(f"================================================================")
-            # print(f"==> [STARTING INFERENCE] for: {description}")
-            print(f"==> Path: {checkpoint_path}")
-            print(f"==> Loading Type: {loading_type}")
-            print(f"================================================================")
+            if master_process:
+                print(f"================================================================")
+                # print(f"==> [STARTING INFERENCE] for: {description}")
+                print(f"==> Path: {checkpoint_path}")
+                print(f"==> Loading Type: {loading_type}")
+                print(f"================================================================")
 
             current_args = copy.deepcopy(args)          # 创建 args 的一个深拷贝，以防止循环间的副作用
 
@@ -141,7 +191,8 @@ if __name__ == "__main__":
                                 auto_seg=current_args.auto_seg,
                                 eval_traindataset=False
                                                         )
-            print(f"\n==> [INFERENCE COMPLETE] for: {checkpoint_path}\n\n")
+            if master_process:
+                print(f"\n==> [INFERENCE COMPLETE] for: {checkpoint_path}\n\n")
         
         # inference_engine (  model, args, best_model_path = checkpoint_path, 
         #                     train_dataloader=train_dataloader, val_dataloader=val_dataloader, test_dataloader=test_dataloader,
@@ -181,4 +232,11 @@ if __name__ == "__main__":
     #             result_name="magtile_finetune_fully_finetune_",
     #             target_dir= "./model_output/mag_output",
     #             SAVE_HUGGINGFACE_PRETRAINED_MODEL = True)
-    
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        # 放在 finally 里：训练异常退出时也要 destroy_process_group，
+        cleanup_ddp()
