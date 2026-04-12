@@ -897,11 +897,8 @@ def run_finetune_engine(train_dataloader,
         print(f"权重保存格式: hugging face格式:{SAVE_HUGGINGFACE_PRETRAINED_MODEL} || lora格式:{save_lora_only}")
 
     # 从超参数中获取值
-    # DDP: 等效 batch_size = per_gpu_bs × world_size，按线性缩放规则同比扩大 lr
-    _world_size = ddp_info['world_size'] if ddp else 1
-    lr = hyperparameters['learning_rate'] * _world_size
-    if master_process and _world_size > 1:
-        print(f"DDP lr scaling: base_lr={hyperparameters['learning_rate']:.2e} × world_size={_world_size} → effective_lr={lr:.2e}")
+    # 使用用户指定的全局 LR，不做自动缩放；用户应根据等效 batch size 自行设定
+    lr = hyperparameters['learning_rate']
     wd = hyperparameters['weight_decay']
     num_epochs = hyperparameters['num_epochs']
     warmup_ratio = hyperparameters['warmup_ratio']
