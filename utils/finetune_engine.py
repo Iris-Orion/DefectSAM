@@ -378,7 +378,7 @@ def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, off
     images = batch["image"].to(device)
     ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)
     if auto_seg:
-        bboxes = None    #TODO 有待完善，直接使用None其实不符合sam的默认输入要求
+        bboxes = None    #TODO 有待完善，auto_seg 应该是 grid point prompt
     else:
         bboxes = batch["bbox"].unsqueeze(1).to(device)   #box prompt
 
@@ -577,57 +577,6 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
                 else:
                     predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
                 loss = loss_fn(predicted_masks, gt_downsampled)
-
-    return loss, predicted_masks, gt_downsampled
-
-
-def _process_batch_with_point_grid(batch, model, loss_fn, device, use_amp,
-                                   auto_seg=True, points_per_side=16, offset_info = None,
-                                   multimask=False):
-    """
-    使用密集点网格作为提示进行边缘检测微调
-    """
-    images = batch["image"].to(device)
-    ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)
-    batch_size, _, h, w = images.shape
-    
-    if auto_seg:
-        # 生成规则网格点
-        grid_size = points_per_side
-        y_coords = torch.linspace(0, h-1, grid_size, device=device)
-        x_coords = torch.linspace(0, w-1, grid_size, device=device)
-        yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
-        
-        # [grid_size*grid_size, 2]
-        point_coords = torch.stack([xx.flatten(), yy.flatten()], dim=-1)
-        
-        # ✅ 修复：添加 point_batch_size 维度
-        # [B, 1, N, 2] - 每张图生成 1 组掩码，使用 N 个点
-        point_coords = point_coords.unsqueeze(0).unsqueeze(0).expand(
-            batch_size, 1, -1, -1
-        )  # [B, 1, N, 2]
-        
-        # ✅ labels 也需要匹配形状 [B, 1, N]
-        point_labels = torch.ones(
-            batch_size, 1, point_coords.shape[2], 
-            dtype=torch.long,
-            device=device
-        )
-        
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-            outputs = model(
-                            pixel_values=images,
-                            input_points=point_coords,  # 使用点提示
-                            input_labels=point_labels,
-                            multimask_output=False)
-            predicted_masks = outputs.pred_masks.squeeze(1)
-            
-            # print(f"predicted_masks shape: {predicted_masks.shape}")
-            # print(f"ground_truth_masks shape: {ground_truth_masks.shape}")
-            gt_downsampled = F.interpolate(ground_truth_masks, size=(256, 256), mode="nearest")
-            loss = loss_fn(predicted_masks, gt_downsampled)
-    else:
-        raise NotImplementedError("Point grid processing is only implemented for auto_seg=True.")
 
     return loss, predicted_masks, gt_downsampled
 
