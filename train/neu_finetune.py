@@ -1,11 +1,5 @@
 """
-支持单卡和 DDP 多卡训练（仿照 nanoGPT 写法）。
-
-单卡训练:
-    python train/neu_finetune.py --batch_size 2
-
-多卡训练 (单机 2 卡):
-    torchrun --standalone --nproc_per_node=2 train/neu_finetune.py --batch_size 2
+支持单卡和 DDP 多卡训练
 """
 import torch
 import monai

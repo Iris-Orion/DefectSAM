@@ -31,7 +31,6 @@ from utils.utils import (compute_dice_score,
 from utils.mfu import SAMMFUEstimator, MFUTracker
 
 from utils.sam_arch import (get_loradsc_model,
-                            get_loradsc_global_only_model,
                             get_loradsc_residual_model,
                             get_loradsc_gated_model,
                             get_loradsc_residual_gated_model,
@@ -141,10 +140,8 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
     elif model_type == 'lora_attn_qv':
         return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False)
 
-    elif model_type == 'loradsc_qv_global':
-        return get_loradsc_global_only_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                             ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
-
+    # 只注入global attn的部分没什么区别
+    
     elif model_type == 'loradsc_qv_residual':
         return get_loradsc_residual_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
                                           ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
@@ -344,7 +341,7 @@ def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = 
     images = batch["image"].to(device)
     ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)      # [b, 256, 1600] ----unsqueeze---> [b, 1, 256, 1600]
     if auto_seg:
-        bboxes = None    #自动分割
+        bboxes = None    #自动分割 TODO auto_seg应该是用grid prompt
     else:
         bboxes = batch["bbox"].unsqueeze(1).to(device)   #box prompt
 
@@ -975,11 +972,6 @@ def run_finetune_engine(train_dataloader,
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # 保存未编译的 vision_encoder 引用，用于保存/加载权重时还原
-    _orig_vision_encoder = model.vision_encoder
-
-    # torch.compile：只编译计算量最大的 vision_encoder 子模块，
-    # 避免 mask_decoder 中的条件分支导致 compile 失败或产生过大的中间缓存
     # AdaLoRA 在 update_and_allocate 时对参数做 in-place SVD 截断，与静态图不兼容，必须跳过
     _ft_type = hyperparameters.get('ft_type', '')
     _is_adalora = _ft_type == 'adalora_encoder'
@@ -992,27 +984,29 @@ def run_finetune_engine(train_dataloader,
     )
 
     # ---------- DDP 包装 ----------
-    # 对 DDP 路径，优先完成 reducer / gradient hook 注册，再只编译 raw_model.vision_encoder。
-    # 单卡与多卡都能共享 compile 加速路径，同时避免对 DDP wrapper 本身做编译。
     if ddp:
         model = DDP(
             model,
             device_ids=[ddp_local_rank],
             find_unused_parameters=needs_find_unused,
         )
-    raw_model = model.module if ddp else model  # 用于保存权重时获取未包装的模型
+    # raw_model 在 compile 之前捕获：torch.compile 只包装 forward，不影响底层参数和 state_dict，
+    # 因此保存权重时直接用 raw_model.state_dict()，无需在保存前还原到未编译版本。
+    raw_model = model.module if ddp else model
 
+    # ---------- torch.compile（DDP 之后，仅 vision_encoder）----------
+    # mask_decoder 含条件分支，compile 会导致图断裂；vision_encoder 占 ~95% 计算量，收益最大。
+    # mode='default'：避免 reduce-overhead 开启 CUDA Graph 带来的严格静态形状限制。
+    # raw_model 已在上方固定，子模块替换不影响 state_dict，保存权重无需还原。
     if use_compile:
         try:
             raw_model.vision_encoder = torch.compile(raw_model.vision_encoder, mode='default')
             if master_process:
-                if ddp:
-                    print("torch.compile 已启用 (DDP + 仅 vision_encoder, mode='default')")
-                else:
-                    print("torch.compile 已启用 (仅 vision_encoder, mode='default')")
+                print(f"torch.compile 已启用 ({'DDP + ' if ddp else ''}仅 vision_encoder, mode='default')")
         except Exception as e:
             if master_process:
                 print(f"torch.compile 不可用，跳过: {e}")
+            use_compile = False
     else:
         if master_process:
             if _is_adalora:
@@ -1047,8 +1041,10 @@ def run_finetune_engine(train_dataloader,
             train_sampler.set_epoch(epoch)
 
         # 每个 epoch 重新创建 tracker，EMA 从头累积
-        batch_size = hyperparameters.get('batch_size', 4)
-        mfu_tracker = MFUTracker(mfu_estimator, batch_size=batch_size, ema_alpha=0.9)
+        single_batch_size = hyperparameters.get('batch_size', 4)
+        world_size = ddp_info['world_size'] if ddp else 1
+        global_batch_size = single_batch_size * world_size
+        mfu_tracker = MFUTracker(mfu_estimator, batch_size=global_batch_size, ema_alpha=0.9)
 
         train_loss, train_dice, train_iou, train_hd95, train_mfu, global_step = _train_one_epoch(
             model, train_dataloader, optimizer,
@@ -1131,9 +1127,7 @@ def run_finetune_engine(train_dataloader,
             # DDP: 只在主进程保存模型，避免多进程同时写文件冲突
             if master_process:
                 print(f"验证 dice 改善到 {best_val_dicescore:.4f}, 保存模型...")
-                # 保存前还原 compiled vision_encoder，保存后恢复
-                if use_compile:
-                    raw_model.vision_encoder = _orig_vision_encoder
+                # raw_model 在 compile 之前捕获，state_dict() 直接可用，无需还原。
                 best_model_path = save_model( hyperparameters=hyperparameters,
                                                 start_timestamp = start_timestamp,
                                                 model=raw_model,
@@ -1144,8 +1138,6 @@ def run_finetune_engine(train_dataloader,
                                                 target_dir= save_dir,
                                                 SAVE_HUGGINGFACE_PRETRAINED_MODEL = SAVE_HUGGINGFACE_PRETRAINED_MODEL,
                                                 save_lora_only=save_lora_only)
-                if use_compile:
-                    raw_model.vision_encoder = torch.compile(_orig_vision_encoder, mode='default')
             if swanlab_run:
                 swanlab.log({
                     "best_epoch": best_epoch,
@@ -1182,10 +1174,6 @@ def run_finetune_engine(train_dataloader,
     # ---------- 最终评估：所有 rank 都执行（torchrun 要求所有进程一起退出）----------
     if master_process:
         print("\n--- Training finished. Starting final evaluation with the best model. ---")
-
-    # 最终评估前先还原 compiled 模块，避免 state_dict key 不匹配
-    if use_compile:
-        raw_model.vision_encoder = _orig_vision_encoder
 
     if not best_model_path:
         if master_process:
