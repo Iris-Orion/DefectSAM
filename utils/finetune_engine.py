@@ -624,7 +624,8 @@ def _train_one_epoch(model,
                      master_process: bool = True,
                      multimask: bool = False,
                      global_step: int = 0,
-                     compute_hd95: bool = False):
+                     compute_hd95: bool = False,
+                     grad_clip: float = 1.0):
     """
     执行一个完整的训练 epoch。
     mfu_tracker: 可选，传入后每个 batch 会更新 MFU 并在 tqdm 后缀中显示。
@@ -662,13 +663,23 @@ def _train_one_epoch(model,
 
         if use_amp:
             scaler.scale(loss).backward()
-            if _pro_hook is not None:
+            if grad_clip > 0:
                 scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip
+                )
+            elif _pro_hook is not None:
+                scaler.unscale_(optimizer)
+            if _pro_hook is not None:
                 _pro_hook.replace_gradients()
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip
+                )
             if _pro_hook is not None:
                 _pro_hook.replace_gradients()
             optimizer.step()
@@ -965,6 +976,10 @@ def run_finetune_engine(train_dataloader,
 
     model.train()
 
+    grad_clip = hyperparameters.get('grad_clip', 1.0)
+    if master_process:
+        print(f"梯度裁剪: {'max_norm=' + str(grad_clip) if grad_clip > 0 else '已禁用 (grad_clip=0)'}")
+
     use_multimask = hyperparameters.get('multimask', False)
     if master_process and use_multimask:
         print("multimask_output=True + best IoU selection 已启用")
@@ -1000,7 +1015,8 @@ def run_finetune_engine(train_dataloader,
             cosine_scheduler, loss_fn, process_batch_fn, scaler, device,
             auto_seg=auto_seg, offset_info=offset_info, mfu_tracker=mfu_tracker,
             master_process=master_process, multimask=use_multimask,
-            global_step=global_step, compute_hd95=train_compute_hd95)
+            global_step=global_step, compute_hd95=train_compute_hd95,
+            grad_clip=grad_clip)
 
         if master_process:
             mfu_str = f"{train_mfu*100:.2f}%" if train_mfu >= 0 else "N/A"

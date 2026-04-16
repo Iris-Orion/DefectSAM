@@ -1,5 +1,5 @@
 """
-支持单卡和 DDP 多卡训练（仿照 nanoGPT 写法）。
+支持单卡和 DDP 多卡训练
 
 单卡训练:
     python train/severstal_finetune.py --batch_size 2
@@ -185,7 +185,4 @@ if __name__ == '__main__':
     try:
         main()
     finally:
-        # ---------- DDP 清理 ----------
-        # 放在 finally 里：训练异常退出（如 worker SIGKILL）时也要 destroy_process_group，
-        # 否则 torchrun 会报 "destroy_process_group() was not called before program exit"。
         cleanup_ddp()
