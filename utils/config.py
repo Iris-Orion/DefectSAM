@@ -73,6 +73,8 @@ def _add_finetune_args(parser):
     # multimask 消融实验
     parser.add_argument('--multimask', action='store_true',
                         help='使用 multimask_output=True + best IoU selection (默认 False, 即 single mask)')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                        help='梯度裁剪的最大范数 (max_norm)，设为 0 禁用，默认 1.0')
     return parser
 
 
