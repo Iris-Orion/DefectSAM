@@ -123,6 +123,17 @@
 | retina_finetune | Retina | `_process_batch` | ✗ | ✓ | Box |
 | floodSeg_finetune | FloodSeg | `_process_batch_with_point_grid` | ✗ | ✗ | 点网格 |
 
+## Hugging Face DoRA（strict q/v）
+
+- `--ft_type dora_qv_encoder` 会在 HF SAM encoder 中先拆分 fused `qkv`，再仅对 `q` / `v` 注入 DoRA，`k` 保持冻结。
+- 该模式只支持 Hugging Face PEFT 保存格式；请使用 `--save_hf_format`，不要与 `--save_custom_lora` 一起传。
+
+## Hugging Face LoKr（strict q/v）
+
+- `--ft_type lokr_qv_encoder` 会复用同样的 fused `qkv` 拆分逻辑，再仅对 `q` / `v` 注入 LoKr，`k` 保持冻结。
+- 建议与 LoRA 对比时显式固定 `--lora_rank 16 --lora_alpha 16`，这样至少能保证名义 rank 配置一致。
+- 该模式同样只支持 Hugging Face PEFT 保存格式；请使用 `--save_hf_format`，不要与 `--save_custom_lora` 一起传。
+
 ## 运行示例
 
 ```bash
@@ -131,6 +142,20 @@ python -m train.neu_finetune \
     --batch_size 4 --learning_rate 2e-4 \
     --ft_type loradsc_qv --num_epochs 50 \
     --swanlab --pj_name neu_loradsc --device_id 0
+
+# Hugging Face DoRA（strict q/v）
+python -m train.neu_finetune \
+    --batch_size 4 --learning_rate 2e-4 \
+    --ft_type dora_qv_encoder --num_epochs 10 \
+    --save_hf_format \
+    --swanlab --pj_name neu_dora_qv --device_id 0
+
+# Hugging Face LoKr（strict q/v）
+python -m train.neu_finetune \
+    --batch_size 4 --learning_rate 2e-4 \
+    --ft_type lokr_qv_encoder --lora_rank 16 --lora_alpha 16 \
+    --num_epochs 10 --save_hf_format \
+    --swanlab --pj_name neu_lokr_qv --device_id 0
 
 # DDP 多 GPU 训练（NEU/Severstal）
 torchrun --nproc_per_node=2 -m train.neu_finetune \

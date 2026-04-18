@@ -101,12 +101,16 @@ LoRACore (基类：冻结原始 qkv，定义 rank/alpha/scale)
 | 函数 | PEFT 方法 | 说明 |
 |------|----------|------|
 | `get_hf_lora_model()` | LoRA | 自动检测 target modules |
+| `get_hf_dora_qv_model()` | DoRA | 先拆分 fused `qkv`，再仅对 `q_proj` / `v_proj` 注入 DoRA |
+| `get_hf_lokr_qv_model()` | LoKr | 先拆分 fused `qkv`，再仅对 `q_proj` / `v_proj` 注入 LoKr |
 | `get_hf_adalora_model()` | AdaLoRA | 自适应秩，训练中从 `init_r` 剪枝至 `target_r` |
 | `get_hf_loha_model()` | LoHa | Hadamard 门控积 |
 | `get_hf_lokr_model()` | LoKr | Kronecker 积 |
 
 辅助函数：
+- `prepare_sam_qkv_for_qv_peft(model, target_part)` — 将 fused `qkv` 包装为暴露 `q_proj/k_proj/v_proj` 的等价模块
 - `get_sam_target_modules(model, target_part)` — 动态检测 SAM 中的 qkv 线性层名称
+- `get_sam_qv_target_modules_for_peft(model, target_part)` — 仅枚举 strict q/v PEFT 的 `q_proj` / `v_proj` 目标
 - `filter_target_modules(named_modules, target_substrings)` — 按子串过滤 `nn.Linear` 模块
 
 ---
@@ -130,9 +134,49 @@ LoRACore (基类：冻结原始 qkv，定义 rank/alpha/scale)
 | `loraga_qv` | SVD 初始化 LoRA | | | | | |
 | `lorapro_qv` | LoRA + 梯度修正 | | | | | |
 | `lora_encoder` | HF PEFT LoRA | | | | | |
+| `dora_qv_encoder` | HF PEFT DoRA（strict q/v） | | | | | |
+| `lokr_qv_encoder` | HF PEFT LoKr（strict q/v） | | | | | |
 | `adalora_encoder` | HF PEFT AdaLoRA | | | | | |
 | `sam_fully` | 全参数微调 | | | | | |
 | `sam_decoder` | 仅解码器微调 | | | | | |
+
+### Hugging Face DoRA（strict q/v）
+
+- `dora_qv_encoder` 不会直接对 fused `qkv` 整层注入 adapter；它会先把 `vision_encoder.layers.*.attn.qkv` 包装成 `q_proj/k_proj/v_proj` 三个子层，再仅对 `q_proj` 和 `v_proj` 应用 PEFT DoRA。
+- 该模式只支持 Hugging Face PEFT 的 `save_pretrained` / `PeftModel.from_pretrained` 路线，不能与 `save_custom_lora` 组合使用。
+- 推荐快速验证命令：
+
+```bash
+python -m train.neu_finetune \
+    --batch_size 4 \
+    --learning_rate 2e-4 \
+    --ft_type dora_qv_encoder \
+    --num_epochs 10 \
+    --save_hf_format \
+    --swanlab \
+    --pj_name neu_dora_qv_quicktest \
+    --device_id 0
+```
+
+### Hugging Face LoKr（strict q/v）
+
+- `lokr_qv_encoder` 与 `dora_qv_encoder` 一样，都会先拆分 fused `qkv`，再仅对 `q_proj` 和 `v_proj` 应用 PEFT adapter；区别是这里使用 `LoKrConfig(r=args.lora_rank, alpha=args.lora_alpha)`。
+- 该模式同样只支持 Hugging Face PEFT 的 `save_pretrained` / `PeftModel.from_pretrained` 路线，不能与 `save_custom_lora` 组合使用。
+- 推荐快速验证命令：
+
+```bash
+python -m train.neu_finetune \
+    --batch_size 4 \
+    --learning_rate 2e-4 \
+    --ft_type lokr_qv_encoder \
+    --lora_rank 16 \
+    --lora_alpha 16 \
+    --num_epochs 10 \
+    --save_hf_format \
+    --swanlab \
+    --pj_name neu_lokr_qv_quicktest \
+    --device_id 0
+```
 
 ### 批处理函数
 

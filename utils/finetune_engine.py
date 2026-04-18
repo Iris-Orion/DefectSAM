@@ -40,7 +40,11 @@ from utils.sam_arch import (get_loradsc_model,
                             get_lorapro_model,
                             get_moelora_model,
                             get_moeloraplus_model)
-from utils.loratask import get_hf_lora_model, get_hf_adalora_model
+from utils.loratask import (get_hf_adalora_model,
+                            get_hf_dora_qv_model,
+                            get_hf_lokr_qv_model,
+                            get_hf_lora_model,
+                            prepare_sam_qkv_for_qv_peft)
 from utils.sam_arch import LoRA_Moe_DepwiseConv_Samqv
 
 
@@ -112,6 +116,13 @@ def debug_print_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None
         )
     print(f"Total params in optimizer groups: {total_params:,}")
     print("===========================================\n")
+
+
+def prepare_base_model_for_hf_adapter_loading(base_model: SamModel, ft_type: str):
+    """在加载 HF PEFT adapter 前，对需要的基座结构做与训练期一致的预处理。"""
+    if ft_type in ['dora_qv_encoder', 'lokr_qv_encoder']:
+        return prepare_sam_qkv_for_qv_peft(base_model, target_part='vision_encoder')
+    return base_model
 
 def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoader = None):
     """
@@ -231,7 +242,7 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
                                      num_experts=3, kernel_sizes=[3, 5, 7], sam_type=sam_type,
                                      expert_type=expert_type)
 
-    elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'sam_fully', 'sam_decoder']:
+    elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'dora_qv_encoder', 'lokr_qv_encoder', 'sam_fully', 'sam_decoder']:
         hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
 
         if model_type == 'adalora_encoder':
@@ -256,6 +267,37 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
         elif model_type == 'lora_decoder':
             return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
                                      lora_dropout=lora_dropout, target_part='mask_decoder')
+
+        elif model_type == 'dora_qv_encoder':
+            if getattr(args, 'save_custom_lora', False):
+                raise ValueError(
+                    "dora_qv_encoder only supports Hugging Face PEFT save/load; "
+                    "please disable --save_custom_lora."
+                )
+            args.save_hf_format = True
+            return get_hf_dora_qv_model(
+                hgsam_model,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_part='vision_encoder',
+            )
+
+        elif model_type == 'lokr_qv_encoder':
+            if getattr(args, 'save_custom_lora', False):
+                raise ValueError(
+                    "lokr_qv_encoder only supports Hugging Face PEFT save/load; "
+                    "please disable --save_custom_lora."
+                )
+            args.save_hf_format = True
+            return get_hf_lokr_qv_model(
+                hgsam_model,
+                lokr_rank=lora_rank,
+                lokr_alpha=lora_alpha,
+                rank_dropout=0.0,
+                module_dropout=0.0,
+                target_part='vision_encoder',
+            )
 
         elif model_type == 'sam_fully':
             return hgsam_model
@@ -1152,6 +1194,7 @@ def run_finetune_engine(train_dataloader,
                 config = PeftConfig.from_pretrained(best_model_path)
                 base_model_path = config.base_model_name_or_path
                 fresh_base = SamModel.from_pretrained(base_model_path)
+                fresh_base = prepare_base_model_for_hf_adapter_loading(fresh_base, _ft_type)
 
                 loaded_model = PeftModel.from_pretrained(fresh_base, best_model_path)
                 loaded_model.to(device)
@@ -1275,7 +1318,8 @@ def inference_engine(model, args, best_model_path,
             try:
                 config = PeftConfig.from_pretrained(best_model_path)
                 base_model_path = config.base_model_name_or_path
-                base_model = SamModel.from_pretrained(base_model_path).to(device)
+                base_model = SamModel.from_pretrained(base_model_path)
+                base_model = prepare_base_model_for_hf_adapter_loading(base_model, args.ft_type).to(device)
                 
                 loaded_model = PeftModel.from_pretrained(base_model, best_model_path)       # 从保存的路径加载 PeftModel
                 print("Successfully loaded model in Hugging Face PEFT format.")
