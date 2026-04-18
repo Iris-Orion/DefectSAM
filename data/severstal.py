@@ -473,8 +473,18 @@ def get_severstal_ft_albumentations_transforms():
 
 def mask2rle(img):
     '''
-    
+    将二值 mask (H, W) 转换为 RLE (Run-Length Encoding) 字符串。
+    img: numpy array, 值为 0 或 1 (bool 或 uint8)
+    返回: RLE 编码字符串，如 "1 3 10 5 ..."
+    空 mask 返回空字符串。
     '''
+    if img.sum() == 0:
+        return ""
+    pixels = img.T.flatten()  # Fortran order (column-major)，与 Kaggle 一致
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    return ' '.join(str(x) for x in runs)
 
 def random_visualize(dataset, num_pics):
     random_samples_idx = random.sample(range(len(dataset)), k=num_pics)

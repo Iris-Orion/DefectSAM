@@ -1,10 +1,67 @@
 ### 选择不同的lora微调方法，返回SAM模型
-import torch
-from peft import LoraConfig, get_peft_model, LoHaConfig, LoKrConfig, AdaLoraConfig
-from transformers import SamModel
-import peft
 import copy
+
+import peft
+import torch
+import torch.nn as nn
+from peft import AdaLoraConfig, LoHaConfig, LoKrConfig, LoraConfig, get_peft_model
+from transformers import SamModel
+
 from utils.utils import print_trainable_parameters
+
+
+class FusedQKVSplitLinear(nn.Module):
+    """将 SAM 的 fused qkv 线性层拆成 q/k/v 三个子层，但保持输出接口不变。"""
+
+    def __init__(self, qkv_layer: nn.Linear):
+        super().__init__()
+        if not isinstance(qkv_layer, nn.Linear):
+            raise TypeError(f"Expected nn.Linear for qkv_layer, got {type(qkv_layer)!r}.")
+        if qkv_layer.out_features % 3 != 0:
+            raise ValueError(
+                f"Expected qkv out_features divisible by 3, got {qkv_layer.out_features}."
+            )
+
+        self.in_features = qkv_layer.in_features
+        self.out_features = qkv_layer.out_features
+        self.has_bias = qkv_layer.bias is not None
+        out_per_part = self.out_features // 3
+
+        self.q_proj = nn.Linear(self.in_features, out_per_part, bias=self.has_bias)
+        self.k_proj = nn.Linear(self.in_features, out_per_part, bias=self.has_bias)
+        self.v_proj = nn.Linear(self.in_features, out_per_part, bias=self.has_bias)
+
+        with torch.no_grad():
+            self.q_proj.weight.copy_(qkv_layer.weight[:out_per_part])
+            self.k_proj.weight.copy_(qkv_layer.weight[out_per_part:2 * out_per_part])
+            self.v_proj.weight.copy_(qkv_layer.weight[2 * out_per_part:])
+            if self.has_bias:
+                self.q_proj.bias.copy_(qkv_layer.bias[:out_per_part])
+                self.k_proj.bias.copy_(qkv_layer.bias[out_per_part:2 * out_per_part])
+                self.v_proj.bias.copy_(qkv_layer.bias[2 * out_per_part:])
+
+    def forward(self, x):
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        return torch.cat((q, k, v), dim=-1)
+
+
+def prepare_sam_qkv_for_qv_peft(model, target_part='vision_encoder'):
+    """
+    将 vision encoder 中 fused qkv 替换为暴露 q_proj/k_proj/v_proj 的等价包装层。
+    幂等：若已是 FusedQKVSplitLinear，则跳过。
+    """
+    if target_part != 'vision_encoder':
+        raise ValueError("q/v-only PEFT 目前仅支持 target_part='vision_encoder'.")
+
+    for layer in model.vision_encoder.layers:
+        qkv_layer = layer.attn.qkv
+        if isinstance(qkv_layer, FusedQKVSplitLinear):
+            continue
+        layer.attn.qkv = FusedQKVSplitLinear(qkv_layer)
+    return model
+
 
 def get_hf_adalora_model(
                         model,
@@ -28,6 +85,7 @@ def get_hf_adalora_model(
     model = get_peft_model(model, config)
     return model
 
+
 def get_hf_lora_model(model, lora_rank=16, lora_alpha=16, lora_dropout=0.0, target_part='vision_encoder'):
     target_modules = get_sam_target_modules(model, target_part=target_part)
     config = LoraConfig(
@@ -41,6 +99,42 @@ def get_hf_lora_model(model, lora_rank=16, lora_alpha=16, lora_dropout=0.0, targ
     model = get_peft_model(model, config)
     return model
 
+
+def get_hf_dora_qv_model(model, lora_rank=16, lora_alpha=16, lora_dropout=0.0, target_part='vision_encoder'):
+    """
+    严格 q/v-only DoRA：先将 fused qkv 拆成 q/k/v 子层，再仅对 q_proj/v_proj 注入 DoRA。
+    """
+    model = prepare_sam_qkv_for_qv_peft(model, target_part=target_part)
+    target_modules = get_sam_qv_target_modules_for_peft(model, target_part=target_part)
+    config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        use_dora=True,
+    )
+    model = get_peft_model(model, config)
+    return model
+
+
+def get_hf_lokr_qv_model(model, lokr_rank=16, lokr_alpha=16, rank_dropout=0.0, module_dropout=0.0, target_part='vision_encoder'):
+    """
+    严格 q/v-only LoKr：先将 fused qkv 拆成 q/k/v 子层，再仅对 q_proj/v_proj 注入 LoKr。
+    """
+    model = prepare_sam_qkv_for_qv_peft(model, target_part=target_part)
+    target_modules = get_sam_qv_target_modules_for_peft(model, target_part=target_part)
+    config = LoKrConfig(
+        r=lokr_rank,
+        alpha=lokr_alpha,
+        target_modules=target_modules,
+        rank_dropout=rank_dropout,
+        module_dropout=module_dropout,
+    )
+    model = get_peft_model(model, config)
+    return model
+
+
 def get_hf_loha_model(model):
     target_modules = get_sam_target_modules(model)
     config = LoHaConfig(
@@ -52,6 +146,7 @@ def get_hf_loha_model(model):
     )
     model = get_peft_model(model, config)
     return model
+
 
 def get_hf_lokr_model(model):
     target_modules = get_sam_target_modules(model)
@@ -109,6 +204,27 @@ def get_sam_target_modules(model, target_part='vision_encoder'):
     if not target_modules:
         raise ValueError("未找到任何匹配的目标模块，请检查模型结构和目标模块名称。")                        # 确保至少选择了一个目标模块
     return target_modules
+
+
+def get_sam_qv_target_modules_for_peft(model, target_part='vision_encoder'):
+    """
+    仅选择 q_proj / v_proj 作为 strict q/v-only PEFT 目标模块，要求模型已经过 qkv 拆分包装。
+    """
+    if target_part != 'vision_encoder':
+        raise ValueError("q/v-only PEFT 目前仅支持 vision_encoder.")
+
+    target_modules = filter_target_modules(
+        model.vision_encoder.named_modules(),
+        ['q_proj', 'v_proj'],
+    )
+    print("\n选择的 strict q/v PEFT 目标模块：")
+    for module_name in target_modules:
+        print(module_name)
+
+    if not target_modules:
+        raise ValueError("未找到 q_proj/v_proj 目标模块，请先执行 prepare_sam_qkv_for_qv_peft().")
+    return target_modules
+
 
 def simple_task():
     from torch import nn
@@ -226,5 +342,3 @@ if __name__ == '__main__':
     # print(decoder_trans_layer_0)
     print_trainable_parameters(get_hf_lora_model(model=hgsam_model, target_part='vision_encoder'))
     # print_trainable_parameters(get_hf_lora_model(model=hgsam_model, target_part='mask_decoder'))
-
-
