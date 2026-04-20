@@ -17,11 +17,6 @@ from albumentations.pytorch import ToTensorV2
 from typing import List, Tuple, Dict
 from sklearn.model_selection import train_test_split
 
-_OLD_CACHE_WARNING_SHOWN = False
-# 注意：曾存在进程级 _MASK_CACHE 内存缓存，与 persistent_workers=True 叠加会导致
-# 每个 DataLoader worker 内存随 epoch 单调增长，最终被 cgroup OOM killer SIGKILL。
-# 现已移除，仅保留磁盘 .npz 缓存。请勿再添加进程内缓存。
-
 
 def _empty_mask() -> np.ndarray:
     return np.zeros((256, 1600, 4), dtype=np.uint8)
@@ -95,27 +90,14 @@ def rle2mask(image_id, df, cache_dir="./data/severstal_steel_defect_detection/ma
     输入: img_id   xxxxxxx.jpg
     输出: jpg对应的四通道的掩码
     输出的np.shape: [256, 1600, 4]   [H, W, C]
-    优先从 .npz / .npy 磁盘缓存加载，未命中时走 RLE 解码。
+    优先从 .npz 磁盘缓存加载，未命中时走 RLE 解码。
     注意：不使用进程级内存缓存，避免在 persistent_workers=True 下
     worker 内存随 epoch 单调增长导致 OOM 被 SIGKILL。
     """
-    global _OLD_CACHE_WARNING_SHOWN
-
-    # 1. 磁盘 .npz 缓存
     npz_path = Path(cache_dir) / f"{Path(image_id).stem}.npz"
     if npz_path.exists():
         return np.load(npz_path)['mask']
 
-    # 2. 兼容老的 .npy 缓存
-    npy_path = Path(cache_dir) / f"{Path(image_id).stem}.npy"
-    if npy_path.exists():
-        mask = np.load(npy_path)
-        if mask.dtype != np.uint8 and not _OLD_CACHE_WARNING_SHOWN:
-            print("[mask_cache] 检测到旧版非 uint8 缓存，可继续读取；若需回收空间可手动重建缓存目录。")
-            _OLD_CACHE_WARNING_SHOWN = True
-        return mask
-
-    # 3. 回退到原始 RLE 解码
     image_df = df[df['ImageId'] == image_id]
     if _is_no_defect_image(image_df):
         return _empty_mask()
@@ -162,7 +144,7 @@ def traindf_preprocess( split_seed: int = 42,
     val_size_relative = val_ratio / (train_ratio + val_ratio)
     train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_relative, random_state=split_seed)
     
-    # 创建mini数据集  
+    # create mini test for quick test  
     if create_mini_dataset:
         train_ids = random.sample(list(train_ids), mini_size)
         val_ids = random.sample(list(val_ids), mini_size // int(train_ratio / val_ratio))
@@ -197,7 +179,7 @@ def traindf_preprocess( split_seed: int = 42,
     print("\nTest Class Distribution:")
     print(test_class_counts)
 
-    # 自动构建 mask 缓存（首次约 1-2 分钟，之后秒级跳过）
+    # build mask cache for quick load
     build_mask_cache(full_df)
 
     return train_df, val_df, test_df
@@ -205,16 +187,10 @@ def traindf_preprocess( split_seed: int = 42,
 def get_bounding_box(ground_truth_map, perturb=True):
     """
     从ground_truth中获得bbox
-    输入:ground_truth_map 是一个合并的掩码 (256, 1600)   tensor格式
     TODO: severstal数据集的ground_truth_map不是合并的, 根据(4, 256, 1600)判断每个channel中的box
     """
-    # 使用全部severstal数据集时，将无缺陷的掩码图像的bbox设为[0, 0, 0, 0]
-    # 先转为np格式
-    # ground_truth_map_np = ground_truth_map.cpu().numpy()
-    # assert type(ground_truth_map_np) == np.ndarray, 'convert to np plz'
     if torch.sum(ground_truth_map)== 0:
         bbox = [0, 0, 0, 0]
-    # 从掩码中得到bounding box
     else:
         y_indices, x_indices = np.where(ground_truth_map > 0)   # np.where 支持  ground_truth_map是tensor输入
         x_min, x_max = np.min(x_indices), np.max(x_indices)
@@ -394,7 +370,7 @@ class SteelDataset_WithBoxPrompt(Dataset):
         # combined_letterboxed_mask = torch.sum(letterboxed_mask_tensor, dim=0)
 
         bbox = get_bounding_box(letterboxed_mask_tensor.squeeze(), perturb=self.is_train)
-        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)           # torch.tensor([x_min, y_min, x_max, y_max]): size=(4)s
+        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)           # torch.tensor([x_min, y_min, x_max, y_max]): size=(4)
 
         # 返回图像, mask, image_id，以及boxes作为prompt
         return {"image": model_input_tensor,
@@ -555,35 +531,6 @@ def visualize_bbox_prompt(steel_dataset_withboxPrompt):
     plt.imshow(mask.permute(1, 2, 0).cpu().numpy(), cmap='Oranges', alpha=(0.8 * (mask > 0).float()).squeeze(0).cpu().numpy())
     show_box(bbox, ax)
 
-def test_create_dataset_no_prompt():
-    p = Path("data/severstal_steel_defect_detection")
-    train_df, val_df, test_df = traindf_preprocess(include_no_defect=False)
-    print(train_df.head())
-    print(val_df.head())
-    train_transform, val_transform = get_albumentations_transforms()
-    train_dataset, val_dataset, _ = create_datasets_no_prompt(train_df, 
-                                                                val_df, 
-                                                                test_df,
-                                                                data_path=p, 
-                                                                train_transform=train_transform,
-                                                                val_transform=val_transform)
-    train_dataloader, val_dataloader, _ = create_dataloaders_no_prompt( train_df, 
-                                                                        val_df,
-                                                                        test_df,
-                                                                        data_path=p, 
-                                                                        train_transform=train_transform,
-                                                                        val_transform=val_transform, 
-                                                                        batch_size=4,
-                                                                        num_workers=4)
-    print("------test_create_dataset_no_prompt------")
-    img0, mask0, imgid0 = train_dataset[0]
-    print(type(img0), type(mask0), type(imgid0))
-    print(f"imgid: {imgid0}")
-    print(f"img0.dtype: {img0.dtype} ||| mask0.dtype: {mask0.dtype}")
-    print(f"img0.shape: {img0.shape} ||| mask0.shape: {mask0.shape}")
-    print(f"img0.data.range: {img0.min()} ~ {img0.max()} ||| mask0.data.range: {mask0.unique()}")
-    print("------test_create_dataset_no_prompt------")
-
 def reverse_letterbox_mask_1ch(mask_letterbox: np.ndarray, orig_size: tuple, target_size: tuple = (1024, 1024)) -> np.ndarray:
     """
     参数:
@@ -611,116 +558,5 @@ def reverse_letterbox_mask_1ch(mask_letterbox: np.ndarray, orig_size: tuple, tar
     restored_mask = cv2.resize(mask_cropped, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
 
     return restored_mask
-
-
-def get_torchvision_transforms():
-    train_transforms = transforms.Compose([
-        # transforms.Resize()    ?? 是否需要resize
-        # transforms.RandomHorizontalFlip(p=0.5),
-        # transforms.RandomVerticalFlip(p=0.5),
-        # transforms.ColorJitter(brightness=[0, 0.2], contrast=[0, 0.2]),  ## 这个参数设置的不对，不要用
-        transforms.ToTensor(),   # totensor 需要在 normalize之前
-        # 来自imagenet的计算结果 对该数据不能这样归一化，会让很多图片变为全黑
-        # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    val_transforms = transforms.Compose([
-        transforms.ToTensor(),   # totensor 需要在 normalize之前
-        # 来自imagenet的计算结果
-        # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    return train_transforms, val_transforms
-
-
-def prepare_image(image, transform, device):
-    """
-    已经弃用的函数
-    resize输入的图像到(1024, 1024), 此函数的逻辑调用ResizeLongestSide函数, 
-    但是resize到指定大小的逻辑不佳
-    """
-    image = transform.apply_image(image)
-    image = torch.as_tensor(image, device=device)
-    return image.permute(2, 0, 1).contiguous()
-
-
-#  simple test
-def old_test():
-    data_path = Path("data/")
-    image_path = data_path / "severstal_steel_defect_detection"
-
-    train_dir = image_path / "train_images"
-    test_dir = image_path / "test_images"
-
-    train_df = pd.read_csv("./data/severstal_steel_defect_detection/train.csv")
-    submission_df = pd.read_csv("./data/severstal_steel_defect_detection/sample_submission.csv")
-
-    image_path_list = list(image_path.glob("*/*.jpg"))
-
-    random_image_path = random.choice(image_path_list)
-    img = Image.open(random_image_path)
-
-    chosen_image_path = train_dir / "0002cc93b.jpg"
-    img2 = Image.open(chosen_image_path)
-
-
-    # mask = rle2mask('008ef3d74.jpg', train_df.head(20))
-    # image_id = '0002cc93b.jpg'
-    idx = random.choice(train_df.index)
-    image_id = train_df.iloc[idx]['ImageId']
-    mask = rle2mask(image_id, train_df)
-
-    img_testmask = Image.open(f'data/severstal_steel_defect_detection/train_images/{image_id}')
-
-    # 可视化
-    fig, axes = plt.subplots(5, 1, figsize=(30, 15))
-    axes[0].imshow(img_testmask)
-    axes[0].set_title(img_testmask)
-    axes[0].axis('off')
-    for i in range(4):
-        axes[i+1].imshow(mask[:, :, i], cmap='gray')
-        axes[i+1].set_title(f"Class {i+1} Mask")
-        axes[i+1].axis('off')
-
-    plt.suptitle(f"Masks for Image ID: {image_id}")
-    plt.show()
-
-    manual_transforms = transforms.Compose([
-        # transforms.Resize()    ?? 是否需要resize
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.ColorJitter(brightness=[0, 0.2], contrast=[0, 0.2]),
-        transforms.ToTensor(),   # totensor 需要在 normalize之前
-        # 来自imagenet的计算结果
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-
-
-def reverse_letterbox_test():
-    train_df, val_df = traindf_preprocess(create_mini_dataset=False, mini_size=256)
-    data_path = "./data/severstal_steel_defect_detection"
-    train_transforms, val_transforms = get_severstal_ft_albumentations_transforms()
-    # train_transforms = transforms.Compose([
-    #     transforms.ToTensor()
-    # ])
-    # val_transforms = transforms.Compose([
-    #     transforms.ToTensor()
-    # ])
-
-    print('#'*20 + ' test_reverse_letterbox_test ' + '#'*20)
-    train_dataset = SteelDataset_WithBoxPrompt(train_df, data_path=data_path, transforms=train_transforms)
-    val_dataset = SteelDataset_WithBoxPrompt(val_df, data_path=data_path, transforms=val_transforms)
-    train_dataloader = DataLoader(train_dataset, batch_size=2, num_workers=4)
-
-    batch = next(iter(train_dataloader))
-    # print(batch.keys(), batch.shape())
-    # reverse_letterbox_mask_1ch()
-
-
-if __name__ == '__main__':
-    # traindf_preprocess()
-    # old_test()
-    test_create_dataset_no_prompt()
-    # test_dataset_with_prompt()
-    # reverse_letterbox_test()
 
 

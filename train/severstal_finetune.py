@@ -2,8 +2,7 @@
 支持单卡和 DDP 多卡训练
 
 单卡训练:
-    python train/severstal_finetune.py --batch_size 2
-    python -m train.severstal_finetune --batch_size 4 --device_id 0 --num_epoch 2
+    python -m train.severstal_finetune --batch_size 4 --device_id 1 --num_epoch 2 --save_custom_lora
 
 多卡训练 (指定 GPU):
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.severstal_finetune --batch_size 2 --num_epochs 2
@@ -18,15 +17,16 @@ from transformers import SamModel
 from data import severstal
 from data.severstal import SteelDataset_WithBoxPrompt
 from utils.config import get_severstal_ft_args
-from utils.helper_function import set_seed, setup_ddp, cleanup_ddp
+from utils.helper_function import set_seed, cleanup_ddp
 from utils.finetune_engine import create_model_from_type, run_finetune_engine, inference_engine, _process_batch_severstal, zero_shot
 from weights.severstal_wts import severstal_dict
 
 def main():
-    # ---------- DDP 初始化 ----------
-    ddp_info = setup_ddp()
-    ddp = ddp_info['ddp']
-    master_process = ddp_info['master_process']
+    ddp = int(os.environ.get('RANK', -1)) != -1
+    ddp_rank = int(os.environ.get('RANK', 0)) if ddp else 0
+    ddp_local_rank = int(os.environ.get('LOCAL_RANK', 0)) if ddp else 0
+    ddp_world_size = int(os.environ.get('WORLD_SIZE', 1)) if ddp else 1
+    master_process = ddp_rank == 0
 
     args = get_severstal_ft_args()
     # 模型初始化前所有 rank 使用相同 seed，保证各进程初始权重一致（DDP 正确性前提）
@@ -58,15 +58,9 @@ def main():
     val_dataset = SteelDataset_WithBoxPrompt(val_df, data_path=data_path, transforms=val_transforms, is_train=False)
     test_dataset = SteelDataset_WithBoxPrompt(test_df, data_path=data_path, transforms=val_transforms, is_train=False)
 
-    # ---------- DataLoader：DDP 模式下所有 split 都使用 DistributedSampler ----------
-    # val/test 用 drop_last=True：DistributedSampler 默认 drop_last=False 时，
-    # 末尾不能整除 world_size 的样本会被**重复填充**到其他 rank。
-    # 这些重复样本在 _evaluate 的 all_reduce 加权汇总里会被双重计入，
-    # 导致 DDP 下 val/test 指标与单卡有偏差，影响早停判断和 best checkpoint 选择。
-    # 代价：每 rank 末尾最多丢 (world_size - 1) 个样本，对 ~1000+ 验证集 < 0.3%。
-    train_sampler = DistributedSampler(train_dataset, shuffle=True) if ddp else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=True) if ddp else None
-    test_sampler = DistributedSampler(test_dataset, shuffle=False, drop_last=True) if ddp else None
+    train_sampler = DistributedSampler(train_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(val_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False, drop_last=True) if ddp else None
+    test_sampler = DistributedSampler(test_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False, drop_last=True) if ddp else None
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -98,21 +92,18 @@ def main():
 
     # ---------- 设备选择 ----------
     if ddp:
-        device = ddp_info['device']
+        device = torch.device(f"cuda:{ddp_local_rank}")
     else:
         device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
 
     if not args.infer_mode and not args.zero_shot:
         model = create_model_from_type(args=args, train_dataloader=train_dataloader)
-        # 模型创建完成后切换为 per-rank seed，保证各 rank 数据增强多样性
-        set_seed(args.seed, seed_offset=ddp_info['rank'])
 
         run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
                             model, device, hyperparameters,
                             process_batch_fn=_process_batch_severstal,
                             save_dir = "./new_weights/finetune/severstal_output/" + hyperparameters['ft_type'],
                             auto_seg=args.auto_seg,
-                            ddp_info=ddp_info,
                             train_sampler=train_sampler)
 
     elif args.zero_shot:

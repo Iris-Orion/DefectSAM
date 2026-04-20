@@ -2,13 +2,14 @@
 支持单卡和 DDP 多卡训练
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.sd900_finetune --batch_size 4 --ft_type loradsc_qkv_residual_gated
 """
+import os
 import torch
 import monai
 import copy
 from transformers import SamModel
 from torch.utils.data import DataLoader, DistributedSampler
 
-from utils.helper_function import set_seed, setup_ddp, cleanup_ddp
+from utils.helper_function import set_seed, cleanup_ddp
 from utils.config import get_common_ft_args
 from utils.finetune_engine import (run_finetune_engine,
                                    inference_engine,
@@ -21,9 +22,11 @@ from weights.sd900_wts import sd900_dict
 
 
 def main():
-    ddp_info = setup_ddp()
-    ddp = ddp_info['ddp']
-    master_process = ddp_info['master_process']
+    ddp = int(os.environ.get('RANK', -1)) != -1
+    ddp_rank = int(os.environ.get('RANK', 0)) if ddp else 0
+    ddp_local_rank = int(os.environ.get('LOCAL_RANK', 0)) if ddp else 0
+    ddp_world_size = int(os.environ.get('WORLD_SIZE', 1)) if ddp else 1
+    master_process = ddp_rank == 0
 
     args = get_common_ft_args()
     # 模型初始化前所有 rank 使用相同 seed，保证各进程初始权重一致（DDP 正确性前提）
@@ -41,9 +44,9 @@ def main():
     train_dataset, val_dataset, test_dataset = sd900_finetune_create_dataset()
     
     # ---------- DataLoader：DDP 模式使用 DistributedSampler ----------
-    train_sampler = DistributedSampler(train_dataset, shuffle=True) if ddp else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=True) if ddp else None
-    test_sampler = DistributedSampler(test_dataset, shuffle=False, drop_last=True) if ddp else None
+    train_sampler = DistributedSampler(train_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(val_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False, drop_last=True) if ddp else None
+    test_sampler = DistributedSampler(test_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False, drop_last=True) if ddp else None
     
     train_dataloader = DataLoader(
         train_dataset,
@@ -74,15 +77,13 @@ def main():
     )
     
     if ddp:
-        device = ddp_info['device']
+        device = torch.device(f"cuda:{ddp_local_rank}")
     else:
         device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
 
 
     if not args.infer_mode and not args.zero_shot:
         model = create_model_from_type(args=args, train_dataloader=train_dataloader)
-        # 模型创建完成后切换为 per-rank seed，保证各 rank 数据增强多样性
-        set_seed(args.seed, seed_offset=ddp_info['rank'])
 
         # 选择 process_batch 函数：SAM原始多prompt多轮策略 or 单一box prompt
         if args.sam_style_train:
@@ -99,7 +100,6 @@ def main():
                                                         hyperparameters=hyperparameters,
                                                         save_dir = "./new_weights/finetune/sd900_output/" + hyperparameters['ft_type'],
                                                         auto_seg = args.auto_seg,
-                                                        ddp_info=ddp_info,
                                                         train_sampler=train_sampler)
     
     elif args.zero_shot:

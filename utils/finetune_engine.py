@@ -1,15 +1,12 @@
 # 适配 severstal neu sd900 magnetic_tile flood数据集
 import torch
-import torch._dynamo
 import torch.distributed as dist
-# torch._dynamo.config.capture_scalar_outputs = True
-# torch._dynamo.config.suppress_errors = True   # 符号形状推导失败时静默回退到 eager，不打印警告
-
 import torch.nn.functional as F
 import pytz
 import monai
 import numpy as np
 import cv2
+import os
 import time
 import swanlab
 import argparse
@@ -20,82 +17,26 @@ from transformers import SamModel
 from peft import PeftModel, PeftConfig
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
-from torch.profiler import profile, record_function, ProfilerActivity
-from utils.helper_function import get_lr_scheduler
+from utils.helper_function import get_lr_scheduler, set_seed
 from utils.utils import (compute_dice_score,
-                         compute_iou_score,
-                         save_model,
-                         save_training_logs,
-                         print_trainable_parameters)
+                        compute_iou_score,
+                        save_model,
+                        save_training_logs,
+                        print_trainable_parameters)
 from utils.mfu import SAMMFUEstimator, MFUTracker
 
 from utils.sam_arch import (get_loradsc_model,
-                            get_loradsc_residual_model,
-                            get_loradsc_gated_model,
                             get_loradsc_residual_gated_model,
                             create_model_for_inference,
-                            get_loraplus_model,
-                            get_loraga_model,
-                            get_lorapro_model,
-                            get_moelora_model,
-                            get_moeloraplus_model)
+                            get_loraplus_model)
+                            
 from utils.loratask import (get_hf_adalora_model,
                             get_hf_dora_qv_model,
                             get_hf_lokr_qv_model,
                             get_hf_lora_model,
                             prepare_sam_qkv_for_qv_peft)
-from utils.sam_arch import LoRA_Moe_DepwiseConv_Samqv
-
-
-def collect_moe_gate_stats(model):
-    """收集所有 MoE LoRA 层的 gate weights 分布统计，用于诊断门控坍塌。
-    返回 dict: {
-        'gate_q/layer_{i}/expert_{j}_mean': float,
-        'gate_v/layer_{i}/expert_{j}_mean': float,
-        'gate_q/layer_{i}/entropy': float,   # 越高=越均匀，log(3)≈1.099 为最大值
-        'gate_v/layer_{i}/entropy': float,
-        'gate_q/layer_{i}/max_prob': float,  # 最大专家概率均值，越接近1=越坍塌
-        'gate_v/layer_{i}/max_prob': float,
-    }
-    如果模型中没有 MoE 层或没有缓存的 gate probs，返回空 dict。
-    """
-    raw_model = model.module if hasattr(model, 'module') else model
-
-    # 收集所有子模块，包括 torch.compile 包装的子模块内部
-    all_modules = []
-    def _collect(m):
-        all_modules.append(m)
-        # torch.compile 包装后原始模块在 _orig_mod 中，需要递归进入
-        if hasattr(m, '_orig_mod'):
-            for sub in m._orig_mod.modules():
-                all_modules.append(sub)
-        else:
-            for child in m.children():
-                _collect(child)
-    _collect(raw_model)
-
-    stats = {}
-    layer_idx = 0
-    for module in all_modules:
-        if isinstance(module, LoRA_Moe_DepwiseConv_Samqv):
-            for prefix, attr in [('gate_q', '_last_gate_probs_q'), ('gate_v', '_last_gate_probs_v')]:
-                probs = getattr(module, attr, None)
-                if probs is None:
-                    continue
-                # probs: [batch, num_experts], 取 batch 均值
-                mean_probs = probs.mean(dim=0)  # [num_experts]
-                for j, p in enumerate(mean_probs):
-                    stats[f'{prefix}/layer_{layer_idx}/expert_{j}_mean'] = p.item()
-                # 熵: -sum(p * log(p))，衡量分布均匀度
-                entropy = -(mean_probs * torch.log(mean_probs + 1e-8)).sum().item()
-                stats[f'{prefix}/layer_{layer_idx}/entropy'] = entropy
-                # 最大概率均值: 每个 batch 样本的 max prob 的均值
-                max_prob = probs.max(dim=-1).values.mean().item()
-                stats[f'{prefix}/layer_{layer_idx}/max_prob'] = max_prob
-            layer_idx += 1
-    return stats
-
 
 def debug_print_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None:
     """
@@ -149,26 +90,14 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
         ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
     
     elif model_type == 'lora_attn_qv':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False)
-
-    # 只注入global attn的部分没什么区别
-    
-    elif model_type == 'loradsc_qv_residual':
-        return get_loradsc_residual_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                          ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
-
-    elif model_type == 'loradsc_qv_gated':
-        return get_loradsc_gated_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                       ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
-                                       gate_init=1e-3, sam_type=sam_type)
+        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, 
+                                ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False)
 
     elif model_type == 'loradsc_qv_residual_gated':
         return get_loradsc_residual_gated_model(
             rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
             ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
             gate_init=0.0,
-            use_symmetric_init=args.use_residual_gated_symmetric_init,
-            symmetric_init_std=args.residual_gated_symmetric_init_std,
             sam_type=sam_type)
 
     elif model_type == 'loradsc_qkv_residual_gated':
@@ -176,8 +105,6 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
             rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
             ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True,
             gate_init=0.0,
-            use_symmetric_init=args.use_residual_gated_symmetric_init,
-            symmetric_init_std=args.residual_gated_symmetric_init_std,
             sam_type=sam_type)
 
     elif model_type == 'loradsc_q_residual_gated':
@@ -185,8 +112,6 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
             rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
             ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True,
             gate_init=0.0,
-            use_symmetric_init=args.use_residual_gated_symmetric_init,
-            symmetric_init_std=args.residual_gated_symmetric_init_std,
             sam_type=sam_type)
 
     elif model_type == 'loradsc_qv_adaptive':
@@ -215,32 +140,7 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
     elif model_type == 'loraplus_qv':
         args.use_loraplus_optim = True  # 强制启用 LoRA+ 优化器
         return get_loraplus_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                  ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
-
-    elif model_type == 'loraga_qv':
-        device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
-        return get_loraga_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                train_dataloader=train_dataloader, device=device, sam_type=sam_type)
-
-    elif model_type == 'lorapro_qv':
-        device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
-        model, pro_hook = get_lorapro_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                            train_dataloader=train_dataloader, device=device, sam_type=sam_type)
-        model._lorapro_hook = pro_hook  # 挂到模型上，训练循环中调用
-        return model
-
-    elif model_type == 'moelora_qv':
-        expert_type = getattr(args, 'moe_expert_type', 'conv')
-        return get_moelora_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                 num_experts=3, kernel_sizes=[3, 5, 7], sam_type=sam_type,
-                                 expert_type=expert_type)
-
-    elif model_type == 'moeloraplus_qv':
-        args.use_loraplus_optim = True  # 强制启用 LoRA+ 优化器
-        expert_type = getattr(args, 'moe_expert_type', 'conv')
-        return get_moeloraplus_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                     num_experts=3, kernel_sizes=[3, 5, 7], sam_type=sam_type,
-                                     expert_type=expert_type)
+                                    ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
 
     elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'dora_qv_encoder', 'lokr_qv_encoder', 'sam_fully', 'sam_decoder']:
         hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
@@ -262,11 +162,11 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
 
         elif model_type == 'lora_encoder':
             return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
-                                     lora_dropout=lora_dropout, target_part='vision_encoder')
+                                        lora_dropout=lora_dropout, target_part='vision_encoder')
 
         elif model_type == 'lora_decoder':
             return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
-                                     lora_dropout=lora_dropout, target_part='mask_decoder')
+                                        lora_dropout=lora_dropout, target_part='mask_decoder')
 
         elif model_type == 'dora_qv_encoder':
             if getattr(args, 'save_custom_lora', False):
@@ -331,6 +231,7 @@ def reverse_letterbox_1ch(input: np.ndarray, orig_size: tuple, target_size: tupl
     y_offset = (target_h - new_h) // 2
 
     # 提取letterbox中的有效区域
+    
     mask_cropped = input[y_offset : y_offset + new_h, x_offset : x_offset + new_w]
 
     # 使用最近邻插值缩放到原始尺寸
@@ -654,20 +555,20 @@ class CUDAPrefetcher:
 
 
 def _train_one_epoch(model,
-                     dataloader,
-                     optimizer,
-                     scheduler,
-                     loss_fn,
-                     procees_batch_fn,
-                     scaler, device,
-                     auto_seg=False,
-                     offset_info=None,
-                     mfu_tracker: MFUTracker = None,
-                     master_process: bool = True,
-                     multimask: bool = False,
-                     global_step: int = 0,
-                     compute_hd95: bool = False,
-                     grad_clip: float = 1.0):
+                    dataloader,
+                    optimizer,
+                    scheduler,
+                    loss_fn,
+                    procees_batch_fn,
+                    scaler, device,
+                    auto_seg=False,
+                    offset_info=None,
+                    mfu_tracker: MFUTracker = None,
+                    master_process: bool = True,
+                    multimask: bool = False,
+                    global_step: int = 0,
+                    compute_hd95: bool = False,
+                    grad_clip: float = 1.0):
     """
     执行一个完整的训练 epoch。
     mfu_tracker: 可选，传入后每个 batch 会更新 MFU 并在 tqdm 后缀中显示。
@@ -676,8 +577,7 @@ def _train_one_epoch(model,
     """
     model.train()
     total_loss, total_dice, total_iou = 0, 0, 0
-    # 训练阶段默认不计算 HD95：CPU 上的 EDT 既慢又占内存，
-    # 容易把 DataLoader worker 拖到 OOM 被 SIGKILL。需要时可通过 --train_hd95 打开。
+    # 训练阶段默认不计算 HD95：OOM risk, --train_hd95
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0) if compute_hd95 else None
     use_amp = scaler is not None
 
@@ -759,16 +659,16 @@ def _train_one_epoch(model,
     avg_mfu = mfu_tracker.mfu if mfu_tracker is not None else -1.0
     return avg_loss, avg_dice, avg_iou, avg_hd95, avg_mfu, global_step
 
-def _evaluate(model,
-              dataloader,
-              loss_fn,
-              procees_batch_fn,
-              device, scaler,
-              auto_seg = False,
-              offset_info = None,
-              master_process: bool = True,
-              multimask: bool = False,
-              ddp: bool = False):
+def _evaluate( model,
+            dataloader,
+            loss_fn,
+            procees_batch_fn,
+            device, scaler,
+            auto_seg = False,
+            offset_info = None,
+            master_process: bool = True,
+            multimask: bool = False,
+            ddp: bool = False):
     """
     评估模型。
 
@@ -804,15 +704,9 @@ def _evaluate(model,
             num_batches += 1
             hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().detach().cpu(), y=gt.detach().cpu())
 
-    # HD95：先在本 rank 内 aggregate，得到本地样本均值；
-    # 乘以本 rank batch 数后汇总，再除以全局 batch 数，等价于跨 rank 的加权平均。
-    # 前提：val/test 的 DistributedSampler 必须使用 drop_last=True，
-    # 否则末尾 padding 重复样本会被双重计入 → 跨 rank 指标与单卡不一致。
-    # （drop_last=True 时每 rank 都丢掉相同数量的尾部样本，batch 数严格相等。）
     local_hd95 = hd95_metric.aggregate().item()
     hd95_metric.reset()
 
-    # 打包所有标量到一个 tensor，单次 all_reduce 最省通信
     stats = torch.tensor(
         [
             total_loss.item(),
@@ -858,45 +752,37 @@ def run_finetune_engine(train_dataloader,
         ddp_info (dict, optional): DDP 配置字典，由 setup_ddp() 返回。None 时退化为单卡训练。
         train_sampler (DistributedSampler, optional): DDP 模式下的训练数据采样器，每个 epoch 需调用 set_epoch。
     """
-    # ---------- DDP 参数解析（仿照 nanoGPT）----------
-    ddp = ddp_info is not None and ddp_info.get('ddp', False)
-    master_process = ddp_info['master_process'] if ddp else True
-    ddp_local_rank = ddp_info['local_rank'] if ddp else 0
-
-    if master_process:
-        print_trainable_parameters(model)
-        print(f"using device {device}")
-        if ddp:
-            print(f"DDP 已启用: world_size={ddp_info['world_size']}, rank={ddp_info['rank']}, local_rank={ddp_local_rank}")
-
-    if master_process:
-        for name, param in model.named_parameters():
-            if 'lora' in name and param.requires_grad:
-                print(name, param.shape)                # lora系列模型的插入位置信息debug
-
-    shanghai_tz = pytz.timezone('Asia/Shanghai')                                # 设置时区为亚洲/上海
-    start_timestamp = datetime.now(shanghai_tz).strftime("%Y%m%d_%H%M%S")       # 获取当前时间戳
-
-    swanlab_run = None
-    if hyperparameters.get('use_swanlab', False) and master_process:  # DDP: 只在主进程初始化 swanlab
-        swanlab_run = swanlab.init(
-            project=hyperparameters.get('swanlab_project', 'please name your swanlab project'),
-            experiment_name=f"{hyperparameters.get('task_name', 'please name your experiment name')}_{start_timestamp}",
-            config=hyperparameters,     # 自动记录所有超参数
-        )
-
-    SAVE_HUGGINGFACE_PRETRAINED_MODEL = hyperparameters['save_hf_format']
-    save_lora_only = hyperparameters['save_custom_lora']
-    if save_lora_only or SAVE_HUGGINGFACE_PRETRAINED_MODEL:
-        log_name = hyperparameters["ft_type"] + "_rank_" + str(hyperparameters["lora_rank"])
+    # ---------- DDP / runtime 初始化 ----------
+    ddp = int(os.environ.get('RANK', -1)) != -1
+    if ddp:
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0
+        seed_offset = ddp_rank
+        print(f"using: world_size={ddp_world_size}, rank={ddp_rank}, local_rank={ddp_local_rank}")
     else:
-        log_name = hyperparameters["ft_type"]
+        print("running on a single gpu, and one process")
+        master_process = True
+        seed_offset = 0
+        ddp_world_size = 1
 
-    if master_process:
-        print(f"权重保存格式: hugging face格式:{SAVE_HUGGINGFACE_PRETRAINED_MODEL} || lora格式:{save_lora_only}")
+    set_seed(hyperparameters['seed'], seed_offset=seed_offset)
 
-    # 从超参数中获取值
-    # 使用用户指定的全局 LR，不做自动缩放；用户应根据等效 batch size 自行设定
+    shanghai_tz = pytz.timezone('Asia/Shanghai')
+    start_timestamp = datetime.now(shanghai_tz).strftime("%Y%m%d_%H%M%S")
+
+    save_hf_format = hyperparameters['save_hf_format']
+    save_lora_only = hyperparameters['save_custom_lora']
+    use_swanlab = hyperparameters.get('use_swanlab', False) and master_process
+    log_name = hyperparameters["ft_type"] + "_rank_" + str(hyperparameters["lora_rank"]) if (
+        save_lora_only or save_hf_format
+    ) else hyperparameters["ft_type"]
+
+    # ---------- optimizer / scaler / scheduler 初始化 ----------
     lr = hyperparameters['learning_rate']
     wd = hyperparameters['weight_decay']
     num_epochs = hyperparameters['num_epochs']
@@ -905,13 +791,16 @@ def run_finetune_engine(train_dataloader,
     min_delta = hyperparameters['min_delta']
     use_loraplus_optim = hyperparameters.get('use_loraplus_optim', False)
     lora_plus_lr_ratio = hyperparameters.get('lora_plus_lr_ratio', 16.0)
-    use_early_stop = not hyperparameters.get('disable_early_stop', False)
+    should_use_early_stop = not hyperparameters.get('disable_early_stop', False)
+    grad_clip = hyperparameters.get('grad_clip', 1.0)
+    use_multimask = hyperparameters.get('multimask', False)
+    train_compute_hd95 = hyperparameters.get('train_hd95', False)
 
     model.to(device)
-
-    trainable_parameters = [param for param in model.parameters() if param.requires_grad]      # 收集所有可训练的参数
+    trainable_parameters = [param for param in model.parameters() if param.requires_grad]
 
     optimizer = None
+    loraplus_status_msg = None
     if use_loraplus_optim:
         param_groups = []
         for module in model.modules():
@@ -925,33 +814,89 @@ def run_finetune_engine(train_dataloader,
                 )
         if param_groups:
             optimizer = AdamW(param_groups)
-            if master_process:
-                print(f"Using LoRA+ optimizer param groups (ratio={lora_plus_lr_ratio}).")
+            loraplus_status_msg = f"Using LoRA+ optimizer param groups (ratio={lora_plus_lr_ratio})."
         else:
-            if master_process:
-                print("LoRA+ optimizer requested but no compatible modules found; fallback to standard AdamW.")
+            loraplus_status_msg = "LoRA+ optimizer requested but no compatible modules found; fallback to standard AdamW."
 
     if optimizer is None:
         optimizer = AdamW(trainable_parameters, lr=lr, weight_decay=wd)
 
-    if master_process:
-        debug_print_optimizer_param_groups(optimizer)
-    # loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-    # BF16 指数范围与 FP32 相同，不会产生梯度上溢，无需 GradScaler
     _use_bf16 = torch.cuda.is_bf16_supported()
-    scaler = torch.amp.GradScaler('cuda', enabled=not _use_bf16)  # BF16 时禁用，FP16 时启用
+    scaler = torch.amp.GradScaler('cuda', enabled=not _use_bf16)
 
-    # 学习率调度策略 
     total_steps = len(train_dataloader) * num_epochs
     warmup_steps = int(warmup_ratio * total_steps)
-
     cosine_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps)
 
-    # MFU 估算器：基于 SAM ViT-B，RTX 5090 BF16 峰值算力
     sam_type = hyperparameters.get('sam_type', 'sam_base')
     mfu_estimator = SAMMFUEstimator(sam_type=sam_type, gpu_type='rtx5090')
+
+    # TF32：在 matmul 和 cudnn 上允许 TF32，在几乎不损失精度的前提下提升吞吐
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    _ft_type = hyperparameters.get('ft_type', '')
+    _is_adalora = _ft_type == 'adalora_encoder'
+    needs_find_unused = _ft_type == 'sam_fully'
+    should_use_compile = not hyperparameters.get('no_compile', False) and not _is_adalora
+    compile_status_msg = None
+
+    if ddp:
+        model = DDP(
+            model,
+            device_ids=[ddp_local_rank],
+            find_unused_parameters=needs_find_unused,
+        )
+
+    raw_model = model.module if ddp else model
+    if should_use_compile:
+        try:
+            raw_model.vision_encoder = torch.compile(raw_model.vision_encoder, mode='default')
+            compile_status_msg = f"torch.compile 已启用 ({'DDP + ' if ddp else ''}仅 vision_encoder, mode='default')"
+        except Exception as e:
+            compile_status_msg = f"torch.compile 不可用，跳过: {e}"
+            should_use_compile = False
+    else:
+        compile_status_msg = "torch.compile 已禁用 (AdaLoRA 与静态图不兼容)" if _is_adalora else "torch.compile 已禁用 (--no_compile)"
+
+    model.train()
+
+    # ---------- rank0 启动期日志与 swanlab 初始化 ----------
+    swanlab_run = None
+    if use_swanlab:
+        swanlab_run = swanlab.init(
+            project=hyperparameters.get('swanlab_project', 'please name your swanlab project'),
+            experiment_name=f"{hyperparameters.get('task_name', 'please name your experiment name')}_{start_timestamp}",
+            config=hyperparameters,
+        )
+
+    offset_info = None
+    if process_batch_fn == _process_batch_severstal:
+        offset_info = severstal_get_offset()
+
     if master_process:
+        print_trainable_parameters(raw_model)
+        print(f"using device {device}")
+        for name, param in raw_model.named_parameters():
+            if 'lora' in name and param.requires_grad:
+                print(name, param.shape)
+
+        print(f"权重保存格式: hugging face格式:{save_hf_format} || lora格式:{save_lora_only}")
+        if loraplus_status_msg is not None:
+            print(loraplus_status_msg)
+        debug_print_optimizer_param_groups(optimizer)
         print(mfu_estimator.summary())
+        if should_use_early_stop:
+            print(f"早停已启用 (patience={patience}, min_delta={min_delta}).")
+        else:
+            print("早停已关闭：将运行完整训练轮次，同时仍跟踪最佳指标以保存模型。")
+        print(compile_status_msg)
+        print(f"梯度裁剪: {'max_norm=' + str(grad_clip) if grad_clip > 0 else '已禁用 (grad_clip=0)'}")
+        if use_multimask:
+            print("multimask_output=True + best IoU selection 已启用")
+        print(f"训练阶段 HD95 计算: {'启用' if train_compute_hd95 else '关闭 (默认)'}")
+        if offset_info is not None:
+            print("Severstal-specific processing enabled. Calculating offset info.")
 
     history = {
         "train_loss": [], "train_dice": [], "train_iou": [], "train_hd95": [],
@@ -962,93 +907,19 @@ def run_finetune_engine(train_dataloader,
     no_improve_epochs = 0
     best_epoch = -1
     best_model_path = None
-    global_step = 0  # 用于 AdaLoRA update_and_allocate
+    global_step = 0
+    last_completed_epoch = 0
 
-    if master_process:
-        if use_early_stop:
-            print(f"早停已启用 (patience={patience}, min_delta={min_delta}).")
-        else:
-            print("早停已关闭：将运行完整训练轮次，同时仍跟踪最佳指标以保存模型。")
-
-    # TF32：在 matmul 和 cudnn 上允许 TF32，在几乎不损失精度的前提下提升吞吐
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-    # AdaLoRA 在 update_and_allocate 时对参数做 in-place SVD 截断，与静态图不兼容，必须跳过
-    _ft_type = hyperparameters.get('ft_type', '')
-    _is_adalora = _ft_type == 'adalora_encoder'
-    # 只有 sam_fully 的 prompt_encoder 存在 requires_grad=True 但 forward 不触达的参数
-    # （box-only prompt 路径下 point/mask embedding 未被激活），需要 find_unused_parameters=True。
-    needs_find_unused = _ft_type == 'sam_fully'
-    use_compile = (
-        not hyperparameters.get('no_compile', False)
-        and not _is_adalora
-    )
-
-    # ---------- DDP 包装 ----------
-    if ddp:
-        model = DDP(
-            model,
-            device_ids=[ddp_local_rank],
-            find_unused_parameters=needs_find_unused,
-        )
-    # raw_model 在 compile 之前捕获：torch.compile 只包装 forward，不影响底层参数和 state_dict，
-    # 因此保存权重时直接用 raw_model.state_dict()，无需在保存前还原到未编译版本。
-    raw_model = model.module if ddp else model
-
-    # ---------- torch.compile（DDP 之后，仅 vision_encoder）----------
-    # mask_decoder 含条件分支，compile 会导致图断裂；vision_encoder 占 ~95% 计算量，收益最大。
-    # mode='default'：避免 reduce-overhead 开启 CUDA Graph 带来的严格静态形状限制。
-    # raw_model 已在上方固定，子模块替换不影响 state_dict，保存权重无需还原。
-    if use_compile:
-        try:
-            raw_model.vision_encoder = torch.compile(raw_model.vision_encoder, mode='default')
-            if master_process:
-                print(f"torch.compile 已启用 ({'DDP + ' if ddp else ''}仅 vision_encoder, mode='default')")
-        except Exception as e:
-            if master_process:
-                print(f"torch.compile 不可用，跳过: {e}")
-            use_compile = False
-    else:
-        if master_process:
-            if _is_adalora:
-                print("torch.compile 已禁用 (AdaLoRA 与静态图不兼容)")
-            else:
-                print("torch.compile 已禁用 (--no_compile)")
-
-    model.train()
-
-    grad_clip = hyperparameters.get('grad_clip', 1.0)
-    if master_process:
-        print(f"梯度裁剪: {'max_norm=' + str(grad_clip) if grad_clip > 0 else '已禁用 (grad_clip=0)'}")
-
-    use_multimask = hyperparameters.get('multimask', False)
-    if master_process and use_multimask:
-        print("multimask_output=True + best IoU selection 已启用")
-
-    train_compute_hd95 = hyperparameters.get('train_hd95', False)
-    if master_process:
-        print(f"训练阶段 HD95 计算: {'启用' if train_compute_hd95 else '关闭 (默认)'}")
-
-    # severstal需要计算 offset_info
-    offset_info = None
-    if process_batch_fn == _process_batch_severstal:
-        if master_process:
-            print("Severstal-specific processing enabled. Calculating offset info.")
-        offset_info = severstal_get_offset()
-
-    # 将 process_batch_fn 传递给训练周期函数
+    # ---------- epoch 训练主循环 ----------
     for epoch in range(num_epochs):
         if master_process:
             print(f"--- Epoch {epoch + 1}/{num_epochs} ---")
 
-        # DDP: 每个 epoch 设置 sampler 的 epoch，保证各进程数据的 shuffle 不同
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # 每个 epoch 重新创建 tracker，EMA 从头累积
         single_batch_size = hyperparameters.get('batch_size', 4)
-        world_size = ddp_info['world_size'] if ddp else 1
+        world_size = ddp_info['world_size'] if ddp and ddp_info is not None else ddp_world_size
         global_batch_size = single_batch_size * world_size
         mfu_tracker = MFUTracker(mfu_estimator, batch_size=global_batch_size, ema_alpha=0.9)
 
@@ -1060,31 +931,13 @@ def run_finetune_engine(train_dataloader,
             global_step=global_step, compute_hd95=train_compute_hd95,
             grad_clip=grad_clip)
 
-        if master_process:
-            mfu_str = f"{train_mfu*100:.2f}%" if train_mfu >= 0 else "N/A"
-            print(f"Training loss: {train_loss:.4f}, train dice: {train_dice:.4f}, "
-                  f"train iou: {train_iou:.4f}, train hd95: {train_hd95:.4f}, MFU: {mfu_str}")
+        val_loss, val_dice, val_iou, val_hd95 = _evaluate(
+            model, val_dataloader, loss_fn, process_batch_fn,
+            device, scaler, auto_seg=auto_seg, offset_info=offset_info,
+            master_process=master_process, multimask=use_multimask,
+            ddp=ddp)
 
-            for i, param_group in enumerate(optimizer.param_groups):
-                print(f"Current learning rate (param_group {i}): {param_group['lr']:.6e}")
-
-        val_loss, val_dice, val_iou, val_hd95 = _evaluate(model, val_dataloader, loss_fn, process_batch_fn,
-                                                      device, scaler, auto_seg = auto_seg, offset_info=offset_info,
-                                                      master_process=master_process, multimask=use_multimask,
-                                                      ddp=ddp)
-        if master_process:
-            print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val HD95: {val_hd95:.4f}')
-
-        # MoE gate 诊断：在终端打印门控分布摘要
-        if master_process:
-            moe_gate_stats = collect_moe_gate_stats(model)
-            if moe_gate_stats:
-                entropy_vals = [v for k, v in moe_gate_stats.items() if 'entropy' in k]
-                max_prob_vals = [v for k, v in moe_gate_stats.items() if 'max_prob' in k]
-                if entropy_vals:
-                    print(f'MoE Gate: avg_entropy={sum(entropy_vals)/len(entropy_vals):.4f} (max=1.099), '
-                          f'avg_max_prob={sum(max_prob_vals)/len(max_prob_vals):.4f}')
-
+        last_completed_epoch = epoch + 1
         history["train_loss"].append(train_loss)
         history["train_dice"].append(train_dice)
         history["train_iou"].append(train_iou)
@@ -1094,6 +947,14 @@ def run_finetune_engine(train_dataloader,
         history["val_dice"].append(val_dice)
         history["val_iou"].append(val_iou)
         history["val_hd95"].append(val_hd95)
+
+        if master_process:
+            mfu_str = f"{train_mfu*100:.2f}%" if train_mfu >= 0 else "N/A"
+            print(f"Training loss: {train_loss:.4f}, train dice: {train_dice:.4f}, "
+                  f"train iou: {train_iou:.4f}, train hd95: {train_hd95:.4f}, MFU: {mfu_str}")
+            for i, param_group in enumerate(optimizer.param_groups):
+                print(f"Current learning rate (param_group {i}): {param_group['lr']:.6e}")
+            print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val HD95: {val_hd95:.4f}')
 
         if swanlab_run:
             log_dict = {
@@ -1109,11 +970,7 @@ def run_finetune_engine(train_dataloader,
             }
             if train_mfu >= 0:
                 log_dict["train/mfu_pct"] = train_mfu * 100
-            # MoE gate 诊断：收集门控权重分布并记录到 swanlab
-            moe_stats = collect_moe_gate_stats(model)
-            if moe_stats:
-                log_dict.update({f"moe/{k}": v for k, v in moe_stats.items()})
-            swanlab.log(log_dict, step=epoch+1)
+            swanlab.log(log_dict, step=epoch + 1)
 
         improved = val_dice - best_val_dicescore > min_delta
         if improved:
@@ -1131,20 +988,20 @@ def run_finetune_engine(train_dataloader,
                 "val_iou": val_iou,
                 "val_hd95": val_hd95,
             }
-            # DDP: 只在主进程保存模型，避免多进程同时写文件冲突
             if master_process:
                 print(f"验证 dice 改善到 {best_val_dicescore:.4f}, 保存模型...")
-                # raw_model 在 compile 之前捕获，state_dict() 直接可用，无需还原。
-                best_model_path = save_model( hyperparameters=hyperparameters,
-                                                start_timestamp = start_timestamp,
-                                                model=raw_model,
-                                                optimizer=optimizer,
-                                                scaler=scaler,
-                                                epoch = epoch+1,
-                                                model_name= log_name,
-                                                target_dir= save_dir,
-                                                SAVE_HUGGINGFACE_PRETRAINED_MODEL = SAVE_HUGGINGFACE_PRETRAINED_MODEL,
-                                                save_lora_only=save_lora_only)
+                best_model_path = save_model(
+                    hyperparameters=hyperparameters,
+                    start_timestamp=start_timestamp,
+                    model=raw_model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch + 1,
+                    model_name=log_name,
+                    target_dir=save_dir,
+                    SAVE_HUGGINGFACE_PRETRAINED_MODEL=save_hf_format,
+                    save_lora_only=save_lora_only,
+                )
             if swanlab_run:
                 swanlab.log({
                     "best_epoch": best_epoch,
@@ -1156,31 +1013,39 @@ def run_finetune_engine(train_dataloader,
                     "best/val_dice": val_dice,
                     "best/val_iou": val_iou,
                     "best/val_hd95": val_hd95,
-                    })
+                })
         else:
-            if use_early_stop:
+            if should_use_early_stop:
                 no_improve_epochs += 1
                 if master_process:
                     print(f"验证 dice 未改善, 已连续 {no_improve_epochs} 个 epoch 没有提升.")
-            else:
-                if master_process:
-                    print("验证 dice 未改善（未启用早停），继续完整训练。")
+            elif master_process:
+                print("验证 dice 未改善（未启用早停），继续完整训练。")
 
         if master_process:
-            output_data = save_training_logs( hyperparameters = hyperparameters,
-                                                results = history,
-                                                epoch = epoch+1,
-                                                start_timestamp = start_timestamp,
-                                                result_name = log_name,
-                                                target_dir = save_dir)
-        if use_early_stop and no_improve_epochs >= patience:
+            save_training_logs(
+                hyperparameters=hyperparameters,
+                results=history,
+                epoch=last_completed_epoch,
+                start_timestamp=start_timestamp,
+                result_name=log_name,
+                target_dir=save_dir,
+            )
+
+        if should_use_early_stop and no_improve_epochs >= patience:
             if master_process:
                 print(f"验证指标连续 {patience} 个 epoch 无改善，提前停止训练。")
             break
 
-    # ---------- 最终评估：所有 rank 都执行（torchrun 要求所有进程一起退出）----------
+    # ---------- 最佳模型处理与最终评估 ----------
     if master_process:
         print("\n--- Training finished. Starting final evaluation with the best model. ---")
+
+    if ddp and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        best_model_path_holder = [best_model_path if master_process else None]
+        dist.broadcast_object_list(best_model_path_holder, src=0)
+        best_model_path = best_model_path_holder[0]
 
     if not best_model_path:
         if master_process:
@@ -1189,50 +1054,56 @@ def run_finetune_engine(train_dataloader,
     else:
         if master_process:
             print(f"Loading best model from: {best_model_path}")
-        if SAVE_HUGGINGFACE_PRETRAINED_MODEL:
+        if save_hf_format:
             try:
                 config = PeftConfig.from_pretrained(best_model_path)
                 base_model_path = config.base_model_name_or_path
                 fresh_base = SamModel.from_pretrained(base_model_path)
                 fresh_base = prepare_base_model_for_hf_adapter_loading(fresh_base, _ft_type)
-
                 loaded_model = PeftModel.from_pretrained(fresh_base, best_model_path)
                 loaded_model.to(device)
             except Exception as e:
-                if master_process:
-                    print(f"Error loading Hugging Face PEFT model: {e}")
-                loaded_model = None
+                raise RuntimeError(f"Failed to load Hugging Face PEFT model from {best_model_path}") from e
         elif save_lora_only:
-            # 需要从最佳 epoch 的保存文件中读取 lora 参数，覆盖掉当前的过拟合参数
             lora_state_dict = torch.load(best_model_path, map_location=device)
             raw_model.load_state_dict(lora_state_dict, strict=False)
-
             loaded_model = raw_model
-            loaded_model.eval()
         else:
             checkpoint = torch.load(best_model_path, map_location=device)
             raw_model.load_state_dict(checkpoint['model_state_dict'])
             loaded_model = raw_model
 
-    # 所有 rank 都跑评估（只有 master 显示进度条和打印结果）
+    loaded_model.eval()
     final_test_loss, final_test_dice, final_test_iou, final_test_hd95 = _evaluate(
         loaded_model, test_dataloader, loss_fn, process_batch_fn, device, scaler,
         auto_seg=auto_seg, offset_info=offset_info, master_process=master_process,
         multimask=use_multimask, ddp=ddp)
 
+    # ---------- 最终收尾 ----------
     if master_process:
         print(f'Final Test Set Evaluation: Loss: {final_test_loss:.4f}, Dice: {final_test_dice:.4f}, IoU: {final_test_iou:.4f}, HD95: {final_test_hd95:.4f}')
-        history["final_test_metrics"]={"loss": final_test_loss, "dice": final_test_dice, "iou": final_test_iou, "hd95": final_test_hd95}
+        history["final_test_metrics"] = {
+            "loss": final_test_loss,
+            "dice": final_test_dice,
+            "iou": final_test_iou,
+            "hd95": final_test_hd95,
+        }
 
         if swanlab_run:
-            swanlab.log({"test/test_dice": final_test_dice,
-                         "test/test_iou": final_test_iou,
-                         "test/test_hd95": final_test_hd95})
+            swanlab.log({
+                "test/test_dice": final_test_dice,
+                "test/test_iou": final_test_iou,
+                "test/test_hd95": final_test_hd95,
+            })
             swanlab.finish()
 
         save_training_logs(
-            hyperparameters=hyperparameters, results=history, epoch=output_data["last_completed_epoch"],
-            start_timestamp=start_timestamp, result_name=log_name, target_dir=save_dir,
+            hyperparameters=hyperparameters,
+            results=history,
+            epoch=last_completed_epoch,
+            start_timestamp=start_timestamp,
+            result_name=log_name,
+            target_dir=save_dir,
         )
         print("--- Training finished ---")
 
@@ -1244,51 +1115,27 @@ def evaluate_all_metrics(model, dataloader, loss_fn, process_batch_fn, device, a
     此函数用于训练完成后的最终评估。
     """
     model.eval()
-
-    # 1. 初始化所有指标计算器
-    # IoU Metric
-    iou_metric = MeanIoU(include_background=True, reduction="mean")
-    # Dice Metric
-    dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
-    
-    # Hausdorff Distance Metric (95th percentile)
-    # 使用95%分位数HD更稳健，能有效避免离群点的极端影响
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
 
     total_dice, total_iou = 0, 0
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Final Evaluation"):
-            # neu, sd900, magnetic用这个
             _, pred_masks_logits, gt_masks = process_batch_fn(
-                batch, model, loss_fn=loss_fn, device=device, use_amp=False, auto_seg=auto_seg, offset_info=offset_info
-            )
+                batch, model, loss_fn=loss_fn, device=device, use_amp=False, auto_seg=auto_seg, offset_info=offset_info)
 
             total_dice += compute_dice_score(pred_masks_logits, gt_masks)
             total_iou += compute_iou_score(pred_masks_logits, gt_masks)
 
-            # # 2. 将模型输出的logits转换为二进制掩码 (Binarize predictions)
-            # # MONAI的指标函数需要 (B, C, H, W) 格式的二进制输入
             pred_masks_binary = (torch.sigmoid(pred_masks_logits) > 0.5).float()
 
-            # # 3. 将当前批次的结果喂给指标计算器
-            # # MONAI会自动处理累加过程
-            # iou_metric(y_pred=pred_masks_binary, y=gt_masks)
-            # dice_metric(y_pred=pred_masks_binary, y=gt_masks)
-            # 避免result in nan/inf distance.
             if gt_masks.sum() > 0 and pred_masks_binary.sum() > 0:
                 hd95_metric(y_pred=pred_masks_binary.detach().cpu(), y=gt_masks.detach().cpu())
 
-    # 4. 在所有数据都处理完后，计算最终的平均指标
-    # mean_iou = iou_metric.aggregate().item()
-    # mean_dice = dice_metric.aggregate().item()
 
     mean_iou = total_iou / len(dataloader)
     mean_dice = total_dice / len(dataloader)
     mean_hd95 = hd95_metric.aggregate().item()
 
-    # 重置计算器状态，以便下次使用
-    # iou_metric.reset()
-    # dice_metric.reset()
     hd95_metric.reset()
     
     print(f"Evaluation Results:")
