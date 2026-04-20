@@ -45,14 +45,8 @@ def _add_finetune_args(parser):
     parser.add_argument('--lora_rank', type=int, default=16, help='LoRA 的秩 (rank)')
     parser.add_argument('--lora_alpha', type=int, default=16, help='LoRA 的 alpha 值')
     parser.add_argument('--lora_dropout', type=float, default=0.0, help='LoRA 的 dropout 比例')
-    parser.add_argument('--use_residual_gated_symmetric_init', action='store_true',
-                        help='仅对 loradsc_qv_residual_gated 启用对称非零初始化并补偿基底权重')
-    parser.add_argument('--residual_gated_symmetric_init_std', type=float, default=1e-3,
-                        help='ResidualGated 对称非零初始化的高斯标准差')
     parser.add_argument('--use_loraplus_optim', action='store_true', help='是否启用 LoRA+ 优化器参数组')
     parser.add_argument('--lora_plus_lr_ratio', type=float, default=16.0, help='LoRA+ 中 B 组学习率相对 A 组的倍数')
-    parser.add_argument('--moe_expert_type', type=str, default='conv', choices=['conv', 'linear', 'lora_conv'],
-                        help='MoE专家类型: conv=DSC卷积(默认), linear=纯线性, lora_conv=线性+DSC串联')
 
     # 环境与设备
     parser.add_argument('--local-rank', '--local_rank', type=int, default=-1, help='torchrun DDP 自动传入，无需手动设置')

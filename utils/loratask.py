@@ -1,14 +1,11 @@
 ### 选择不同的lora微调方法，返回SAM模型
 import copy
-
 import peft
 import torch
 import torch.nn as nn
 from peft import AdaLoraConfig, LoHaConfig, LoKrConfig, LoraConfig, get_peft_model
 from transformers import SamModel
-
 from utils.utils import print_trainable_parameters
-
 
 class FusedQKVSplitLinear(nn.Module):
     """将 SAM 的 fused qkv 线性层拆成 q/k/v 三个子层，但保持输出接口不变。"""

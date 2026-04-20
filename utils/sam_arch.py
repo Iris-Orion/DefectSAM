@@ -44,7 +44,7 @@ class LoRASam_Plus(LoRACore):
     - 本类提供 get_loraplus_param_groups 以便优化器直接使用不同 lr。
     """
     def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
-                 ft_q=True, ft_k=False, ft_v=True):
+                ft_q=True, ft_k=False, ft_v=True):
         super().__init__(qkv_layer, enabled, rank, lora_alpha, dropout_rate)
         self.ft_q = ft_q
         self.ft_k = ft_k
@@ -117,7 +117,7 @@ class LoRASam_DepWiseConv(LoRACore):
     对sam的encoder的attention部分选中的q, k, v层的各种组合形式进行lora-dsc修改
     """
     def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
-                 ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True):
+                ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True):
         super().__init__(qkv_layer, enabled, rank, lora_alpha, dropout_rate)
         self.ft_q = ft_q
         self.ft_k = ft_k
@@ -143,7 +143,6 @@ class LoRASam_DepWiseConv(LoRACore):
             if self.add_dsc_conv:
                 self.lora_dw_conv[part] = nn.Conv2d(rank, rank, kernel_size=3, padding=1, groups=rank, bias=False)
                 self.lora_pw_conv[part] = nn.Conv2d(rank, rank, kernel_size=1, padding=0, bias=False)
-   
         self.init_weights()
 
     def init_weights(self):
@@ -214,7 +213,7 @@ class LoRASam_DepWiseConv_Gated(LoRASam_DepWiseConv):
     - 提供 LoRA+ 参数组接口（A 与 B/Conv/Gate 分组不同学习率）。
     """
     def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
-                 ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, gate_init: float = 1e-3):
+                ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, gate_init: float = 1e-3):
         super().__init__(
             qkv_layer=qkv_layer,
             enabled=enabled,
@@ -268,9 +267,9 @@ class LoRASam_DepWiseConv_ResidualGated(LoRASam_DepWiseConv):
     与 Gated 的区别：gate 只控制 DSC 分支，残差路径 A(x) 始终保证 B 有梯度。
     """
     def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
-                 ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, gate_init: float = 0.0):
+                ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, gate_init: float = 0.0):
         super().__init__(qkv_layer, enabled, rank, lora_alpha, dropout_rate,
-                         ft_q, ft_k, ft_v, add_dsc_conv)
+                        ft_q, ft_k, ft_v, add_dsc_conv)
         self.gate = nn.ParameterDict({
             part: nn.Parameter(torch.tensor(float(gate_init)))
             for part in self.lora_a.keys()
@@ -281,8 +280,7 @@ class LoRASam_DepWiseConv_ResidualGated(LoRASam_DepWiseConv):
         if self.add_dsc_conv:
             h = self.lora_a[part](x_drop)                        # [B, H, W, rank]
             conv_in = h.permute(0, 3, 1, 2)                      # [B, rank, H, W]
-            conv_out = self.lora_pw_conv[part](
-                           self.lora_dw_conv[part](conv_in))
+            conv_out = self.lora_pw_conv[part](self.lora_dw_conv[part](conv_in))
             conv_out = conv_out.permute(0, 2, 3, 1)              # [B, H, W, rank]
             # 残差保证 B 始终有梯度；gate 控制 DSC 贡献，初始为 0
             delta = self.lora_b[part](h + self.gate[part] * conv_out) * self.scale
@@ -291,7 +289,7 @@ class LoRASam_DepWiseConv_ResidualGated(LoRASam_DepWiseConv):
         return delta
 
     def get_loraplus_param_groups(self, base_lr: float, lora_plus_lr_ratio: float = 16.0,
-                                   weight_decay: float = 0.0):
+                                weight_decay: float = 0.0):
         """A: base_lr；B + DSC conv + gate: base_lr * ratio"""
         if self.rank <= 0:
             return []
@@ -366,9 +364,9 @@ class LoRASam_DepWiseConv_AdaptiveGated(LoRASam_DepWiseConv):
     - 使得模型能按需激活 DSC，不同输入图像有不同的通道权重。
     """
     def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0,
-                 ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True):
+                ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True):
         super().__init__(qkv_layer, enabled, rank, lora_alpha, dropout_rate,
-                         ft_q, ft_k, ft_v, add_dsc_conv)
+                        ft_q, ft_k, ft_v, add_dsc_conv)
         self.adaptive_gate = nn.ModuleDict({})
         for part in self.lora_a.keys():
             gate_net = nn.Sequential(
@@ -394,8 +392,7 @@ class LoRASam_DepWiseConv_AdaptiveGated(LoRASam_DepWiseConv):
             dynamic_weight = self.adaptive_gate[part](conv_in)   # [B, rank]
             dynamic_weight = dynamic_weight.view(-1, 1, 1, self.rank) # [B, 1, 1, rank]
             
-            conv_out = self.lora_pw_conv[part](
-                           self.lora_dw_conv[part](conv_in))
+            conv_out = self.lora_pw_conv[part](self.lora_dw_conv[part](conv_in))
             conv_out = conv_out.permute(0, 2, 3, 1)              # [B, H, W, rank]
             
             delta = self.lora_b[part](h + dynamic_weight * conv_out) * self.scale
@@ -404,7 +401,7 @@ class LoRASam_DepWiseConv_AdaptiveGated(LoRASam_DepWiseConv):
         return delta
 
     def get_loraplus_param_groups(self, base_lr: float, lora_plus_lr_ratio: float = 16.0,
-                                   weight_decay: float = 0.0):
+                                weight_decay: float = 0.0):
         if self.rank <= 0:
             return []
         a_params, b_side_params = [], []
@@ -443,7 +440,7 @@ class LoRA_Moe_DepwiseConv_Samqv(nn.Module):
     EXPERT_TYPES = ('conv', 'linear', 'lora_conv')
 
     def __init__(self, qkv_layer, merge, rank=16, lora_alpha=16, dropout=0.05,
-                 num_experts=3, kernel_sizes=[3, 5, 7], expert_type='conv'):
+                num_experts=3, kernel_sizes=[3, 5, 7], expert_type='conv'):
         super(LoRA_Moe_DepwiseConv_Samqv, self).__init__()
         assert expert_type in self.EXPERT_TYPES, \
             f"expert_type must be one of {self.EXPERT_TYPES}, got '{expert_type}'"
@@ -639,9 +636,9 @@ def get_loradsc_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, add_dsc_
     for layers in hgsam_model.vision_encoder.layers:
         # lora_alpha 默认应该等于 rank
         layers.attn.qkv = LoRASam_DepWiseConv(qkv_layer = layers.attn.qkv, enabled = True,
-                                              rank=rank, lora_alpha=lora_alpha, dropout_rate=dropout_rate,
-                                              ft_q = ft_q, ft_k = ft_k, ft_v = ft_v,
-                                              add_dsc_conv=add_dsc_conv)
+                                                rank=rank, lora_alpha=lora_alpha, dropout_rate=dropout_rate,
+                                                ft_q = ft_q, ft_k = ft_k, ft_v = ft_v,
+                                                add_dsc_conv=add_dsc_conv)
     return hgsam_model
 
 def get_loradsc_residual_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=False, ft_v=True,
@@ -741,11 +738,9 @@ def get_loradsc_gated_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, ad
     return hgsam_model
 
 def get_loradsc_residual_gated_model(rank, lora_alpha, dropout_rate,
-                                      ft_q=True, ft_k=False, ft_v=True,
-                                      add_dsc_conv=True, gate_init: float = 0.0,
-                                      use_symmetric_init: bool = False,
-                                      symmetric_init_std: float = 1e-3,
-                                      sam_type: str = "sam_base"):
+                                    ft_q=True, ft_k=False, ft_v=True,
+                                    add_dsc_conv=True, gate_init: float = 0.0,
+                                    sam_type: str = "sam_base"):
     """
     构建 ResidualGated LoRA-DSC 版本 SAM。
     公式: delta = B(A(x) + gate * DSC(A(x))) * scale，gate_init=0.0
@@ -768,13 +763,11 @@ def get_loradsc_residual_gated_model(rank, lora_alpha, dropout_rate,
             dropout_rate=dropout_rate, ft_q=ft_q, ft_k=ft_k, ft_v=ft_v,
             add_dsc_conv=add_dsc_conv, gate_init=gate_init,
         )
-    if use_symmetric_init:
-        apply_residual_gated_symmetric_init(hgsam_model, init_std=symmetric_init_std)
     return hgsam_model
 
 def get_loradsc_adaptive_gated_model(rank, lora_alpha, dropout_rate,
-                                     ft_q=True, ft_k=False, ft_v=True,
-                                     add_dsc_conv=True, sam_type: str = "sam_base"):
+                                    ft_q=True, ft_k=False, ft_v=True,
+                                    add_dsc_conv=True, sam_type: str = "sam_base"):
     """
     构建 Channel-wise Adaptive Gated LoRA-DSC 版本 SAM。
     """
@@ -833,7 +826,7 @@ def get_loraplus_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=False, ft
 
 
 def get_moelora_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_sizes=[3, 5, 7],
-                      sam_type="sam_base", expert_type='conv'):
+                    sam_type="sam_base", expert_type='conv'):
     """MoE-LoRA: 多专家 + 门控路由。expert_type: 'conv' | 'linear' | 'lora_conv'"""
     if sam_type == "sam_base":
         hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
@@ -855,7 +848,7 @@ def get_moelora_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_size
 
 
 def get_moeloraplus_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_sizes=[3, 5, 7],
-                          sam_type="sam_base", expert_type='conv'):
+                        sam_type="sam_base", expert_type='conv'):
     """
     MoE-LoRA+：沿用 MoE-LoRA 的低秩专家结构，但训练时使用 LoRA+ 的差异学习率。
 
@@ -935,7 +928,7 @@ def apply_lora_ga_init(model, train_dataloader, device, rank, lora_alpha):
 def get_loraga_model(rank, lora_alpha, dropout_rate, train_dataloader, device, sam_type="sam_base"):
     """LoRA-GA: 标准LoRA结构 + SVD梯度初始化"""
     model = get_loradsc_model(rank=rank, lora_alpha=lora_alpha, dropout_rate=dropout_rate,
-                              ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False, sam_type=sam_type)
+                            ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False, sam_type=sam_type)
     model = apply_lora_ga_init(model, train_dataloader, device, rank, lora_alpha)
     return model
 
