@@ -13,8 +13,9 @@ from utils.config import get_common_ft_args
 from utils.utils import compute_dice_score, compute_iou_score
 from data.magnetic_tile_dataset import create_magnetic_dataset
 from utils.helper_function import set_seed, cleanup_ddp
-from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, zero_shot, create_model_from_type
+from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, zero_shot
 from weights.magnetic_wts import magnetic_dict
+from utils.loratask import create_model_from_type
 
 def mag_inference(model, device, dataloader, scaler):
     model.to(device) 

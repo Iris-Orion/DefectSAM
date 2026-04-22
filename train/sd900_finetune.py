@@ -15,10 +15,11 @@ from utils.finetune_engine import (run_finetune_engine,
                                    inference_engine,
                                    _process_batch, _process_batch_sam_style,
                                    zero_shot,
-                                   create_model_from_type)
+                                   )
 from data.sd900_dataset import sd900_finetune_create_dataset
 
 from weights.sd900_wts import sd900_dict
+from utils.loratask import create_model_from_type
 
 
 def main():

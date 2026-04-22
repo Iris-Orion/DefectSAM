@@ -9,8 +9,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from data.neu_dataset import create_neu_dataset_stratified, debug_neu_dataset_info
 from utils.config import get_common_ft_args
-from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, create_model_from_type, zero_shot
+from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, zero_shot
 from utils.helper_function import set_seed, cleanup_ddp
+from utils.loratask import create_model_from_type
 
 def main():
     ddp = int(os.environ.get('RANK', -1)) != -1

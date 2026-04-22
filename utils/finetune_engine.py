@@ -9,13 +9,11 @@ import cv2
 import os
 import time
 import swanlab
-import argparse
 from tqdm import tqdm
 from torch.optim import AdamW
 from datetime import datetime
 from transformers import SamModel
 from peft import PeftModel, PeftConfig
-from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
@@ -27,16 +25,8 @@ from utils.utils import (compute_dice_score,
                         print_trainable_parameters)
 from utils.mfu import SAMMFUEstimator, MFUTracker
 
-from utils.sam_arch import (get_loradsc_model,
-                            get_loradsc_residual_gated_model,
-                            create_model_for_inference,
-                            get_loraplus_model)
-                            
-from utils.loratask import (get_hf_adalora_model,
-                            get_hf_dora_qv_model,
-                            get_hf_lokr_qv_model,
-                            get_hf_lora_model,
-                            prepare_sam_qkv_for_qv_peft)
+from utils.sam_arch import create_model_for_inference
+from utils.loratask import prepare_sam_qkv_for_qv_peft
 
 def debug_print_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None:
     """
@@ -58,158 +48,11 @@ def debug_print_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None
     print(f"Total params in optimizer groups: {total_params:,}")
     print("===========================================\n")
 
-
 def prepare_base_model_for_hf_adapter_loading(base_model: SamModel, ft_type: str):
     """在加载 HF PEFT adapter 前，对需要的基座结构做与训练期一致的预处理。"""
-    if ft_type in ['dora_qv_encoder', 'lokr_qv_encoder']:
+    if ft_type in ['dora_qv_encoder', 'lokr_qv_encoder', 'loha_qv_encoder']:
         return prepare_sam_qkv_for_qv_peft(base_model, target_part='vision_encoder')
     return base_model
-
-def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoader = None):
-    """
-    根据给定的模型类型字符串和参数创建一个模型实例。
-
-    Args:
-        model_type (str): 模型的类型标识符 (e.g., 'loradsc_qv', 'lora_encoder').
-        args (argparse.Namespace): 包含所有超参数的args对象。
-        train_dataloader (DataLoader, optional): 仅在需要计算总步数时(如AdaLora)提供。
-
-    Returns:
-        torch.nn.Module: 创建好的模型实例。
-    """
-    lora_rank = args.lora_rank
-    lora_alpha = args.lora_alpha
-    lora_dropout = args.lora_dropout
-    model_type = args.ft_type
-    sam_type = args.sam_type
-
-    print(f"--- Creating model of type: {model_type} with rank: {lora_rank} ---")
-
-    if model_type == 'loradsc_qv':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, 
-        ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
-    
-    elif model_type == 'lora_attn_qv':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, 
-                                ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False)
-
-    elif model_type == 'loradsc_qv_residual_gated':
-        return get_loradsc_residual_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
-            gate_init=0.0,
-            sam_type=sam_type)
-
-    elif model_type == 'loradsc_qkv_residual_gated':
-        return get_loradsc_residual_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True,
-            gate_init=0.0,
-            sam_type=sam_type)
-
-    elif model_type == 'loradsc_q_residual_gated':
-        return get_loradsc_residual_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True,
-            gate_init=0.0,
-            sam_type=sam_type)
-
-    elif model_type == 'loradsc_qv_adaptive':
-        args.use_loraplus_optim = True
-        from utils.sam_arch import get_loradsc_adaptive_gated_model
-        return get_loradsc_adaptive_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
-
-    elif model_type == 'loradsc_qkv_adaptive':
-        args.use_loraplus_optim = True
-        from utils.sam_arch import get_loradsc_adaptive_gated_model
-        return get_loradsc_adaptive_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
-
-    elif model_type == 'loradsc_q':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True)
-    
-    elif model_type == 'loradsc_qk':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=True, ft_v=False, add_dsc_conv=True)
-    
-    elif model_type == 'loradsc_qkv':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True)
-
-    elif model_type == 'loraplus_qv':
-        args.use_loraplus_optim = True  # 强制启用 LoRA+ 优化器
-        return get_loraplus_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                    ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
-
-    elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'dora_qv_encoder', 'lokr_qv_encoder', 'sam_fully', 'sam_decoder']:
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-
-        if model_type == 'adalora_encoder':
-            if train_dataloader is None:
-                raise ValueError("train_dataloader must be provided for 'adalora_encoder' type.")
-            ada_target_r = lora_rank
-            ada_init_r = max(int(ada_target_r * 1.5), ada_target_r)
-            total_step = args.num_epochs * len(train_dataloader)
-            return get_hf_adalora_model(
-                model=hgsam_model,
-                total_step=total_step,
-                target_part='vision_encoder',
-                target_r=ada_target_r,
-                init_r=ada_init_r,
-                lora_alpha=lora_alpha,
-            )
-
-        elif model_type == 'lora_encoder':
-            return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
-                                        lora_dropout=lora_dropout, target_part='vision_encoder')
-
-        elif model_type == 'lora_decoder':
-            return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
-                                        lora_dropout=lora_dropout, target_part='mask_decoder')
-
-        elif model_type == 'dora_qv_encoder':
-            if getattr(args, 'save_custom_lora', False):
-                raise ValueError(
-                    "dora_qv_encoder only supports Hugging Face PEFT save/load; "
-                    "please disable --save_custom_lora."
-                )
-            args.save_hf_format = True
-            return get_hf_dora_qv_model(
-                hgsam_model,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                target_part='vision_encoder',
-            )
-
-        elif model_type == 'lokr_qv_encoder':
-            if getattr(args, 'save_custom_lora', False):
-                raise ValueError(
-                    "lokr_qv_encoder only supports Hugging Face PEFT save/load; "
-                    "please disable --save_custom_lora."
-                )
-            args.save_hf_format = True
-            return get_hf_lokr_qv_model(
-                hgsam_model,
-                lokr_rank=lora_rank,
-                lokr_alpha=lora_alpha,
-                rank_dropout=0.0,
-                module_dropout=0.0,
-                target_part='vision_encoder',
-            )
-
-        elif model_type == 'sam_fully':
-            return hgsam_model
-
-        elif model_type == 'sam_decoder':
-            for name, param in hgsam_model.named_parameters():
-                if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
-                    param.requires_grad_(False)
-            return hgsam_model
-            
-    else:
-        raise ValueError(f"Unknown model type: '{model_type}'. Please check your configuration.")
 
 def reverse_letterbox_1ch(input: np.ndarray, orig_size: tuple, target_size: tuple = (1024, 1024)) -> np.ndarray:
     """
@@ -230,13 +73,9 @@ def reverse_letterbox_1ch(input: np.ndarray, orig_size: tuple, target_size: tupl
     x_offset = (target_w - new_w) // 2
     y_offset = (target_h - new_h) // 2
 
-    # 提取letterbox中的有效区域
-    
-    mask_cropped = input[y_offset : y_offset + new_h, x_offset : x_offset + new_w]
-
-    # 使用最近邻插值缩放到原始尺寸
-    # 注意OpenCV的resize参数是(width, height)
-    restored_mask = cv2.resize(mask_cropped, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
+    mask_cropped = input[y_offset : y_offset + new_h, x_offset : x_offset + new_w]  # 提取letterbox中的有效区域
+    # 注意OpenCV的resize参数是(width, height)使用最近邻插值缩放到原始尺寸
+    restored_mask = cv2.resize(mask_cropped, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)  # TODO 和注释不一致 NTER_LANCZOS4效果不佳
 
     return restored_mask
 
@@ -378,7 +217,6 @@ def _sample_points_from_mask(gt_mask, num_points=1, sample_from='foreground'):
         labels.append(0)
 
     return np.array(coords, dtype=np.float32), np.array(labels, dtype=np.int64)
-
 
 def _sample_correction_points(pred_mask, gt_mask, num_points=1):
     """
@@ -849,9 +687,18 @@ def run_finetune_engine(train_dataloader,
         )
 
     raw_model = model.module if ddp else model
+    _compile_is_peft = save_hf_format and hasattr(raw_model, 'base_model')
+    _compiled_ve = None
+    _orig_ve = None
     if should_use_compile:
         try:
-            raw_model.vision_encoder = torch.compile(raw_model.vision_encoder, mode='default')
+            if _compile_is_peft:
+                _peft_inner = raw_model.base_model.model
+                _orig_ve = _peft_inner.vision_encoder
+                _compiled_ve = torch.compile(_orig_ve, mode='default')
+                _peft_inner.vision_encoder = _compiled_ve
+            else:
+                raw_model.vision_encoder = torch.compile(raw_model.vision_encoder, mode='default')
             compile_status_msg = f"torch.compile 已启用 ({'DDP + ' if ddp else ''}仅 vision_encoder, mode='default')"
         except Exception as e:
             compile_status_msg = f"torch.compile 不可用，跳过: {e}"
@@ -990,6 +837,8 @@ def run_finetune_engine(train_dataloader,
             }
             if master_process:
                 print(f"验证 dice 改善到 {best_val_dicescore:.4f}, 保存模型...")
+                if _compiled_ve is not None:
+                    _peft_inner.vision_encoder = _orig_ve
                 best_model_path = save_model(
                     hyperparameters=hyperparameters,
                     start_timestamp=start_timestamp,
@@ -1002,6 +851,8 @@ def run_finetune_engine(train_dataloader,
                     SAVE_HUGGINGFACE_PRETRAINED_MODEL=save_hf_format,
                     save_lora_only=save_lora_only,
                 )
+                if _compiled_ve is not None:
+                    _peft_inner.vision_encoder = _compiled_ve
             if swanlab_run:
                 swanlab.log({
                     "best_epoch": best_epoch,
