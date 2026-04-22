@@ -18,8 +18,9 @@ from data import severstal
 from data.severstal import SteelDataset_WithBoxPrompt
 from utils.config import get_severstal_ft_args
 from utils.helper_function import set_seed, cleanup_ddp
-from utils.finetune_engine import create_model_from_type, run_finetune_engine, inference_engine, _process_batch_severstal, zero_shot
+from utils.finetune_engine import run_finetune_engine, inference_engine, _process_batch_severstal, zero_shot
 from weights.severstal_wts import severstal_dict
+from utils.loratask import create_model_from_type
 
 def main():
     ddp = int(os.environ.get('RANK', -1)) != -1

@@ -3,7 +3,12 @@ import copy
 import peft
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+import argparse
 from peft import AdaLoraConfig, LoHaConfig, LoKrConfig, LoraConfig, get_peft_model
+from utils.sam_arch import (get_loradsc_model,
+                            get_loradsc_residual_gated_model,
+                            get_loraplus_model)
 from transformers import SamModel
 from utils.utils import print_trainable_parameters
 
@@ -132,14 +137,18 @@ def get_hf_lokr_qv_model(model, lokr_rank=16, lokr_alpha=16, rank_dropout=0.0, m
     return model
 
 
-def get_hf_loha_model(model):
-    target_modules = get_sam_target_modules(model)
+def get_hf_loha_qv_model(model, loha_rank=16, loha_alpha=16, rank_dropout=0.0, module_dropout=0.0, target_part='vision_encoder'):
+    """
+    严格 q/v-only LoHa：先将 fused qkv 拆成 q/k/v 子层，再仅对 q_proj/v_proj 注入 LoHa。
+    """
+    model = prepare_sam_qkv_for_qv_peft(model, target_part=target_part)
+    target_modules = get_sam_qv_target_modules_for_peft(model, target_part=target_part)
     config = LoHaConfig(
-        r=16,
-        alpha=16,
-        target_modules= target_modules,
-        module_dropout=0.1,
-        # modules_to_save=["classifier"],
+        r=loha_rank,
+        alpha=loha_alpha,
+        target_modules=target_modules,
+        rank_dropout=rank_dropout,
+        module_dropout=module_dropout,
     )
     model = get_peft_model(model, config)
     return model
@@ -221,6 +230,169 @@ def get_sam_qv_target_modules_for_peft(model, target_part='vision_encoder'):
     if not target_modules:
         raise ValueError("未找到 q_proj/v_proj 目标模块，请先执行 prepare_sam_qkv_for_qv_peft().")
     return target_modules
+
+def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoader = None):
+    """
+    根据给定的模型类型字符串和参数创建一个模型实例。
+
+    Args:
+        model_type (str): 模型的类型标识符 (e.g., 'loradsc_qv', 'lora_encoder').
+        args (argparse.Namespace): 包含所有超参数的args对象。
+        train_dataloader (DataLoader, optional): 仅在需要计算总步数时(如AdaLora)提供。
+
+    Returns:
+        torch.nn.Module: 创建好的模型实例。
+    """
+    lora_rank = args.lora_rank
+    lora_alpha = args.lora_alpha
+    lora_dropout = args.lora_dropout
+    model_type = args.ft_type
+    sam_type = args.sam_type
+
+    print(f"--- Creating model of type: {model_type} with rank: {lora_rank} ---")
+
+    if model_type == 'loradsc_qv':
+        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, 
+        ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
+    
+    elif model_type == 'lora_attn_qv':
+        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, 
+                                ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False)
+
+    elif model_type == 'loradsc_qv_residual_gated':
+        return get_loradsc_residual_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
+            gate_init=0.0,
+            sam_type=sam_type)
+
+    elif model_type == 'loradsc_qkv_residual_gated':
+        return get_loradsc_residual_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True,
+            gate_init=0.0,
+            sam_type=sam_type)
+
+    elif model_type == 'loradsc_q_residual_gated':
+        return get_loradsc_residual_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True,
+            gate_init=0.0,
+            sam_type=sam_type)
+
+    elif model_type == 'loradsc_qv_adaptive':
+        args.use_loraplus_optim = True
+        from utils.sam_arch import get_loradsc_adaptive_gated_model
+        return get_loradsc_adaptive_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
+
+    elif model_type == 'loradsc_qkv_adaptive':
+        args.use_loraplus_optim = True
+        from utils.sam_arch import get_loradsc_adaptive_gated_model
+        return get_loradsc_adaptive_gated_model(
+            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+            ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
+
+    elif model_type == 'loradsc_q':
+        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True)
+    
+    elif model_type == 'loradsc_qk':
+        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=True, ft_v=False, add_dsc_conv=True)
+    
+    elif model_type == 'loradsc_qkv':
+        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True)
+
+    elif model_type == 'loraplus_qv':
+        args.use_loraplus_optim = True  # 强制启用 LoRA+ 优化器
+        return get_loraplus_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
+                                    ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
+
+    elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'dora_qv_encoder', 'lokr_qv_encoder', 'loha_qv_encoder', 'sam_fully', 'sam_decoder']:
+        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
+
+        if model_type == 'adalora_encoder':
+            if train_dataloader is None:
+                raise ValueError("train_dataloader must be provided for 'adalora_encoder' type.")
+            ada_target_r = lora_rank
+            ada_init_r = max(int(ada_target_r * 1.5), ada_target_r)
+            total_step = args.num_epochs * len(train_dataloader)
+            return get_hf_adalora_model(
+                model=hgsam_model,
+                total_step=total_step,
+                target_part='vision_encoder',
+                target_r=ada_target_r,
+                init_r=ada_init_r,
+                lora_alpha=lora_alpha,
+            )
+
+        elif model_type == 'lora_encoder':
+            return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
+                                        lora_dropout=lora_dropout, target_part='vision_encoder')
+
+        elif model_type == 'lora_decoder':
+            return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
+                                        lora_dropout=lora_dropout, target_part='mask_decoder')
+
+        elif model_type == 'dora_qv_encoder':
+            if getattr(args, 'save_custom_lora', False):
+                raise ValueError(
+                    "dora_qv_encoder only supports Hugging Face PEFT save/load; "
+                    "please disable --save_custom_lora."
+                )
+            args.save_hf_format = True
+            return get_hf_dora_qv_model(
+                hgsam_model,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_part='vision_encoder',
+            )
+
+        elif model_type == 'lokr_qv_encoder':
+            if getattr(args, 'save_custom_lora', False):
+                raise ValueError(
+                    "lokr_qv_encoder only supports Hugging Face PEFT save/load; "
+                    "please disable --save_custom_lora."
+                )
+            args.save_hf_format = True
+            return get_hf_lokr_qv_model(
+                hgsam_model,
+                lokr_rank=lora_rank,
+                lokr_alpha=lora_alpha,
+                rank_dropout=0.0,
+                module_dropout=0.0,
+                target_part='vision_encoder',
+            )
+
+        elif model_type == 'loha_qv_encoder':
+            if getattr(args, 'save_custom_lora', False):
+                raise ValueError(
+                    "loha_qv_encoder only supports Hugging Face PEFT save/load; "
+                    "please disable --save_custom_lora."
+                )
+            args.save_hf_format = True
+            return get_hf_loha_qv_model(
+                hgsam_model,
+                loha_rank=lora_rank,
+                loha_alpha=lora_alpha,
+                rank_dropout=0.0,
+                module_dropout=0.0,
+                target_part='vision_encoder',
+            )
+
+        elif model_type == 'sam_fully':
+            return hgsam_model
+
+        elif model_type == 'sam_decoder':
+            for name, param in hgsam_model.named_parameters():
+                if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
+                    param.requires_grad_(False)
+            return hgsam_model
+            
+    else:
+        raise ValueError(f"Unknown model type: '{model_type}'. Please check your configuration.")
+
 
 
 def simple_task():

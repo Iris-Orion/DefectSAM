@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from PIL import Image
 
 # 让仓库根目录可被 import
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -76,6 +77,24 @@ def test_rle2mask_disk_cache_hit(tmp_path):
     assert out.shape == (256, 1600, 4)
     assert out[10, 20, 0] == 1
     assert out.sum() == 1
+
+
+def test_rle2mask_ignores_legacy_npy_cache(tmp_path):
+    """旧 .npy 缓存不再被读取；无 .npz 命中时应按无缓存路径处理。"""
+    legacy_mask = np.zeros((256, 1600, 4), dtype=np.uint8)
+    legacy_mask[0, 0, 0] = 1
+    np.save(tmp_path / "legacy.npy", legacy_mask)
+
+    df = pd.DataFrame({
+        "ImageId": ["legacy.jpg"],
+        "ClassId": [1],
+        "EncodedPixels": ["1 4"],
+    })
+    out = sv.rle2mask("legacy.jpg", df, cache_dir=str(tmp_path))
+    expected = sv._rle2mask_raw("legacy.jpg", df)
+    assert out.shape == (256, 1600, 4)
+    assert np.array_equal(out, expected)
+    assert not np.array_equal(out, legacy_mask)
 
 
 def test_rle2mask_fallback_no_cache(tmp_path):
@@ -161,6 +180,83 @@ def test_get_bounding_box_perturb_within_image():
         x_min, y_min, x_max, y_max = bbox
         assert 0 <= x_min <= x_max <= 1600
         assert 0 <= y_min <= y_max <= 256
+
+
+def _write_dummy_severstal_images(tmp_path, image_ids):
+    """在临时目录下写最小 Severstal 风格图片，供 dataset/dataloader 单测使用。"""
+    train_images_dir = tmp_path / "train_images"
+    train_images_dir.mkdir(parents=True, exist_ok=True)
+    for idx, image_id in enumerate(image_ids, start=1):
+        img = np.full((256, 1600, 3), idx * 32, dtype=np.uint8)
+        Image.fromarray(img).save(train_images_dir / image_id)
+
+
+def test_create_dataset_and_dataloader_no_prompt_contract(tmp_path, monkeypatch):
+    """将源文件里的临时打印式测试改成真正可断言的 dataset/dataloader 合同测试。"""
+    train_id = "train_sample.jpg"
+    val_id = "val_sample.jpg"
+    test_id = "test_sample.jpg"
+    _write_dummy_severstal_images(tmp_path, [train_id, val_id, test_id])
+
+    def fake_rle2mask(image_id, df, cache_dir="./data/severstal_steel_defect_detection/mask_cache"):
+        del df, cache_dir
+        mask = np.zeros((256, 1600, 4), dtype=np.uint8)
+        if image_id == train_id:
+            mask[5:20, 30:60, 0] = 1
+        elif image_id == val_id:
+            mask[10:30, 40:70, 0] = 1
+        else:
+            mask[15:35, 50:90, 0] = 1
+        return mask
+
+    monkeypatch.setattr(sv, "rle2mask", fake_rle2mask)
+
+    train_df = pd.DataFrame({"ImageId": [train_id], "ClassId": [1], "EncodedPixels": ["1 4"]})
+    val_df = pd.DataFrame({"ImageId": [val_id], "ClassId": [1], "EncodedPixels": ["1 4"]})
+    test_df = pd.DataFrame({"ImageId": [test_id], "ClassId": [1], "EncodedPixels": ["1 4"]})
+    train_transform, val_transform = sv.get_albumentations_transforms()
+
+    train_dataset, val_dataset, test_dataset = sv.create_datasets_no_prompt(
+        train_df,
+        val_df,
+        test_df,
+        data_path=tmp_path,
+        train_transform=train_transform,
+        val_transform=val_transform,
+    )
+    assert isinstance(train_dataset, sv.SteelDataset)
+    assert isinstance(val_dataset, sv.SteelDataset)
+    assert isinstance(test_dataset, sv.SteelDataset)
+    assert len(train_dataset) == 1
+    assert len(val_dataset) == 1
+    assert len(test_dataset) == 1
+
+    img, mask, image_id = val_dataset[0]
+    assert image_id == val_id
+    assert img.dtype == torch.float32
+    assert mask.dtype == torch.float32
+    assert img.shape == (3, 256, 1600)
+    assert mask.shape == (1, 256, 1600)
+    assert 0.0 <= float(img.min()) <= float(img.max()) <= 1.0
+    assert mask.sum().item() == 600.0
+
+    train_loader, val_loader, test_loader = sv.create_dataloaders_no_prompt(
+        train_df,
+        val_df,
+        test_df,
+        data_path=tmp_path,
+        train_transform=train_transform,
+        val_transform=val_transform,
+        batch_size=1,
+        num_workers=0,
+    )
+    batch_img, batch_mask, batch_ids = next(iter(test_loader))
+    assert batch_img.shape == (1, 3, 256, 1600)
+    assert batch_mask.shape == (1, 1, 256, 1600)
+    assert batch_img.dtype == torch.float32
+    assert batch_mask.dtype == torch.float32
+    assert list(batch_ids) == [test_id]
+    assert batch_mask.sum().item() == 800.0
 
 
 # ─── C. df 处理 ────────────────────────────────────────────────
