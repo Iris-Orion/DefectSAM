@@ -308,7 +308,8 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
         return get_loraplus_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
                                     ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
 
-    elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'dora_qv_encoder', 'lokr_qv_encoder', 'loha_qv_encoder', 'sam_fully', 'sam_decoder']:
+    elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'lokr_encoder',
+                        'dora_qv_encoder', 'lokr_qv_encoder', 'loha_qv_encoder', 'sam_fully', 'sam_decoder']:
         hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
 
         if model_type == 'adalora_encoder':
@@ -334,6 +335,7 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
             return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
                                         lora_dropout=lora_dropout, target_part='mask_decoder')
 
+        
         elif model_type == 'dora_qv_encoder':
             if getattr(args, 'save_custom_lora', False):
                 raise ValueError(
@@ -381,8 +383,18 @@ def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoade
                 target_part='vision_encoder',
             )
 
+        elif model_type == 'lokr_encoder':
+            if getattr(args, 'save_custom_lora', False):
+                raise ValueError(
+                    "loha_qv_encoder only supports Hugging Face PEFT save/load; "
+                    "please disable --save_custom_lora."
+                )
+            args.save_hf_format = True
+            return get_hf_lokr_model(model=hgsam_model)
+
         elif model_type == 'sam_fully':
             return hgsam_model
+        
 
         elif model_type == 'sam_decoder':
             for name, param in hgsam_model.named_parameters():
