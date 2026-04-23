@@ -1,13 +1,10 @@
 """
 utils/loratask.py 单元测试。
 
-覆盖：FusedQKVSplitLinear（含错误路径）、filter_target_modules、
-      prepare_sam_qkv_for_qv_peft（包括幂等性与错误路径）、
-      get_sam_target_modules / get_sam_qv_target_modules_for_peft 的错误路径、
-      create_model_from_type 的可在 CPU 上触发的错误分支。
-
-不依赖 GPU、SAM 权重或真实数据集。
+加载真实 SAM-base 模型，测试 FusedQKVSplitLinear 是否正确替换 vision encoder 中的 qkv 层。
+不依赖 GPU 或真实数据集。
 """
+import copy
 import argparse
 import sys
 from pathlib import Path
@@ -21,93 +18,80 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import utils.loratask as lt
+from transformers import SamConfig, SamModel
 
 
-# ─── 辅助：最小假模型 ──────────────────────────────────────────────
+# ─── SAM-base 风格 fixture（2层，与真实 qkv 维度一致）────────────────
 
-class _FakeAttn:
-    def __init__(self):
-        self.qkv = nn.Linear(8, 12)
-
-
-class _FakeLayer:
-    def __init__(self):
-        self.attn = _FakeAttn()
+def _make_sam_config():
+    """与 sam-vit-base 架构完全一致，仅将层数缩减为 2 以加速测试。"""
+    config = SamConfig()
+    config.vision_config.num_hidden_layers = 2
+    config.vision_config.num_global_attn_indices = [1]
+    return config
 
 
-class _FakeVisionEncoder:
-    def __init__(self):
-        self.layers = [_FakeLayer(), _FakeLayer()]
+@pytest.fixture(scope="module")
+def sam_base():
+    """SAM-base 随机权重模型，整个测试模块共享一份（不修改）。"""
+    return SamModel(_make_sam_config())
 
 
-class _FakeModelForQKVPeft:
-    def __init__(self):
-        self.vision_encoder = _FakeVisionEncoder()
+@pytest.fixture
+def sam_fresh():
+    """每个测试独立的 SAM 模型副本，用于需要原地修改的测试。"""
+    return SamModel(_make_sam_config())
 
 
-class _FakeAttentionQKV(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.qkv = nn.Linear(8, 12)
+@pytest.fixture
+def sam_qv_split(sam_fresh):
+    """已执行 qkv 拆分的 SAM 模型。"""
+    lt.prepare_sam_qkv_for_qv_peft(sam_fresh, 'vision_encoder')
+    return sam_fresh
 
 
-class _FakeEncoderWithQKV(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.layer0 = _FakeAttentionQKV()
-        self.layer1 = _FakeAttentionQKV()
-
-
-class _FakeAttentionQV(nn.Module):
+# 无法匹配 qkv/q_proj/v_proj 的极简 encoder，仅用于"未找到"错误路径
+class _NoLinearEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.q_proj = nn.Linear(8, 4)
-        self.k_proj = nn.Linear(8, 4)
-        self.v_proj = nn.Linear(8, 4)
+        self.act = nn.ReLU()
 
 
-class _FakeEncoderWithQV(nn.Module):
+class _ModelNoLinear:
+    """只有 vision_encoder 和 mask_decoder 属性，但 vision_encoder 不含目标线性层。"""
     def __init__(self):
-        super().__init__()
-        self.layer0 = _FakeAttentionQV()
-
-
-class _FakeEncoderNoLinear(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.relu = nn.ReLU()
-
-
-class _FakeModelWithVisionEncoder:
-    def __init__(self, encoder):
-        self.vision_encoder = encoder
-        self.mask_decoder = _FakeEncoderWithQKV()
+        self.vision_encoder = _NoLinearEncoder()
+        self.mask_decoder = _NoLinearEncoder()
 
 
 # ─── A. FusedQKVSplitLinear ───────────────────────────────────────
+# 使用真实 SAM-base qkv 尺寸：Linear(768, 2304)
+
+SAM_HIDDEN = 768
+SAM_QKV_OUT = 2304  # 768 * 3
+
 
 def test_fused_qkv_split_linear_output_matches_original():
     """包装后的 forward 输出应与原始 qkv 线性层完全一致。"""
     torch.manual_seed(0)
-    qkv = nn.Linear(8, 12)
+    qkv = nn.Linear(SAM_HIDDEN, SAM_QKV_OUT)
     wrapper = lt.FusedQKVSplitLinear(qkv)
-    x = torch.randn(3, 8)
+    x = torch.randn(3, SAM_HIDDEN)
     with torch.no_grad():
         out_ref = qkv(x)
         out_wrapped = wrapper(x)
-    assert out_wrapped.shape == (3, 12)
+    assert out_wrapped.shape == (3, SAM_QKV_OUT)
     assert torch.allclose(out_wrapped, out_ref, atol=1e-5), \
         "FusedQKVSplitLinear 的输出与原始层不一致"
 
 
 def test_fused_qkv_split_linear_no_bias():
     """无 bias 的情况：has_bias=False，输出形状正确。"""
-    qkv = nn.Linear(8, 12, bias=False)
+    qkv = nn.Linear(SAM_HIDDEN, SAM_QKV_OUT, bias=False)
     wrapper = lt.FusedQKVSplitLinear(qkv)
     assert not wrapper.has_bias
-    x = torch.randn(2, 8)
-    out = wrapper(x)
-    assert out.shape == (2, 12)
+    x = torch.randn(2, SAM_HIDDEN)
+    assert wrapper(x).shape == (2, SAM_QKV_OUT)
 
 
 def test_fused_qkv_split_linear_type_error():
@@ -118,127 +102,115 @@ def test_fused_qkv_split_linear_type_error():
 
 def test_fused_qkv_split_linear_value_error_not_divisible():
     """out_features 不能被 3 整除时应抛出 ValueError。"""
-    qkv = nn.Linear(8, 10)  # 10 % 3 != 0
     with pytest.raises(ValueError, match="divisible by 3"):
-        lt.FusedQKVSplitLinear(qkv)
+        lt.FusedQKVSplitLinear(nn.Linear(SAM_HIDDEN, SAM_HIDDEN + 1))
 
 
 def test_fused_qkv_split_linear_submodule_weights_correct():
     """q/k/v 子层权重应分别等于原始 qkv 权重的对应切片。"""
     torch.manual_seed(1)
-    qkv = nn.Linear(8, 12)
+    qkv = nn.Linear(SAM_HIDDEN, SAM_QKV_OUT)
     wrapper = lt.FusedQKVSplitLinear(qkv)
+    head_dim = SAM_QKV_OUT // 3
     with torch.no_grad():
-        assert torch.allclose(wrapper.q_proj.weight, qkv.weight[:4])
-        assert torch.allclose(wrapper.k_proj.weight, qkv.weight[4:8])
-        assert torch.allclose(wrapper.v_proj.weight, qkv.weight[8:])
+        assert torch.allclose(wrapper.q_proj.weight, qkv.weight[:head_dim])
+        assert torch.allclose(wrapper.k_proj.weight, qkv.weight[head_dim:2 * head_dim])
+        assert torch.allclose(wrapper.v_proj.weight, qkv.weight[2 * head_dim:])
 
 
 # ─── B. filter_target_modules ─────────────────────────────────────
 
-def test_filter_target_modules_finds_qkv_linear():
-    """模块名包含 'qkv' 且类型为 Linear 时应被选中。"""
-    encoder = _FakeEncoderWithQKV()
-    result = lt.filter_target_modules(encoder.named_modules(), ['qkv'])
-    assert any('qkv' in name for name in result)
+def test_filter_target_modules_finds_qkv_linear(sam_base):
+    result = lt.filter_target_modules(sam_base.vision_encoder.named_modules(), ['qkv'])
+    assert len(result) > 0
+    assert all('qkv' in name for name in result)
 
 
 def test_filter_target_modules_excludes_non_linear():
-    """非 Linear 的模块即使名称匹配也不应被选中。"""
-    encoder = _FakeEncoderNoLinear()
-    result = lt.filter_target_modules(encoder.named_modules(), ['relu'])
+    result = lt.filter_target_modules(_NoLinearEncoder().named_modules(), ['act'])
     assert result == []
 
 
-def test_filter_target_modules_multiple_substrings():
-    """多个 target_substrings 时，只要任一匹配就应包含该模块。"""
-    encoder = _FakeEncoderWithQV()
-    result = lt.filter_target_modules(encoder.named_modules(), ['q_proj', 'v_proj'])
+def test_filter_target_modules_multiple_substrings(sam_qv_split):
+    result = lt.filter_target_modules(
+        sam_qv_split.vision_encoder.named_modules(), ['q_proj', 'v_proj']
+    )
     names = '\n'.join(result)
     assert 'q_proj' in names
     assert 'v_proj' in names
     assert 'k_proj' not in names
 
 
-def test_filter_target_modules_no_match_returns_empty():
-    """没有任何匹配时返回空列表。"""
-    encoder = _FakeEncoderWithQKV()
-    result = lt.filter_target_modules(encoder.named_modules(), ['nonexistent'])
+def test_filter_target_modules_no_match_returns_empty(sam_base):
+    result = lt.filter_target_modules(
+        sam_base.vision_encoder.named_modules(), ['nonexistent']
+    )
     assert result == []
 
 
 # ─── C. prepare_sam_qkv_for_qv_peft ──────────────────────────────
 
-def test_prepare_sam_qkv_wraps_layers():
+def test_prepare_sam_qkv_wraps_layers(sam_fresh):
     """调用后每个 layer.attn.qkv 都应被替换为 FusedQKVSplitLinear。"""
-    model = _FakeModelForQKVPeft()
-    result = lt.prepare_sam_qkv_for_qv_peft(model, 'vision_encoder')
-    assert result is model
-    for layer in model.vision_encoder.layers:
+    result = lt.prepare_sam_qkv_for_qv_peft(sam_fresh, 'vision_encoder')
+    assert result is sam_fresh
+    for layer in sam_fresh.vision_encoder.layers:
         assert isinstance(layer.attn.qkv, lt.FusedQKVSplitLinear)
 
 
-def test_prepare_sam_qkv_idempotent():
-    """重复调用不应二次包装（已是 FusedQKVSplitLinear 则跳过）。"""
-    model = _FakeModelForQKVPeft()
-    lt.prepare_sam_qkv_for_qv_peft(model, 'vision_encoder')
-    ids_after_first = [id(layer.attn.qkv) for layer in model.vision_encoder.layers]
-    lt.prepare_sam_qkv_for_qv_peft(model, 'vision_encoder')
-    ids_after_second = [id(layer.attn.qkv) for layer in model.vision_encoder.layers]
-    assert ids_after_first == ids_after_second
+def test_prepare_sam_qkv_idempotent(sam_fresh):
+    """重复调用不应二次包装。"""
+    lt.prepare_sam_qkv_for_qv_peft(sam_fresh, 'vision_encoder')
+    ids_first = [id(layer.attn.qkv) for layer in sam_fresh.vision_encoder.layers]
+    lt.prepare_sam_qkv_for_qv_peft(sam_fresh, 'vision_encoder')
+    ids_second = [id(layer.attn.qkv) for layer in sam_fresh.vision_encoder.layers]
+    assert ids_first == ids_second
 
 
-def test_prepare_sam_qkv_wrong_target_raises():
+def test_prepare_sam_qkv_wrong_target_raises(sam_fresh):
     """target_part != 'vision_encoder' 应抛出 ValueError。"""
-    model = _FakeModelForQKVPeft()
     with pytest.raises(ValueError):
-        lt.prepare_sam_qkv_for_qv_peft(model, 'mask_decoder')
+        lt.prepare_sam_qkv_for_qv_peft(sam_fresh, 'mask_decoder')
 
 
-# ─── D. get_sam_target_modules 错误路径 ───────────────────────────
+# ─── D. get_sam_target_modules ────────────────────────────────────
 
-def test_get_sam_target_modules_finds_qkv(capsys):
-    model = _FakeModelWithVisionEncoder(_FakeEncoderWithQKV())
-    result = lt.get_sam_target_modules(model, 'vision_encoder')
+def test_get_sam_target_modules_finds_qkv(sam_base, capsys):
+    result = lt.get_sam_target_modules(sam_base, 'vision_encoder')
     assert len(result) > 0
     assert all('qkv' in name for name in result)
 
 
-def test_get_sam_target_modules_unknown_part_raises():
-    model = _FakeModelWithVisionEncoder(_FakeEncoderWithQKV())
+def test_get_sam_target_modules_unknown_part_raises(sam_base):
     with pytest.raises(ValueError, match="target_part"):
-        lt.get_sam_target_modules(model, 'unknown_part')
+        lt.get_sam_target_modules(sam_base, 'unknown_part')
 
 
 def test_get_sam_target_modules_no_match_raises():
-    """encoder 中没有 q_proj/k_proj/v_proj/qkv 时应抛出 ValueError。"""
-    model = _FakeModelWithVisionEncoder(_FakeEncoderNoLinear())
+    """vision_encoder 中无匹配层时应抛出 ValueError。"""
     with pytest.raises(ValueError, match="未找到"):
-        lt.get_sam_target_modules(model, 'vision_encoder')
+        lt.get_sam_target_modules(_ModelNoLinear(), 'vision_encoder')
 
 
-# ─── E. get_sam_qv_target_modules_for_peft 错误路径 ──────────────
+# ─── E. get_sam_qv_target_modules_for_peft ───────────────────────
 
-def test_get_sam_qv_target_modules_finds_q_and_v(capsys):
-    model = _FakeModelWithVisionEncoder(_FakeEncoderWithQV())
-    result = lt.get_sam_qv_target_modules_for_peft(model, 'vision_encoder')
+def test_get_sam_qv_target_modules_finds_q_and_v(sam_qv_split, capsys):
+    result = lt.get_sam_qv_target_modules_for_peft(sam_qv_split, 'vision_encoder')
     names = '\n'.join(result)
     assert 'q_proj' in names
     assert 'v_proj' in names
     assert 'k_proj' not in names
 
 
-def test_get_sam_qv_target_modules_wrong_target_raises():
-    model = _FakeModelWithVisionEncoder(_FakeEncoderWithQV())
+def test_get_sam_qv_target_modules_wrong_target_raises(sam_qv_split):
     with pytest.raises(ValueError):
-        lt.get_sam_qv_target_modules_for_peft(model, 'mask_decoder')
+        lt.get_sam_qv_target_modules_for_peft(sam_qv_split, 'mask_decoder')
 
 
-def test_get_sam_qv_target_modules_no_qv_raises():
-    """模型中没有 q_proj/v_proj 时（只有 qkv 整合层）应抛出 ValueError。"""
-    model = _FakeModelWithVisionEncoder(_FakeEncoderWithQKV())
+def test_get_sam_qv_target_modules_no_qv_raises(sam_base):
+    """真实 SAM 在 qkv 拆分前只有 qkv，没有 q_proj/v_proj，应抛出 ValueError。"""
     with pytest.raises(ValueError, match="q_proj/v_proj"):
-        lt.get_sam_qv_target_modules_for_peft(model, 'vision_encoder')
+        lt.get_sam_qv_target_modules_for_peft(sam_base, 'vision_encoder')
 
 
 # ─── F. create_model_from_type 错误路径 ───────────────────────────

@@ -439,7 +439,6 @@ def _train_one_epoch(model,
 
         # 获取 LoRA-Pro hook（如果存在）
         _raw = getattr(model, 'module', model)  # DDP unwrap
-        _pro_hook = getattr(_raw, '_lorapro_hook', None)
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -448,10 +447,7 @@ def _train_one_epoch(model,
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip
                 )
-            elif _pro_hook is not None:
-                scaler.unscale_(optimizer)
-            if _pro_hook is not None:
-                _pro_hook.replace_gradients()
+
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -460,8 +456,6 @@ def _train_one_epoch(model,
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip
                 )
-            if _pro_hook is not None:
-                _pro_hook.replace_gradients()
             optimizer.step()
 
         # AdaLoRA rank 分配：必须在 optimizer.step() 之后、scheduler.step() 之前调用
@@ -746,7 +740,7 @@ def run_finetune_engine(train_dataloader,
             print("Severstal-specific processing enabled. Calculating offset info.")
 
     history = {
-        "train_loss": [], "train_dice": [], "train_iou": [], "train_hd95": [],
+        "train_loss": [], "train_dice": [], "train_iou": [],
         "val_loss": [], "val_dice": [], "val_iou": [], "val_hd95": [],
         "train_mfu": [],
     }
@@ -788,7 +782,6 @@ def run_finetune_engine(train_dataloader,
         history["train_loss"].append(train_loss)
         history["train_dice"].append(train_dice)
         history["train_iou"].append(train_iou)
-        history["train_hd95"].append(train_hd95)
         history["train_mfu"].append(round(train_mfu * 100, 4) if train_mfu >= 0 else None)
         history["val_loss"].append(val_loss)
         history["val_dice"].append(val_dice)
@@ -798,7 +791,7 @@ def run_finetune_engine(train_dataloader,
         if master_process:
             mfu_str = f"{train_mfu*100:.2f}%" if train_mfu >= 0 else "N/A"
             print(f"Training loss: {train_loss:.4f}, train dice: {train_dice:.4f}, "
-                  f"train iou: {train_iou:.4f}, train hd95: {train_hd95:.4f}, MFU: {mfu_str}")
+                  f"train iou: {train_iou:.4f}, MFU: {mfu_str}")
             for i, param_group in enumerate(optimizer.param_groups):
                 print(f"Current learning rate (param_group {i}): {param_group['lr']:.6e}")
             print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val HD95: {val_hd95:.4f}')
@@ -808,7 +801,6 @@ def run_finetune_engine(train_dataloader,
                 "train/loss": train_loss,
                 "train/dice": train_dice,
                 "train/iou": train_iou,
-                "train/hd95": train_hd95,
                 "val/loss": val_loss,
                 "val/dice": val_dice,
                 "val/iou": val_iou,
@@ -829,7 +821,6 @@ def run_finetune_engine(train_dataloader,
                 "train_loss": train_loss,
                 "train_dice": train_dice,
                 "train_iou": train_iou,
-                "train_hd95": train_hd95,
                 "val_loss": val_loss,
                 "val_dice": val_dice,
                 "val_iou": val_iou,
@@ -859,7 +850,6 @@ def run_finetune_engine(train_dataloader,
                     "best/train_loss": train_loss,
                     "best/train_dice": train_dice,
                     "best/train_iou": train_iou,
-                    "best/train_hd95": train_hd95,
                     "best/val_loss": val_loss,
                     "best/val_dice": val_dice,
                     "best/val_iou": val_iou,
