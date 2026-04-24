@@ -1,3 +1,4 @@
+import os
 import torch
 import math
 import time
@@ -5,6 +6,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import SamModel
 from utils.utils import print_trainable_parameters
+
+
+_SAM_WEIGHT_SPECS = {
+    "sam_base":  ("./HuggingfaceModel/sam_vit_base/model",  "facebook/sam-vit-base"),
+    "sam_large": ("./HuggingfaceModel/sam_vit_large/model", "facebook/sam-vit-large"),
+}
+
+
+def load_sam_pretrained(sam_type: str) -> "SamModel":
+    """按 sam_type 加载 HuggingFace SAM 权重；本地 config.json 不存在则自动从 HF Hub 下载。"""
+    if sam_type not in _SAM_WEIGHT_SPECS:
+        raise ValueError(
+            f"Unknown sam_type: {sam_type!r}. Valid: {list(_SAM_WEIGHT_SPECS)}"
+        )
+    local_dir, repo_id = _SAM_WEIGHT_SPECS[sam_type]
+    if not os.path.exists(os.path.join(local_dir, "config.json")):
+        from huggingface_hub import snapshot_download
+        print(f"[sam_weights] {local_dir} not found, downloading {repo_id} ...")
+        os.makedirs(local_dir, exist_ok=True)
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=local_dir,
+            allow_patterns=["config.json", "*.safetensors"],
+        )
+    return SamModel.from_pretrained(local_dir)
 
 class LoRACore(nn.Module):
     def __init__(self, qkv_layer, enabled, rank=16, lora_alpha=16, dropout_rate=0):
@@ -624,10 +650,7 @@ def get_loradsc_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, add_dsc_
     """
     lora-dsc-选中q,k,v的选定组合进行微调,不选中bias, 不选中output的proj层
     """
-    if sam_type == "sam_base":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    elif sam_type == "sam_large":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
+    hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
     # 冻结某些层
@@ -649,12 +672,7 @@ def get_loradsc_residual_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=F
     残差连接方式: delta = lora_b( lora_a(x) + DSC(lora_a(x)) ) * scale
     当 DSC 不提供有用信息时，残差路径保留纯 LoRA 信号，降低优化难度。
     """
-    if sam_type == "sam_base":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    elif sam_type == "sam_large":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
-    else:
-        raise ValueError(f"Unknown sam_type: {sam_type}")
+    hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
@@ -681,12 +699,9 @@ def get_loradsc_global_only_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft
     SAM ViT-B global_attn_indexes = [2, 5, 8, 11]
     SAM ViT-L global_attn_indexes = [5, 11, 17, 23]
     """
-    if sam_type == "sam_base":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-        global_attn_indexes = {2, 5, 8, 11}
-    elif sam_type == "sam_large":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
-        global_attn_indexes = {5, 11, 17, 23}
+    hgsam_model = load_sam_pretrained(sam_type)
+    _GLOBAL_ATTN_INDEXES = {"sam_base": {2, 5, 8, 11}, "sam_large": {5, 11, 17, 23}}
+    global_attn_indexes = _GLOBAL_ATTN_INDEXES[sam_type]
 
     for name, param in hgsam_model.named_parameters():
         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
@@ -711,12 +726,7 @@ def get_loradsc_gated_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, ad
     """
     Gated LoRA-DSC 版本 SAM。
     """
-    if sam_type == "sam_base":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    elif sam_type == "sam_large":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
-    else:
-        raise ValueError(f"Unknown sam_type: {sam_type}")
+    hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
@@ -745,12 +755,7 @@ def get_loradsc_residual_gated_model(rank, lora_alpha, dropout_rate,
     构建 ResidualGated LoRA-DSC 版本 SAM。
     公式: delta = B(A(x) + gate * DSC(A(x))) * scale，gate_init=0.0
     """
-    if sam_type == "sam_base":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    elif sam_type == "sam_large":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
-    else:
-        raise ValueError(f"Unknown sam_type: {sam_type}")
+    hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") \
@@ -771,12 +776,7 @@ def get_loradsc_adaptive_gated_model(rank, lora_alpha, dropout_rate,
     """
     构建 Channel-wise Adaptive Gated LoRA-DSC 版本 SAM。
     """
-    if sam_type == "sam_base":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    elif sam_type == "sam_large":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
-    else:
-        raise ValueError(f"Unknown sam_type: {sam_type}")
+    hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") \
@@ -799,12 +799,7 @@ def get_loraplus_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=False, ft
     说明：LoRA+ 的核心是优化阶段对 A/B 使用不同学习率。
     模型注入后，请在优化器中调用 LoRASam_Plus.get_loraplus_param_groups。
     """
-    if sam_type == "sam_base":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    elif sam_type == "sam_large":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
-    else:
-        raise ValueError(f"Unknown sam_type: {sam_type}")
+    hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
@@ -828,12 +823,7 @@ def get_loraplus_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=False, ft
 def get_moelora_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_sizes=[3, 5, 7],
                     sam_type="sam_base", expert_type='conv'):
     """MoE-LoRA: 多专家 + 门控路由。expert_type: 'conv' | 'linear' | 'lora_conv'"""
-    if sam_type == "sam_base":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-    elif sam_type == "sam_large":
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_large")
-    else:
-        raise ValueError(f"Unknown sam_type: {sam_type}")
+    hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):

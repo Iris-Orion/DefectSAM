@@ -252,3 +252,154 @@ def test_create_model_from_type_lokr_with_save_custom_lora_raises(monkeypatch):
     args = _make_args(ft_type='lokr_qv_encoder', save_custom_lora=True)
     with pytest.raises(ValueError, match="lokr_qv_encoder"):
         lt.create_model_from_type(args)
+
+
+# ─── G. 注册表覆盖 ──────────────────────────────────────────────────
+
+_EXPECTED_FT_TYPES = {
+    'loradsc_qv', 'lora_attn_qv', 'loradsc_q', 'loradsc_qk', 'loradsc_qkv',
+    'loradsc_qv_residual_gated', 'loradsc_qkv_residual_gated', 'loradsc_q_residual_gated',
+    'loradsc_qv_adaptive', 'loradsc_qkv_adaptive', 'loraplus_qv',
+    'lora_encoder', 'lora_decoder', 'adalora_encoder',
+    'dora_qv_encoder', 'lokr_qv_encoder', 'loha_qv_encoder', 'lokr_encoder',
+    'sam_fully', 'sam_decoder',
+}
+
+
+def test_registry_covers_all_expected_ft_types():
+    got = set(lt._SAM_ARCH_VARIANTS) | set(lt._HF_PEFT_BUILDERS)
+    assert got == _EXPECTED_FT_TYPES
+
+
+def test_registries_are_disjoint():
+    overlap = set(lt._SAM_ARCH_VARIANTS) & set(lt._HF_PEFT_BUILDERS)
+    assert overlap == set(), f"ft_type 同时出现在两张表中: {overlap}"
+
+
+def test_all_sam_arch_variants_pass_sam_type():
+    for name, (_, _, pass_sam_type, _) in lt._SAM_ARCH_VARIANTS.items():
+        assert pass_sam_type is True, f"{name} 应当 pass_sam_type=True"
+
+
+# ─── H. _build_sam_arch_variant dispatcher ───────────────────────────
+
+def test_build_sam_arch_variant_passes_sam_type(monkeypatch):
+    received = {}
+    def fake_factory(**kw):
+        received.update(kw)
+        return 'MODEL'
+    spec = (fake_factory, dict(ft_q=True, ft_k=False, ft_v=True), True, False)
+    args = _make_args(sam_type='sam_large')
+    result = lt._build_sam_arch_variant(args, spec)
+    assert result == 'MODEL'
+    assert received['sam_type'] == 'sam_large'
+    assert received['rank'] == 4
+    assert not hasattr(args, 'use_loraplus_optim') or not args.use_loraplus_optim
+
+
+def test_build_sam_arch_variant_sets_loraplus_optim():
+    def fake_factory(**kw):
+        return 'MODEL'
+    spec = (fake_factory, dict(ft_q=True, ft_k=False, ft_v=True), True, True)
+    args = _make_args()
+    assert not args.use_loraplus_optim
+    lt._build_sam_arch_variant(args, spec)
+    assert args.use_loraplus_optim is True
+
+
+# ─── I. _require_hf_save ────────────────────────────────────────────
+
+def test_require_hf_save_sets_flag():
+    args = _make_args(ft_type='dora_qv_encoder', save_custom_lora=False)
+    lt._require_hf_save(args)
+    assert args.save_hf_format is True
+
+
+def test_require_hf_save_raises_on_conflict():
+    args = _make_args(ft_type='loha_qv_encoder', save_custom_lora=True)
+    with pytest.raises(ValueError, match="loha_qv_encoder"):
+        lt._require_hf_save(args)
+
+
+# ─── J. load_sam_pretrained ─────────────────────────────────────────
+
+from utils.sam_arch import load_sam_pretrained, _SAM_WEIGHT_SPECS
+
+
+def test_load_sam_pretrained_unknown_type_raises():
+    with pytest.raises(ValueError, match="sam_huge"):
+        load_sam_pretrained('sam_huge')
+
+
+def test_load_sam_pretrained_existing_path_skips_download(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
+
+    monkeypatch.setitem(_SAM_WEIGHT_SPECS, 'sam_test',
+                        (str(model_dir), 'fake/repo'))
+
+    sentinel = object()
+    monkeypatch.setattr(lt.SamModel, 'from_pretrained', lambda p: sentinel)
+
+    result = load_sam_pretrained('sam_test')
+    assert result is sentinel
+
+
+def test_load_sam_pretrained_triggers_download_when_missing(monkeypatch, tmp_path):
+    model_dir = tmp_path / "missing_model"
+    monkeypatch.setitem(_SAM_WEIGHT_SPECS, 'sam_test',
+                        (str(model_dir), 'fake/repo'))
+
+    download_calls = []
+    def fake_download(repo_id, local_dir, allow_patterns):
+        download_calls.append((repo_id, local_dir))
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text("{}")
+
+    import utils.sam_arch as sa
+    monkeypatch.setattr(sa, 'snapshot_download', fake_download, raising=False)
+    import builtins
+    _real_import = builtins.__import__
+    def patched_import(name, *a, **kw):
+        if name == 'huggingface_hub':
+            import types
+            mod = types.ModuleType('huggingface_hub')
+            mod.snapshot_download = fake_download
+            return mod
+        return _real_import(name, *a, **kw)
+    monkeypatch.setattr(builtins, '__import__', patched_import)
+
+    sentinel = object()
+    monkeypatch.setattr(lt.SamModel, 'from_pretrained', lambda p: sentinel)
+
+    result = load_sam_pretrained('sam_test')
+    assert result is sentinel
+    assert len(download_calls) == 1
+    assert download_calls[0][0] == 'fake/repo'
+
+
+# ─── K. create_model_from_type HF PEFT 分支走 sam_type ──────────────
+
+def test_create_model_hf_peft_uses_sam_type(monkeypatch):
+    loaded_paths = []
+    fake_model = SamModel(_make_sam_config())
+
+    def track_load(sam_type):
+        loaded_paths.append(sam_type)
+        return fake_model
+
+    monkeypatch.setattr(lt, 'load_sam_pretrained', track_load)
+    args = _make_args(ft_type='sam_fully', sam_type='sam_large')
+    lt.create_model_from_type(args)
+    assert loaded_paths == ['sam_large']
+
+
+def test_create_model_sam_decoder_freezes_encoder(monkeypatch):
+    fake_model = SamModel(_make_sam_config())
+    monkeypatch.setattr(lt, 'load_sam_pretrained', lambda st: fake_model)
+    args = _make_args(ft_type='sam_decoder')
+    result = lt.create_model_from_type(args)
+    for name, param in result.named_parameters():
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
+            assert not param.requires_grad, f"{name} should be frozen"

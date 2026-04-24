@@ -8,7 +8,9 @@ import argparse
 from peft import AdaLoraConfig, LoHaConfig, LoKrConfig, LoraConfig, get_peft_model
 from utils.sam_arch import (get_loradsc_model,
                             get_loradsc_residual_gated_model,
-                            get_loraplus_model)
+                            get_loraplus_model,
+                            get_loradsc_adaptive_gated_model,
+                            load_sam_pretrained)
 from transformers import SamModel
 from utils.utils import print_trainable_parameters
 
@@ -231,179 +233,142 @@ def get_sam_qv_target_modules_for_peft(model, target_part='vision_encoder'):
         raise ValueError("未找到 q_proj/v_proj 目标模块，请先执行 prepare_sam_qkv_for_qv_peft().")
     return target_modules
 
+#   第三个 True/False — pass_sam_type：是否把 args.sam_type 传给工厂函数。True 表示该变体支持 sam_base/sam_large 切换。
+#   第四个 True/False — set_loraplus_optim：是否在调用前强制设置 args.use_loraplus_optim = True（启用 LoRA+ 差异学习率优化器）。
+
+_SAM_ARCH_VARIANTS = {
+    # name: (factory, fixed_kwargs, pass_sam_type, set_loraplus_optim)
+    'loradsc_qv':                 (get_loradsc_model,                dict(ft_q=True, ft_k=False, ft_v=True,  add_dsc_conv=True),                  True,  False),
+    'lora_attn_qv':               (get_loradsc_model,                dict(ft_q=True, ft_k=False, ft_v=True,  add_dsc_conv=False),                 True,  False),
+    'loradsc_q':                  (get_loradsc_model,                dict(ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True),                  True,  False),
+    'loradsc_qk':                 (get_loradsc_model,                dict(ft_q=True, ft_k=True,  ft_v=False, add_dsc_conv=True),                  True,  False),
+    'loradsc_qkv':                (get_loradsc_model,                dict(ft_q=True, ft_k=True,  ft_v=True,  add_dsc_conv=True),                  True,  False),
+    'loradsc_qv_residual_gated':  (get_loradsc_residual_gated_model, dict(ft_q=True, ft_k=False, ft_v=True,  add_dsc_conv=True, gate_init=0.0),  True,  False),
+    'loradsc_qkv_residual_gated': (get_loradsc_residual_gated_model, dict(ft_q=True, ft_k=True,  ft_v=True,  add_dsc_conv=True, gate_init=0.0),  True,  False),
+    'loradsc_q_residual_gated':   (get_loradsc_residual_gated_model, dict(ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True, gate_init=0.0),  True,  False),
+    'loradsc_qv_adaptive':        (get_loradsc_adaptive_gated_model, dict(ft_q=True, ft_k=False, ft_v=True,  add_dsc_conv=True),                  True,  True),
+    'loradsc_qkv_adaptive':       (get_loradsc_adaptive_gated_model, dict(ft_q=True, ft_k=True,  ft_v=True,  add_dsc_conv=True),                  True,  True),
+    'loraplus_qv':                (get_loraplus_model,               dict(ft_q=True, ft_k=False, ft_v=True),                                     True,  True),
+}
+
+
+def _build_sam_arch_variant(args, spec):
+    factory, fixed_kwargs, pass_sam_type, set_loraplus_optim = spec
+    if set_loraplus_optim:
+        args.use_loraplus_optim = True
+    kwargs = dict(
+        rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        dropout_rate=args.lora_dropout,
+        **fixed_kwargs,
+    )
+    if pass_sam_type:
+        kwargs['sam_type'] = args.sam_type
+    return factory(**kwargs)
+
+
+def _require_hf_save(args):
+    if getattr(args, 'save_custom_lora', False):
+        raise ValueError(
+            f"{args.ft_type} only supports Hugging Face PEFT save/load; "
+            "please disable --save_custom_lora."
+        )
+    args.save_hf_format = True
+
+
+def _build_lora_encoder(args, m, _):
+    return get_hf_lora_model(m, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
+                             lora_dropout=args.lora_dropout, target_part='vision_encoder')
+
+
+def _build_lora_decoder(args, m, _):
+    return get_hf_lora_model(m, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
+                             lora_dropout=args.lora_dropout, target_part='mask_decoder')
+
+
+def _build_adalora_encoder(args, m, train_dataloader):
+    if train_dataloader is None:
+        raise ValueError("train_dataloader must be provided for 'adalora_encoder' type.")
+    target_r = args.lora_rank
+    return get_hf_adalora_model(
+        model=m,
+        total_step=args.num_epochs * len(train_dataloader),
+        target_part='vision_encoder',
+        target_r=target_r,
+        init_r=max(int(target_r * 1.5), target_r),
+        lora_alpha=args.lora_alpha,
+    )
+
+
+def _build_dora_qv(args, m, _):
+    _require_hf_save(args)
+    return get_hf_dora_qv_model(m, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
+                                lora_dropout=args.lora_dropout, target_part='vision_encoder')
+
+
+def _build_lokr_qv(args, m, _):
+    _require_hf_save(args)
+    return get_hf_lokr_qv_model(m, lokr_rank=args.lora_rank, lokr_alpha=args.lora_alpha,
+                                rank_dropout=0.0, module_dropout=0.0, target_part='vision_encoder')
+
+
+def _build_loha_qv(args, m, _):
+    _require_hf_save(args)
+    return get_hf_loha_qv_model(m, loha_rank=args.lora_rank, loha_alpha=args.lora_alpha,
+                                rank_dropout=0.0, module_dropout=0.0, target_part='vision_encoder')
+
+
+def _build_lokr(args, m, _):
+    _require_hf_save(args)
+    return get_hf_lokr_model(model=m)
+
+
+def _build_sam_fully(args, m, _):
+    return m
+
+
+def _build_sam_decoder(args, m, _):
+    for name, param in m.named_parameters():
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
+            param.requires_grad_(False)
+    return m
+
+
+_HF_PEFT_BUILDERS = {
+    'lora_encoder':    _build_lora_encoder,
+    'lora_decoder':    _build_lora_decoder,
+    'adalora_encoder': _build_adalora_encoder,
+    'dora_qv_encoder': _build_dora_qv,
+    'lokr_qv_encoder': _build_lokr_qv,
+    'loha_qv_encoder': _build_loha_qv,
+    'lokr_encoder':    _build_lokr,
+    'sam_fully':       _build_sam_fully,
+    'sam_decoder':     _build_sam_decoder,
+}
+
+
 def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoader = None):
     """
     根据给定的模型类型字符串和参数创建一个模型实例。
 
     Args:
-        model_type (str): 模型的类型标识符 (e.g., 'loradsc_qv', 'lora_encoder').
         args (argparse.Namespace): 包含所有超参数的args对象。
         train_dataloader (DataLoader, optional): 仅在需要计算总步数时(如AdaLora)提供。
 
     Returns:
         torch.nn.Module: 创建好的模型实例。
     """
-    lora_rank = args.lora_rank
-    lora_alpha = args.lora_alpha
-    lora_dropout = args.lora_dropout
     model_type = args.ft_type
-    sam_type = args.sam_type
+    print(f"--- Creating model of type: {model_type} with rank: {args.lora_rank} ---")
 
-    print(f"--- Creating model of type: {model_type} with rank: {lora_rank} ---")
+    if model_type in _SAM_ARCH_VARIANTS:
+        return _build_sam_arch_variant(args, _SAM_ARCH_VARIANTS[model_type])
 
-    if model_type == 'loradsc_qv':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, 
-        ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
-    
-    elif model_type == 'lora_attn_qv':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, 
-                                ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=False)
+    if model_type in _HF_PEFT_BUILDERS:
+        hgsam_model = load_sam_pretrained(args.sam_type)
+        return _HF_PEFT_BUILDERS[model_type](args, hgsam_model, train_dataloader)
 
-    elif model_type == 'loradsc_qv_residual_gated':
-        return get_loradsc_residual_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True,
-            gate_init=0.0,
-            sam_type=sam_type)
-
-    elif model_type == 'loradsc_qkv_residual_gated':
-        return get_loradsc_residual_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True,
-            gate_init=0.0,
-            sam_type=sam_type)
-
-    elif model_type == 'loradsc_q_residual_gated':
-        return get_loradsc_residual_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True,
-            gate_init=0.0,
-            sam_type=sam_type)
-
-    elif model_type == 'loradsc_qv_adaptive':
-        args.use_loraplus_optim = True
-        from utils.sam_arch import get_loradsc_adaptive_gated_model
-        return get_loradsc_adaptive_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=False, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
-
-    elif model_type == 'loradsc_qkv_adaptive':
-        args.use_loraplus_optim = True
-        from utils.sam_arch import get_loradsc_adaptive_gated_model
-        return get_loradsc_adaptive_gated_model(
-            rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-            ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True, sam_type=sam_type)
-
-    elif model_type == 'loradsc_q':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=False, ft_v=False, add_dsc_conv=True)
-    
-    elif model_type == 'loradsc_qk':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=True, ft_v=False, add_dsc_conv=True)
-    
-    elif model_type == 'loradsc_qkv':
-        return get_loradsc_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout, ft_q=True, ft_k=True, ft_v=True, add_dsc_conv=True)
-
-    elif model_type == 'loraplus_qv':
-        args.use_loraplus_optim = True  # 强制启用 LoRA+ 优化器
-        return get_loraplus_model(rank=lora_rank, lora_alpha=lora_alpha, dropout_rate=lora_dropout,
-                                    ft_q=True, ft_k=False, ft_v=True, sam_type=sam_type)
-
-    elif model_type in ['lora_encoder', 'lora_decoder', 'adalora_encoder', 'lokr_encoder',
-                        'dora_qv_encoder', 'lokr_qv_encoder', 'loha_qv_encoder', 'sam_fully', 'sam_decoder']:
-        hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
-
-        if model_type == 'adalora_encoder':
-            if train_dataloader is None:
-                raise ValueError("train_dataloader must be provided for 'adalora_encoder' type.")
-            ada_target_r = lora_rank
-            ada_init_r = max(int(ada_target_r * 1.5), ada_target_r)
-            total_step = args.num_epochs * len(train_dataloader)
-            return get_hf_adalora_model(
-                model=hgsam_model,
-                total_step=total_step,
-                target_part='vision_encoder',
-                target_r=ada_target_r,
-                init_r=ada_init_r,
-                lora_alpha=lora_alpha,
-            )
-
-        elif model_type == 'lora_encoder':
-            return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
-                                        lora_dropout=lora_dropout, target_part='vision_encoder')
-
-        elif model_type == 'lora_decoder':
-            return get_hf_lora_model(hgsam_model, lora_rank=lora_rank, lora_alpha=lora_alpha,
-                                        lora_dropout=lora_dropout, target_part='mask_decoder')
-
-        
-        elif model_type == 'dora_qv_encoder':
-            if getattr(args, 'save_custom_lora', False):
-                raise ValueError(
-                    "dora_qv_encoder only supports Hugging Face PEFT save/load; "
-                    "please disable --save_custom_lora."
-                )
-            args.save_hf_format = True
-            return get_hf_dora_qv_model(
-                hgsam_model,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                target_part='vision_encoder',
-            )
-
-        elif model_type == 'lokr_qv_encoder':
-            if getattr(args, 'save_custom_lora', False):
-                raise ValueError(
-                    "lokr_qv_encoder only supports Hugging Face PEFT save/load; "
-                    "please disable --save_custom_lora."
-                )
-            args.save_hf_format = True
-            return get_hf_lokr_qv_model(
-                hgsam_model,
-                lokr_rank=lora_rank,
-                lokr_alpha=lora_alpha,
-                rank_dropout=0.0,
-                module_dropout=0.0,
-                target_part='vision_encoder',
-            )
-
-        elif model_type == 'loha_qv_encoder':
-            if getattr(args, 'save_custom_lora', False):
-                raise ValueError(
-                    "loha_qv_encoder only supports Hugging Face PEFT save/load; "
-                    "please disable --save_custom_lora."
-                )
-            args.save_hf_format = True
-            return get_hf_loha_qv_model(
-                hgsam_model,
-                loha_rank=lora_rank,
-                loha_alpha=lora_alpha,
-                rank_dropout=0.0,
-                module_dropout=0.0,
-                target_part='vision_encoder',
-            )
-
-        elif model_type == 'lokr_encoder':
-            if getattr(args, 'save_custom_lora', False):
-                raise ValueError(
-                    "loha_qv_encoder only supports Hugging Face PEFT save/load; "
-                    "please disable --save_custom_lora."
-                )
-            args.save_hf_format = True
-            return get_hf_lokr_model(model=hgsam_model)
-
-        elif model_type == 'sam_fully':
-            return hgsam_model
-        
-
-        elif model_type == 'sam_decoder':
-            for name, param in hgsam_model.named_parameters():
-                if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
-                    param.requires_grad_(False)
-            return hgsam_model
-            
-    else:
-        raise ValueError(f"Unknown model type: '{model_type}'. Please check your configuration.")
+    raise ValueError(f"Unknown model type: '{model_type}'. Please check your configuration.")
 
 
 

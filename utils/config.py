@@ -62,7 +62,8 @@ def _add_finetune_args(parser):
     parser.add_argument('--zero_shot', action="store_true", help='是否进行zero-shot评估')
 
     # sam模型大小选择
-    parser.add_argument('--sam_type', type=str, default="sam_base", help='sam模型大小选择')
+    parser.add_argument('--sam_type', type=str, default="sam_base",
+                        choices=['sam_base', 'sam_large'], help='sam模型大小选择')
 
     # multimask 消融实验
     parser.add_argument('--multimask', action='store_true',
