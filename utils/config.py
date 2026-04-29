@@ -40,6 +40,7 @@ def _add_finetune_args(parser):
     parser.set_defaults(batch_size=2, num_epochs=50)
 
     parser.add_argument('--warmup_ratio', type=float, default=0.1, help='学习率预热 (warmup) 的比例')
+    parser.add_argument('--no_scheduler', action='store_true', help='禁用学习率调度，使用固定学习率')
 
     # LoRA 相关参数
     parser.add_argument('--lora_rank', type=int, default=16, help='LoRA 的秩 (rank)')

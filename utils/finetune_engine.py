@@ -1,4 +1,16 @@
-# 适配 severstal neu sd900 magnetic_tile flood数据集
+/**
+ * finetune_engine.py
+ *
+ * SAM 参数高效微调（PEFT）通用训练引擎。
+ * 支持单卡 / DDP 多卡、多种 LoRA 变体、torch.compile 加速、
+ * LoRA+ 差异学习率、AdaLoRA 动态秩分配、以及多轮 point-prompt 训练模式。
+ *
+ * 核心设计约束（违反会导致权重加载失败）：
+ * 1. torch.compile 仅包装 vision_encoder；保存/加载前必须先 unwrap。
+ * 2. LoRA-only 保存（save_custom_lora）只存 requires_grad=True 的参数；
+ *    加载时通过 load_lora_state_dict_for_model 做 key 对齐（含 compiled 模型适配）。
+ * 3. DDP 模式下只有 rank0 保存模型，其余 rank 通过 broadcast_object_list 同步路径。
+ */
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -25,8 +37,81 @@ from utils.utils import (compute_dice_score,
                         print_trainable_parameters)
 from utils.mfu import SAMMFUEstimator, MFUTracker
 
-from utils.sam_arch import create_model_for_inference
 from utils.loratask import prepare_sam_qkv_for_qv_peft
+
+
+def _preview_keys(keys, limit: int = 8) -> str:
+    keys = list(keys)
+    suffix = " ..." if len(keys) > limit else ""
+    return f"{keys[:limit]}{suffix}"
+
+
+/**
+ * 将 LoRA-only checkpoint 加载到模型中。
+ *
+ * 关键适配逻辑（torch.compile 导致 state_dict key 名变化）：
+ *   - save_lora_parameters() 保存前会剥离 "_orig_mod." 前缀。
+ *   - 若当前模型的 vision_encoder 仍被 torch.compile 包装，其 state_dict
+ *     期望 "vision_encoder._orig_mod.layers.0..." 形式的 key。
+ *   - 本函数在检测到不匹配时，会自动补回 "_orig_mod." 前缀再尝试匹配。
+ *
+ * validate_trainable=True 时，只会对以下两类不匹配抛异常：
+ *   a) 模型中可训练参数在 checkpoint 里缺失；
+ *   b) checkpoint 中多出 LoRA/gate/shared_image_embedding 相关参数（暗示结构变更）。
+ * 其他无关残留 key（如旧版本冻结参数）会被静默忽略。
+ */
+def load_lora_state_dict_for_model(
+    model: torch.nn.Module,
+    lora_state_dict: dict,
+    strict: bool = False,
+    validate_trainable: bool = True,
+):
+    """
+    Load LoRA-only checkpoints into either normal or torch.compile-wrapped models.
+
+    save_lora_parameters() strips "_orig_mod." before saving. When the current
+    model still has a compiled vision_encoder, its state_dict expects
+    "vision_encoder._orig_mod.*" keys, so adapt those keys before loading.
+    """
+    model_keys = set(model.state_dict().keys())
+    trainable_keys = {name for name, param in model.named_parameters() if param.requires_grad}
+    state_dict_to_load = {}
+
+    for checkpoint_key, value in lora_state_dict.items():
+        key = checkpoint_key.replace("_orig_mod.", "")
+        if key not in model_keys and key.startswith("vision_encoder."):
+            compiled_key = key.replace("vision_encoder.", "vision_encoder._orig_mod.", 1)
+            if compiled_key in model_keys:
+                key = compiled_key
+        state_dict_to_load[key] = value
+
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict_to_load, strict=False)
+    missing_trainable = sorted(key for key in missing_keys if key in trainable_keys)
+    unexpected_trainable = sorted(
+        key for key in unexpected_keys
+        if "lora" in key or "shared_image_embedding" in key or "gate" in key
+    )
+
+    if validate_trainable and (missing_trainable or unexpected_trainable):
+        message = ["LoRA checkpoint 加载未严格对齐。"]
+        if missing_trainable:
+            message.append(
+                f"缺失 {len(missing_trainable)} 个可训练参数: {_preview_keys(missing_trainable)}"
+            )
+        if unexpected_trainable:
+            message.append(
+                f"checkpoint 中有 {len(unexpected_trainable)} 个模型无法匹配的 LoRA 相关参数: {_preview_keys(unexpected_trainable)}"
+            )
+        raise RuntimeError(" ".join(message))
+
+    if strict and (missing_keys or unexpected_keys):
+        raise RuntimeError(
+            "LoRA checkpoint strict=True 加载失败。"
+            f"missing={_preview_keys(missing_keys)}, "
+            f"unexpected={_preview_keys(unexpected_keys)}"
+        )
+    return missing_keys, unexpected_keys
+
 
 def debug_print_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None:
     """
@@ -48,12 +133,21 @@ def debug_print_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None
     print(f"Total params in optimizer groups: {total_params:,}")
     print("===========================================\n")
 
+/**
+ * HF PEFT adapter 加载前的基座预处理。
+ * 某些 ft_type（如 dora_qv_encoder）在训练前会把原生 qkv 拆分为独立 q/k/v Linear；
+ * 加载 adapter 前必须对 fresh base_model 做同样的拆分，否则 key 无法对齐。
+ */
 def prepare_base_model_for_hf_adapter_loading(base_model: SamModel, ft_type: str):
-    """在加载 HF PEFT adapter 前，对需要的基座结构做与训练期一致的预处理。"""
     if ft_type in ['dora_qv_encoder', 'lokr_qv_encoder', 'loha_qv_encoder']:
         return prepare_sam_qkv_for_qv_peft(base_model, target_part='vision_encoder')
     return base_model
 
+/**
+ * 将 letterbox 后的单通道 mask 恢复到原始尺寸。
+ * 流程：先按 letterbox 的 padding offset 裁掉黑边，再 interpolate 回原始分辨率。
+ * 注意：OpenCV resize 参数是 (width, height)。
+ */
 def reverse_letterbox_1ch(input: np.ndarray, orig_size: tuple, target_size: tuple = (1024, 1024)) -> np.ndarray:
     """
     参数:
@@ -79,6 +173,13 @@ def reverse_letterbox_1ch(input: np.ndarray, orig_size: tuple, target_size: tupl
 
     return restored_mask
 
+/**
+ * 预计算 Severstal 数据集的 letterbox ↔ 低分辨率 mask (256×256) 空间映射坐标。
+ * 
+ * Severstal 原始图尺寸为 256×1600，经 letterbox 到 1024×1024 后送入 SAM；
+ * SAM mask_decoder 输出固定 256×256。本函数计算在 256×256 空间内需要保留的
+ * 有效区域坐标，用于 _process_batch_severstal 中的 crop + interpolate。
+ */
 def severstal_get_offset():
     """
     对每张 mask 应用 reverse letterbox (PyTorch 版本)
@@ -98,6 +199,10 @@ def severstal_get_offset():
     crop_x_end = int((x_offset + new_w) * (pred_w / target_w))
     return (crop_y_start, crop_x_start, crop_y_end, crop_x_end)
 
+/**
+ * 从 SAM multimask_output 的 3 个候选 mask 中，选择 model 预测 IoU 最高的那个。
+ * 输入 shape 兼容 squeeze point_batch 前后的两种形式。
+ */
 def _select_best_mask(pred_masks, iou_scores):
     """从 multimask 输出中选取 model 预测 IoU 最高的 mask。
     Args:
@@ -116,6 +221,17 @@ def _select_best_mask(pred_masks, iou_scores):
     return selected.unsqueeze(1)  # [B, 1, H, W]
 
 
+/**
+ * Severstal 数据集专用 batch 处理。
+ *
+ * 尺寸流转（以典型输入 256×1600 为例）：
+ *   1. image 经 dataloader letterbox → 1024×1024 送入 SAM encoder；
+ *   2. SAM decoder 输出 pred_masks → 256×256；
+ *   3. 在 256×256 空间 crop 掉 letterbox 引入的黑边（用 severstal_get_offset 坐标）；
+ *   4. interpolate 回 256×1600 原始尺寸，再与 ground_truth_masks 计算 loss。
+ *
+ * 若不执行 3/4 步，loss 会把黑边 padding 区域也算进去，导致梯度污染。
+ */
 def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None, multimask=False):
     """
     处理severstal数据集单个批次的数据，执行前向传播和损失计算。
@@ -152,6 +268,12 @@ def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = 
         loss = loss_fn(predicted_masks_256_1600, ground_truth_masks)
     return loss, predicted_masks_256_1600, ground_truth_masks
 
+/**
+ * 通用 batch 处理（sd900 / NEU / Magnetic-Tile 等）。
+ *
+ * 与 severstal 不同：这些数据集原始尺寸接近正方形，letterbox 黑边很小；
+ * 直接在 256×256 低分辨率空间计算 loss（GT 下采样到 256×256），避免高分辨率 interpolate 的显存开销。
+ */
 def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None, multimask=False):
     """
     处理单个批次的数据，执行前向传播和损失计算。
@@ -658,7 +780,10 @@ def run_finetune_engine(train_dataloader,
 
     total_steps = len(train_dataloader) * num_epochs
     warmup_steps = int(warmup_ratio * total_steps)
-    cosine_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps)
+    if hyperparameters.get('no_scheduler', False):
+        cosine_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    else:
+        cosine_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps)
 
     sam_type = hyperparameters.get('sam_type', 'sam_base')
     mfu_estimator = SAMMFUEstimator(sam_type=sam_type, gpu_type='rtx5090')
@@ -692,7 +817,9 @@ def run_finetune_engine(train_dataloader,
                 _compiled_ve = torch.compile(_orig_ve, mode='default')
                 _peft_inner.vision_encoder = _compiled_ve
             else:
-                raw_model.vision_encoder = torch.compile(raw_model.vision_encoder, mode='default')
+                _orig_ve = raw_model.vision_encoder
+                _compiled_ve = torch.compile(_orig_ve, mode='default')
+                raw_model.vision_encoder = _compiled_ve
             compile_status_msg = f"torch.compile 已启用 ({'DDP + ' if ddp else ''}仅 vision_encoder, mode='default')"
         except Exception as e:
             compile_status_msg = f"torch.compile 不可用，跳过: {e}"
@@ -829,7 +956,10 @@ def run_finetune_engine(train_dataloader,
             if master_process:
                 print(f"验证 dice 改善到 {best_val_dicescore:.4f}, 保存模型...")
                 if _compiled_ve is not None:
-                    _peft_inner.vision_encoder = _orig_ve
+                    if _compile_is_peft:
+                        _peft_inner.vision_encoder = _orig_ve
+                    else:
+                        raw_model.vision_encoder = _orig_ve
                 best_model_path = save_model(
                     hyperparameters=hyperparameters,
                     start_timestamp=start_timestamp,
@@ -843,7 +973,10 @@ def run_finetune_engine(train_dataloader,
                     save_lora_only=save_lora_only,
                 )
                 if _compiled_ve is not None:
-                    _peft_inner.vision_encoder = _compiled_ve
+                    if _compile_is_peft:
+                        _peft_inner.vision_encoder = _compiled_ve
+                    else:
+                        raw_model.vision_encoder = _compiled_ve
             if swanlab_run:
                 swanlab.log({
                     "best_epoch": best_epoch,
@@ -888,6 +1021,15 @@ def run_finetune_engine(train_dataloader,
         dist.broadcast_object_list(best_model_path_holder, src=0)
         best_model_path = best_model_path_holder[0]
 
+    # 加载权重前恢复未 compile 的 vision_encoder，避免 key 不匹配
+    if _compiled_ve is not None:
+        if _compile_is_peft:
+            _peft_inner.vision_encoder = _orig_ve
+        else:
+            raw_model.vision_encoder = _orig_ve
+        if master_process:
+            print("加载权重前已恢复原始 vision_encoder（解除 torch.compile）。")
+
     if not best_model_path:
         if master_process:
             print("Warning: No best model was saved. Final evaluation will be on the last state of the model.")
@@ -907,11 +1049,19 @@ def run_finetune_engine(train_dataloader,
                 raise RuntimeError(f"Failed to load Hugging Face PEFT model from {best_model_path}") from e
         elif save_lora_only:
             lora_state_dict = torch.load(best_model_path, map_location=device)
-            raw_model.load_state_dict(lora_state_dict, strict=False)
+            load_lora_state_dict_for_model(raw_model, lora_state_dict, strict=False)
             loaded_model = raw_model
         else:
             checkpoint = torch.load(best_model_path, map_location=device)
-            raw_model.load_state_dict(checkpoint['model_state_dict'])
+            try:
+                raw_model.load_state_dict(checkpoint['model_state_dict'])
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Failed to load full checkpoint from {best_model_path}. "
+                    f"If the checkpoint was saved without torch.compile but the current model has a compiled vision_encoder, "
+                    f"this is likely due to state_dict key mismatch (missing vision_encoder._orig_mod. prefix). "
+                    f"Original error: {e}"
+                ) from e
             loaded_model = raw_model
 
     loaded_model.eval()
@@ -1012,14 +1162,31 @@ def inference_engine(model, args, best_model_path,
                 loaded_model = PeftModel.from_pretrained(base_model, best_model_path)       # 从保存的路径加载 PeftModel
                 print("Successfully loaded model in Hugging Face PEFT format.")
             except Exception as e:
-                print(f"Error loading Hugging Face PEFT model: {e}")
-                loaded_model = None            # 加载失败
+                raise RuntimeError(f"Failed to load Hugging Face PEFT model from {best_model_path}") from e
     elif save_lora_only:
-        loaded_model = create_model_for_inference(model=model, lora_weights_path=best_model_path, device=device)
-    
+        lora_state_dict = torch.load(best_model_path, map_location=device)
+        load_lora_state_dict_for_model(model, lora_state_dict, strict=False)
+        loaded_model = model.to(device)
+        loaded_model.eval()
+
     else:
         checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # 若 model 的 vision_encoder 被 torch.compile 包装，先 unwrap 再加载
+        _compiled_ve_infer = None
+        if hasattr(model.vision_encoder, '_orig_mod'):
+            _compiled_ve_infer = model.vision_encoder
+            model.vision_encoder = model.vision_encoder._orig_mod
+        try:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        except RuntimeError as e:
+            if _compiled_ve_infer is not None:
+                model.vision_encoder = _compiled_ve_infer
+            raise RuntimeError(
+                f"Failed to load full checkpoint from {best_model_path}. "
+                f"If the checkpoint was saved without torch.compile but the current model has a compiled vision_encoder, "
+                f"this is likely due to state_dict key mismatch (missing vision_encoder._orig_mod. prefix). "
+                f"Original error: {e}"
+            ) from e
         loaded_model = model
         loaded_model.to(device)
         print("Successfully loaded model from standard PyTorch checkpoint.")
