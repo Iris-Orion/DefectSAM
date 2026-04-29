@@ -1057,6 +1057,43 @@ def measure_inference_time(model, input_tensor, num_runs=10):
     avg_time = (end_time - start_time) / num_runs
     return avg_time
 
+def _preview_keys(keys, limit: int = 8) -> str:
+    keys = list(keys)
+    suffix = " ..." if len(keys) > limit else ""
+    return f"{keys[:limit]}{suffix}"
+
+
+def _load_lora_state_dict_strict_for_inference(model: nn.Module, lora_state_dict: dict):
+    model_keys = set(model.state_dict().keys())
+    trainable_keys = {name for name, param in model.named_parameters() if param.requires_grad}
+    state_dict_to_load = {}
+
+    for checkpoint_key, value in lora_state_dict.items():
+        key = checkpoint_key.replace("_orig_mod.", "")
+        if key not in model_keys and key.startswith("vision_encoder."):
+            compiled_key = key.replace("vision_encoder.", "vision_encoder._orig_mod.", 1)
+            if compiled_key in model_keys:
+                key = compiled_key
+        state_dict_to_load[key] = value
+
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict_to_load, strict=False)
+    missing_trainable = sorted(key for key in missing_keys if key in trainable_keys)
+    unexpected_keys = sorted(unexpected_keys)
+
+    if missing_trainable or unexpected_keys:
+        message = ["LoRA checkpoint 加载未严格对齐。"]
+        if missing_trainable:
+            message.append(
+                f"缺失 {len(missing_trainable)} 个可训练参数: {_preview_keys(missing_trainable)}"
+            )
+        if unexpected_keys:
+            message.append(
+                f"checkpoint 中有 {len(unexpected_keys)} 个模型无法匹配的参数: {_preview_keys(unexpected_keys)}"
+            )
+        raise RuntimeError(" ".join(message))
+    return missing_keys, unexpected_keys
+
+
 def create_model_for_inference(model, lora_weights_path: str, device: str = "cpu") -> SamModel:
     """
     一步到位创建用于推理的、加载了LoRA权重的SAM模型。
@@ -1069,25 +1106,17 @@ def create_model_for_inference(model, lora_weights_path: str, device: str = "cpu
     print("--- 开始构建推理模型 ---")
     print(f"从 '{lora_weights_path}' 加载微调后的LoRA权重...")
     try:
-        # 加载只包含LoRA参数的state_dict
         lora_state_dict = torch.load(lora_weights_path, map_location=torch.device(device))
-        # compile后保存的权重有_orig_mod
-        lora_state_dict = {k.replace('_orig_mod.', ''): v for k, v in lora_state_dict.items()}
-
-        # 使用 strict=False 将LoRA权重加载到模型中
-        # 这会填充 lora_a_q, lora_b_q 等参数，同时忽略文件中不存在的基础模型参数
-        missing_keys, unexpected_keys = model.load_state_dict(lora_state_dict, strict=False)
+        missing_keys, unexpected_keys = _load_lora_state_dict_strict_for_inference(model, lora_state_dict)
         
         print("LoRA权重加载成功！")
-        if unexpected_keys:
-             print(f"警告: 权重文件中有多余的键: {unexpected_keys}")
         # `missing_keys` 会列出所有基础模型的参数，这是正常现象
         # print(f"  - {len(missing_keys)} 个基础模型参数被正确忽略。")
 
     except FileNotFoundError:
-        print(f"  - 错误: 找不到LoRA权重文件: {lora_weights_path}。模型将使用随机初始化的LoRA权重。")
+        raise FileNotFoundError(f"LoRA 权重文件不存在: {lora_weights_path}")
     except Exception as e:
-        print(f"  - 错误: 加载LoRA权重时发生错误: {e}")
+        raise RuntimeError(f"加载 LoRA 权重失败: {e}") from e
 
     model.to(device)
     model.eval()
