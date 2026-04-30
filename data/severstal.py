@@ -184,10 +184,14 @@ def traindf_preprocess( split_seed: int = 42,
 
     return train_df, val_df, test_df
 
-def get_bounding_box(ground_truth_map, perturb=True):
+def get_bounding_box(ground_truth_map, perturb=True, perturb_px=None):
     """
     从ground_truth中获得bbox
     TODO: severstal数据集的ground_truth_map不是合并的, 根据(4, 256, 1600)判断每个channel中的box
+    
+    Args:
+        perturb: 是否启用随机perturb（训练时使用）
+        perturb_px: 固定外扩像素数（验证/测试时使用）。若不为None，则忽略perturb参数，使用固定外扩。
     """
     if torch.sum(ground_truth_map)== 0:
         bbox = [0, 0, 0, 0]
@@ -197,7 +201,14 @@ def get_bounding_box(ground_truth_map, perturb=True):
         y_min, y_max = np.min(y_indices), np.max(y_indices)
 
         H, W = ground_truth_map.shape
-        if perturb:
+        if perturb_px is not None:
+            # 固定外扩模式（val/test）
+            x_min = max(0, x_min - perturb_px)
+            x_max = min(W, x_max + perturb_px)
+            y_min = max(0, y_min - perturb_px)
+            y_max = min(H, y_max + perturb_px)
+        elif perturb:
+            # 随机perturb模式（train）
             x_min = max(0, x_min - np.random.randint(0, 20))
             x_max = min(W, x_max + np.random.randint(0, 20))
             y_min = max(0, y_min - np.random.randint(0, 20))
@@ -248,11 +259,12 @@ class SteelDataset_WithBoxPrompt(Dataset):
     3. 保留增强后的(256, 1600)掩码作为Ground Truth，用于计算损失。
     4. 返回逆向letterbox所需的元数据。
     """
-    def __init__(self, df, data_path, transforms: transforms.Compose, is_train=True):
+    def __init__(self, df, data_path, transforms: transforms.Compose, is_train=True, perturb_px=None):
         self.df = df
         self.root = data_path
         self.transforms = transforms
         self.is_train = is_train
+        self.perturb_px = perturb_px
         self.fnames = self.df['ImageId'].unique()
     
     def preprocess(self, original_image: torch.Tensor):
@@ -369,7 +381,7 @@ class SteelDataset_WithBoxPrompt(Dataset):
     
         # combined_letterboxed_mask = torch.sum(letterboxed_mask_tensor, dim=0)
 
-        bbox = get_bounding_box(letterboxed_mask_tensor.squeeze(), perturb=self.is_train)
+        bbox = get_bounding_box(letterboxed_mask_tensor.squeeze(), perturb=self.is_train, perturb_px=self.perturb_px)
         bbox_tensor = torch.tensor(bbox, dtype=torch.float32)           # torch.tensor([x_min, y_min, x_max, y_max]): size=(4)
 
         # 返回图像, mask, image_id，以及boxes作为prompt
