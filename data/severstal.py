@@ -395,6 +395,59 @@ class SteelDataset_WithBoxPrompt(Dataset):
     def __len__(self):
         return len(self.fnames)
 
+
+class SteelDataset_WithBoxPromptResizeInfer(SteelDataset_WithBoxPrompt):
+    """
+    Severstal 推理专用数据集:
+    1. 原始图像和合并后的二值 mask 均从 (256, 1600) resize 到 (1024, 1024)。
+    2. box prompt 在 resize 后的 mask 空间生成。
+    3. 原始 (256, 1600) mask 仍作为 GT 返回，用于最终指标计算。
+    """
+    def __init__(self, df, data_path, transforms: transforms.Compose = None, is_train=False, perturb_px=None):
+        super().__init__(df=df, data_path=data_path, transforms=transforms, is_train=is_train, perturb_px=perturb_px)
+        self.resize_transform = A.Compose([
+            A.Resize(
+                height=1024,
+                width=1024,
+                interpolation=cv2.INTER_CUBIC,
+            )
+        ])
+
+    def __getitem__(self, idx):
+        image_id = self.fnames[idx]
+        original_mask_4ch = rle2mask(image_id, self.df)
+        original_mask_1ch = np.sum(original_mask_4ch, axis=2, keepdims=True)
+        original_mask_1ch = (original_mask_1ch > 0).astype(np.uint8)
+
+        image_path = os.path.join(self.root, "train_images", image_id)
+        original_img_np = np.array(Image.open(image_path).convert("RGB"))
+
+        if self.transforms is not None:
+            augmented = self.transforms(image=original_img_np, mask=original_mask_1ch)
+            original_img_np = augmented["image"]
+            original_mask_1ch = augmented["mask"]
+
+        resized = self.resize_transform(image=original_img_np, mask=original_mask_1ch)
+        resized_img_np = resized["image"]
+        resized_mask_np = resized["mask"]
+        if resized_mask_np.ndim == 2:
+            resized_mask_np = np.expand_dims(resized_mask_np, axis=-1)
+
+        model_input_tensor = torch.from_numpy(resized_img_np).permute(2, 0, 1).float() / 255.0
+        gt_mask_tensor = torch.from_numpy(original_mask_1ch).permute(2, 0, 1).float()
+        resized_mask_tensor = torch.from_numpy(resized_mask_np).permute(2, 0, 1).float()
+
+        bbox = get_bounding_box(resized_mask_tensor.squeeze(), perturb=self.is_train, perturb_px=self.perturb_px)
+        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
+
+        return {
+            "image": model_input_tensor,
+            "mask": gt_mask_tensor.squeeze(),
+            "resized_mask": resized_mask_tensor.squeeze(),
+            "image_id": image_id,
+            "bbox": bbox_tensor,
+        }
+
 def create_datasets_no_prompt(train_df, val_df, test_df, data_path, train_transform, val_transform):
     '''
     创建不返回box prompt的severstal数据集, 供不需prompt的baseline使用
@@ -570,5 +623,3 @@ def reverse_letterbox_mask_1ch(mask_letterbox: np.ndarray, orig_size: tuple, tar
     restored_mask = cv2.resize(mask_cropped, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
 
     return restored_mask
-
-

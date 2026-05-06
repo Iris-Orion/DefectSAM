@@ -215,6 +215,36 @@ def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = 
     return loss, predicted_masks_256_1600, ground_truth_masks
 
 
+def _process_batch_severstal_resize_infer(batch, model, loss_fn, device, use_amp, auto_seg=False, offset_info=None, multimask=False):
+    """
+    Severstal resize 推理评估:
+    输入图像已直接 resize 到 1024x1024，没有 letterbox padding，因此 SAM 的 256x256 logits
+    直接插值回原始 256x1600 尺寸，与原始 GT 计算指标。
+    """
+    images = batch["image"].to(device)
+    ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)
+    if auto_seg:
+        bboxes = None
+    else:
+        bboxes = batch["bbox"].unsqueeze(1).to(device)
+
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+        outputs = model(pixel_values=images, input_boxes=bboxes, multimask_output=multimask)
+        if multimask:
+            predicted_masks = _select_best_mask(outputs.pred_masks, outputs.iou_scores)
+        else:
+            predicted_masks = outputs.pred_masks.squeeze(1)
+
+        predicted_masks_256_1600 = F.interpolate(
+            predicted_masks,
+            size=(256, 1600),
+            mode="bilinear",
+            align_corners=False,
+        )
+        loss = loss_fn(predicted_masks_256_1600, ground_truth_masks)
+    return loss, predicted_masks_256_1600, ground_truth_masks
+
+
 def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None, multimask=False):
     """
     处理单个批次的数据，执行前向传播和损失计算。
@@ -1086,7 +1116,8 @@ def inference_engine(model, args, best_model_path,
                      train_dataloader, val_dataloader, test_dataloader, 
                      process_batch_fn, loss_fn, scaler, device, 
                      results_filename="evaluation_results.txt",
-                     auto_seg: bool = False, eval_traindataset = False):
+                     auto_seg: bool = False, eval_traindataset = False,
+                     eval_valdataset: bool = True):
     """
     纯推理, 加bbox和不加bbox?
     """
@@ -1142,9 +1173,11 @@ def inference_engine(model, args, best_model_path,
     # test_results = evaluate_all_metrics_profiler(loaded_model, test_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
     test_results = evaluate_all_metrics(loaded_model, test_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
-    print("\n--- Evaluating on Validation Set ---")
-    # val_results = evaluate_all_metrics_profiler(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
-    val_results = evaluate_all_metrics(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
+    val_results = None
+    if eval_valdataset:
+        print("\n--- Evaluating on Validation Set ---")
+        # val_results = evaluate_all_metrics_profiler(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
+        val_results = evaluate_all_metrics(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
     train_results = None
     if eval_traindataset:
@@ -1156,7 +1189,8 @@ def inference_engine(model, args, best_model_path,
     print("\n--- Summary of Results ---")
     if eval_traindataset:
         print(f"Training Set:   Dice={train_results['dice']:.4f}, IoU={train_results['iou']:.4f}, HD95={train_results['hd95']:.4f}")
-    print(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}")
+    if eval_valdataset:
+        print(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}")
     print(f"Test Set:     Dice={test_results['dice']:.4f}, IoU={test_results['iou']:.4f}, HD95={test_results['hd95']:.4f}")
 
     # --- 将路径和结果保存到TXT文件 ---
@@ -1169,7 +1203,8 @@ def inference_engine(model, args, best_model_path,
             f.write("\n--- Evaluation Metrics ---\n")
             if train_results:
                 f.write(f"Training Set:   Dice={train_results['dice']:.4f}, IoU={train_results['iou']:.4f}, HD95={train_results['hd95']:.4f}\n")
-            f.write(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}\n")
+            if val_results:
+                f.write(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}\n")
             f.write(f"Test Set:     Dice={test_results['dice']:.4f}, IoU={test_results['iou']:.4f}, HD95={test_results['hd95']:.4f}\n")
             f.write("="*50 + "\n\n")
         print("Results successfully saved.")
@@ -1186,7 +1221,8 @@ def zero_shot(model_path,
                      train_dataloader, val_dataloader, test_dataloader, 
                      process_batch_fn, loss_fn, device, 
                      results_filename="evaluation_results.txt",
-                     auto_seg: bool = False, eval_traindataset = False):
+                     auto_seg: bool = False, eval_traindataset = False,
+                     eval_valdataset: bool = True):
     loaded_model = SamModel.from_pretrained(model_path).to(device)
 
     offset_info = None
@@ -1199,9 +1235,11 @@ def zero_shot(model_path,
     # test_results = evaluate_all_metrics_profiler(loaded_model, test_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
     test_results = evaluate_all_metrics(loaded_model, test_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
-    print("\n--- Evaluating on Validation Set ---")
-    # val_results = evaluate_all_metrics_profiler(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
-    val_results = evaluate_all_metrics(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
+    val_results = None
+    if eval_valdataset:
+        print("\n--- Evaluating on Validation Set ---")
+        # val_results = evaluate_all_metrics_profiler(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
+        val_results = evaluate_all_metrics(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
     train_results = None
     if eval_traindataset:
@@ -1213,7 +1251,8 @@ def zero_shot(model_path,
     print("\n--- Summary of Results ---")
     if eval_traindataset:
         print(f"Training Set:   Dice={train_results['dice']:.4f}, IoU={train_results['iou']:.4f}, HD95={train_results['hd95']:.4f}")
-    print(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}")
+    if eval_valdataset:
+        print(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}")
     print(f"Test Set:     Dice={test_results['dice']:.4f}, IoU={test_results['iou']:.4f}, HD95={test_results['hd95']:.4f}")
 
     # --- 将路径和结果保存到TXT文件 ---
@@ -1226,7 +1265,8 @@ def zero_shot(model_path,
             f.write("\n--- Evaluation Metrics ---\n")
             if train_results:
                 f.write(f"Training Set:   Dice={train_results['dice']:.4f}, IoU={train_results['iou']:.4f}, HD95={train_results['hd95']:.4f}\n")
-            f.write(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}\n")
+            if val_results:
+                f.write(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}\n")
             f.write(f"Test Set:     Dice={test_results['dice']:.4f}, IoU={test_results['iou']:.4f}, HD95={test_results['hd95']:.4f}\n")
             f.write("="*50 + "\n\n")
         print("Results successfully saved.")
