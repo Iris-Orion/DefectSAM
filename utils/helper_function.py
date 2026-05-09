@@ -55,6 +55,27 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, eta_min_ratio=0.1):
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+def use_eager_attn_for_compat():
+    """
+    兼容 transformers 4.47.0 训练权重的推理补丁。
+
+    5.5.0 起 SamModel.from_pretrained 默认使用 sdpa attention，
+    与 4.47.0 eager 实现存在 ~0.002 dice 系统偏差。
+    在评估 4.47.0 旧权重的推理脚本顶部调用，确保与训练时 attention 实现一致。
+    可重复调用，第二次起为空操作。
+    """
+    from transformers import SamModel
+    # 幂等保护：避免多次调用时重复 patch
+    if getattr(SamModel.from_pretrained, '_eager_compat_patched', False):
+        return
+    _orig = SamModel.from_pretrained
+    def _patched(pretrained_model_name_or_path, *args, **kwargs):
+        kwargs.setdefault("attn_implementation", "eager")
+        return _orig(pretrained_model_name_or_path, *args, **kwargs)
+    _patched._eager_compat_patched = True
+    SamModel.from_pretrained = _patched
+
+
 def get_bounding_box(ground_truth_map, perturb=True, perturb_range=20):
     """
     从ground_truth中获得bbox。

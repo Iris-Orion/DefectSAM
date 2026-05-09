@@ -111,6 +111,35 @@ def get_severstal_ft_args():
     parser = argparse.ArgumentParser(description='Severstal数据集微调模型的参数配置')
     parser = add_common_ft_args(parser)
     _add_severstal_args(parser)
+    parser.add_argument(
+        '--severstal_infer_preprocess',
+        type=str,
+        default='letterbox',
+        choices=['letterbox', 'resize'],
+        help='Severstal 推理评估预处理方式: letterbox=保持训练时逻辑, resize=Albumentations Resize 到 1024x1024 后推理'
+    )
+    parser.add_argument(
+        '--single_weight_path',
+        type=str,
+        default=None,
+        help='Severstal 推理模式下只评估一个指定权重路径'
+    )
+    parser.add_argument(
+        '--single_weight_json',
+        type=str,
+        default=None,
+        help='single_weight_path 对应的训练记录 JSON，用于校验/补全 ft_type、rank、alpha 和保存格式'
+    )
+    parser.add_argument(
+        '--severstal_eval_val',
+        action='store_true',
+        help='Severstal infer_mode/zero_shot 时额外评估验证集；默认只评估测试集'
+    )
+    parser.add_argument(
+        '--severstal_eval_train',
+        action='store_true',
+        help='Severstal infer_mode/zero_shot 时额外评估训练集；默认只评估测试集'
+    )
     args = parser.parse_args()
     return args
 

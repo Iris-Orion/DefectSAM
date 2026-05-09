@@ -60,7 +60,21 @@ def load_lora_state_dict_for_model(
         state_dict_to_load[key] = value
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict_to_load, strict=False)
-    missing_trainable = sorted(key for key in missing_keys if key in trainable_keys)
+
+    # transformers 版本升级后 shared_image_embedding 可能变为可训练参数，
+    # 但旧 checkpoint 未保存它，属版本差异而非 LoRA 对齐问题，降级为警告。
+    compat_missing = sorted(
+        key for key in missing_keys
+        if key in trainable_keys and "shared_image_embedding" in key
+    )
+    if compat_missing:
+        print(
+            f"[WARN] load_lora_state_dict: checkpoint 缺少以下参数（transformers 版本差异，已跳过）: {compat_missing}"
+        )
+    missing_trainable = sorted(
+        key for key in missing_keys
+        if key in trainable_keys and key not in compat_missing
+    )
     unexpected_trainable = sorted(
         key for key in unexpected_keys
         if "lora" in key or "shared_image_embedding" in key or "gate" in key

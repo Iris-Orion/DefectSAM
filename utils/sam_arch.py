@@ -654,7 +654,7 @@ def get_loradsc_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, add_dsc_
 
     for name, param in hgsam_model.named_parameters():
     # 冻结某些层
-        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder") or name.startswith("shared_image_embedding"):
             param.requires_grad_(False)
     for layers in hgsam_model.vision_encoder.layers:
         # lora_alpha 默认应该等于 rank
@@ -675,7 +675,7 @@ def get_loradsc_residual_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=F
     hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
-        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder") or name.startswith("shared_image_embedding"):
             param.requires_grad_(False)
 
     for layers in hgsam_model.vision_encoder.layers:
@@ -704,7 +704,7 @@ def get_loradsc_global_only_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft
     global_attn_indexes = _GLOBAL_ATTN_INDEXES[sam_type]
 
     for name, param in hgsam_model.named_parameters():
-        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder") or name.startswith("shared_image_embedding"):
             param.requires_grad_(False)
 
     for i, layers in enumerate(hgsam_model.vision_encoder.layers):
@@ -729,7 +729,7 @@ def get_loradsc_gated_model(rank, lora_alpha, dropout_rate, ft_q, ft_k, ft_v, ad
     hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
-        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder") or name.startswith("shared_image_embedding"):
             param.requires_grad_(False)
 
     for layers in hgsam_model.vision_encoder.layers:
@@ -759,7 +759,7 @@ def get_loradsc_residual_gated_model(rank, lora_alpha, dropout_rate,
 
     for name, param in hgsam_model.named_parameters():
         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") \
-                or name.startswith("mask_decoder"):
+                or name.startswith("mask_decoder") or name.startswith("shared_image_embedding"):
             param.requires_grad_(False)
 
     for layers in hgsam_model.vision_encoder.layers:
@@ -780,7 +780,7 @@ def get_loradsc_adaptive_gated_model(rank, lora_alpha, dropout_rate,
 
     for name, param in hgsam_model.named_parameters():
         if name.startswith("vision_encoder") or name.startswith("prompt_encoder") \
-                or name.startswith("mask_decoder"):
+                or name.startswith("mask_decoder") or name.startswith("shared_image_embedding"):
             param.requires_grad_(False)
 
     for layers in hgsam_model.vision_encoder.layers:
@@ -802,7 +802,7 @@ def get_loraplus_model(rank, lora_alpha, dropout_rate, ft_q=True, ft_k=False, ft
     hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
-        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder") or name.startswith("shared_image_embedding"):
             param.requires_grad_(False)
 
     for layers in hgsam_model.vision_encoder.layers:
@@ -826,7 +826,7 @@ def get_moelora_model(rank, lora_alpha, dropout_rate, num_experts=3, kernel_size
     hgsam_model = load_sam_pretrained(sam_type)
 
     for name, param in hgsam_model.named_parameters():
-        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder"):
+        if name.startswith("vision_encoder") or name.startswith("prompt_encoder") or name.startswith("mask_decoder") or name.startswith("shared_image_embedding"):
             param.requires_grad_(False)
     for layers in hgsam_model.vision_encoder.layers:
         layers.attn.qkv = LoRA_Moe_DepwiseConv_Samqv(
