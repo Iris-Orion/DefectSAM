@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from albumentations.pytorch import ToTensorV2
 from typing import List, Tuple, Dict
 from sklearn.model_selection import train_test_split
+from data.common_ops import debug_dataset_info
 
 
 def _empty_mask() -> np.ndarray:
@@ -623,3 +624,7 @@ def reverse_letterbox_mask_1ch(mask_letterbox: np.ndarray, orig_size: tuple, tar
     restored_mask = cv2.resize(mask_cropped, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
 
     return restored_mask
+
+if __name__ == "__main__":
+    a, b, c = create_dataset_with_prompt(include_no_defect=False)
+    debug_dataset_info(a, b, c)

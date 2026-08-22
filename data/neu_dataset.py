@@ -10,7 +10,7 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, Subset
 
-from data.common_ops import build_binary_mask, build_stratify_keys, letterbox_image_np, letterbox_mask_np
+from data.common_ops import build_binary_mask, build_stratify_keys, letterbox_image_np, letterbox_mask_np, debug_dataset_info
 from utils.helper_function import get_bounding_box
 
 
@@ -43,8 +43,8 @@ class NEU_SEG_Dataset_BSL(Dataset):
         mask_np = build_binary_mask(mask_np)
         if self.transforms:
             augmented = self.transforms(image=image_np, mask=mask_np)
-            image = augmented['image'] / 255.0  # [3, 256, 256]
-            mask = (augmented['mask']).unsqueeze(0)  # [1, 256, 256]
+            image = augmented['image'] / 255.0          # [3, 256, 256]
+            mask = (augmented['mask']).unsqueeze(0)     # [1, 256, 256]
         return image, mask, image_id
 
 
@@ -165,10 +165,6 @@ def neu_bsl_create_dataset():
     return train_dataset, val_dataset, test_dataset
 
 
-def generate_neu_keys(mask_dir, mask_files):
-    return build_stratify_keys(mask_dir, mask_files)
-
-
 def create_neu_dataset_stratified():
     train_images_dir = 'data/NEU_Seg-main/images/training'
     train_annotations_dir = 'data/NEU_Seg-main/annotations/training'
@@ -180,10 +176,14 @@ def create_neu_dataset_stratified():
     all_train_mask_files = sorted([f for f in os.listdir(train_annotations_dir) if f.endswith('.png')])
     all_test_mask_files = sorted([f for f in os.listdir(test_annotations_dir) if f.endswith('.png')])
 
-    stratify_keys_train = generate_neu_keys(train_annotations_dir, all_train_mask_files)
-    stratify_keys_test = generate_neu_keys(test_annotations_dir, all_test_mask_files)
+    stratify_keys_train = build_stratify_keys(train_annotations_dir, all_train_mask_files)
+    stratify_keys_test = build_stratify_keys(test_annotations_dir, all_test_mask_files)
 
-    print("策略键生成完毕。")
+    print("-" * 100 + "\n")
+    print(f"原始训练集分类键: ", list(set(stratify_keys_train)))
+    print(f"原始测试集分类键: ", list(set(stratify_keys_test)))
+
+    print("-" * 100 + "\n")
     print(f"原始训练集中的类别组合分布: \n{Counter(stratify_keys_train)}")
     print(f"原始测试集中的类别组合分布: \n{Counter(stratify_keys_test)}")
 
@@ -198,9 +198,10 @@ def create_neu_dataset_stratified():
         random_state=42,
     )
 
-    print("\n验证划分结果")
     train_keys = [stratify_keys_train[i] for i in train_indices]
     val_keys = [stratify_keys_train[i] for i in val_indices]
+
+    print("-" * 100 + "\n" "验证划分结果")    
     print(f"\n划分后训练集的分布: \n{Counter(train_keys)}")
     print(f"\n划分后验证集的分布: \n{Counter(val_keys)}")
 
@@ -212,25 +213,7 @@ def create_neu_dataset_stratified():
     val_dataset = Subset(full_val_dataset, val_indices)
     return train_dataset, val_dataset, test_dataset
 
+if __name__ == '__main__':
+    a, b , c = create_neu_dataset_stratified()
+    debug_dataset_info(a, b, c)
 
-def debug_neu_dataset_info(train_dataset, val_dataset, test_dataset):
-    print("=" * 40)
-    print(f"[数据统计] 训练集图片: {len(train_dataset)} 张")
-    print(f"[数据统计] 验证集图片: {len(val_dataset)} 张")
-    print(f"[数据统计] 测试集图片: {len(test_dataset)} 张")
-    print("=" * 40)
-
-    idx = random.randint(0, len(train_dataset) - 1)
-    sample = train_dataset[idx]
-    img, mask, bbox, image_id = sample['image'], sample['mask'], sample['bbox'], sample['image_id']
-
-    print("=" * 40)
-    print("debug shapes")
-    print(f"img: {img.shape}, mask: {mask.shape}, bbox: {bbox}, image_id: {image_id}")
-    print("=" * 40)
-
-    print("=" * 40)
-    print("debug data types and data ranges")
-    print(f"img: {img.dtype}, mask: {mask.dtype}, bbox: {bbox.dtype}")
-    print(f"img: {img.min()} ~ {img.max()}, mask: {mask.unique()}")
-    print("=" * 40)

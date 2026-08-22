@@ -11,7 +11,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from data.common_ops import letterbox_image_np, letterbox_mask_np, split_stratified_6_2_2
+from data.common_ops import letterbox_image_np, letterbox_mask_np, split_stratified_6_2_2, debug_dataset_info
 from utils.helper_function import get_bounding_box
 
 
@@ -233,28 +233,28 @@ def sd900_finetune_create_dataloader(args, train_dataset, val_dataset, test_data
     return train_loader, val_loader, test_loader
 
 
-def debug_sd900_img_and_mask():
+def debug_read_and_transform_img():
     img = cv2.cvtColor(cv2.imread('data/sd900/Source Images/In_1.bmp'), cv2.COLOR_BGR2RGB)
     gt = cv2.imread('data/sd900/Ground truth/In_1.png', cv2.IMREAD_GRAYSCALE)
     print(
-        f"---------cv2读取img和mask---------\n"
-        f"img.shape:{img.shape}, gt.shape:{gt.shape}\n"
-        f"img.type:{type(img)}, gt.type:{type(gt)}\n"
-        f"img.dtype:{img.dtype}, gt.dtype:{gt.dtype}\n"
-        f"img data range: {img.min()} ~ {img.max()}\n"
-        f"gt data unique values: {np.unique(gt)}\n"
+        f"---------cv2读取sd900的img和mask---------\n"
+        f"{'img.shape:':<16}{str(img.shape):<32}{'gt.shape:':<16}{gt.shape}\n"
+        f"{'img.type:':<16}{str(type(img)):<32}{'gt.type:':<16}{type(gt)}\n"
+        f"{'img.dtype:':<16}{str(img.dtype):<32}{'gt.dtype:':<16}{gt.dtype}\n"
+        f"{'img.range:':<16}{img.min()} ~ {img.max()}\n"
+        f"{'gt.unique:':<16}{np.unique(gt)}\n"
         f"-----------------------------------"
     )
 
     img_tr = transforms.ToTensor()(img)
     gt_tr = transforms.ToTensor()(gt)
     print(
-        f"---------torchvision转换--------\n"
-        f"img_tr.shape:{img_tr.shape}, gt_tr.shape:{gt_tr.shape}\n"
-        f"img_tr.type:{type(img_tr)}, gt_tr.type:{type(gt_tr)}\n"
-        f"img_tr.dtype:{img_tr.dtype}, gt_tr.dtype:{gt_tr.dtype}\n"
-        f"img_tr data range: {img_tr.min()} ~ {img_tr.max()}\n"
-        f"gt_tr data unique: {torch.unique(gt_tr)}\n"
+        f"---------torchvision转换sd900--------\n"
+        f"{'img_tr.shape:':<16}{str(img_tr.shape):<32}{'gt_tr.shape:':<16}{gt_tr.shape}\n"    
+        f"{'img_tr.type:':<16}{str(type(img_tr)):<32}{'gt_tr.type:':<16}{type(gt_tr)}\n"      
+        f"{'img_tr.dtype:':<16}{str(img_tr.dtype):<32}{'gt_tr.dtype:':<16}{gt_tr.dtype}\n"    
+        f"{'img_tr.range:':<16}{img_tr.min()} ~ {img_tr.max()}\n"
+        f"{'gt_tr.unique:':<16}{torch.unique(gt_tr)}\n"
         f"-----------------------------------"
     )
 
@@ -265,17 +265,29 @@ def debug_sd900_img_and_mask():
 
     print(
         f"---------albumentation 转换 totensorv2并不会归一化需要自己除以255.0并转为float32--------\n"
-        f"img_aug.shape:{img_aug.shape}, gt_tr.shape:{mask_aug.shape}\n"
-        f"img_aug.type:{type(img_aug)}, gt_tr.type:{type(mask_aug)}\n"
-        f"img_aug.dtype:{img_aug.dtype}, gt_tr.dtype:{mask_aug.dtype}\n"
-        f"img_aug data range: {img_aug.min()} ~ {img_aug.max()}\n"
-        f"mask_aug data unique: {torch.unique(mask_aug)}\n"
+        f"{'img_aug.shape:':<18}{str(img_aug.shape):<32}{'mask_aug.shape:':<18}{mask_aug.shape}\n"
+        f"{'img_aug.type:':<18}{str(type(img_aug)):<32}{'mask_aug.type:':<18}{type(mask_aug)}\n"
+        f"{'img_aug.dtype:':<18}{str(img_aug.dtype):<32}{'mask_aug.dtype:':<18}{mask_aug.dtype}\n"
+        f"{'img_aug.range:':<18}{img_aug.min()} ~ {img_aug.max()}\n"
+        f"{'mask_aug.unique:':<18}{torch.unique(mask_aug)}\n"
         f"-----------------------------------"
     )
 
     img_aug_float32 = (img_aug / 255.0).float()
     mask_aug_float32 = (mask_aug / 255.0).float()
-    print(f"img_aug.shape: {img_aug_float32.shape}, img_aug_float32.dtype: {img_aug_float32.dtype}")
-    print(f"mask_aug.shape: {mask_aug_float32.shape}, mask_aug.dtype: {mask_aug_float32.dtype}")
+    print(
+        f"---------手动除以255--------\n"
+        f"{'img_f32.shape:':<16}{str(img_aug_float32.shape):<32}{'mask_f32.shape:':<16}{mask_aug_float32.shape}\n"
+        f"{'img_f32.type:':<16}{str(type(img_aug_float32)):<32}{'mask_f32.type:':<16}{type(mask_aug_float32)}\n"
+        f"{'img_f32.dtype:':<16}{str(img_aug_float32.dtype):<32}{'mask_f32.dtype:':<16}{mask_aug_float32.dtype}\n"
+        f"{'img_f32.range:':<16}{img_aug_float32.min()} ~ {img_aug_float32.max()}\n"
+        f"{'mask_f32.unique:':<16}{torch.unique(mask_aug_float32)}\n"
+        f"-----------------------------------"
+    )
+
+
 if __name__ == "__main__":
-    debug_sd900_img_and_mask()
+    # debug_read_and_transform_img()
+    
+    a, b, c  = sd900_finetune_create_dataset()
+    debug_dataset_info(a, b, c)

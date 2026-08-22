@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from data.common_ops import letterbox_image_np, letterbox_mask_np, split_stratified_6_2_2
+from data.common_ops import letterbox_image_np, letterbox_mask_np, split_stratified_6_2_2, debug_dataset_info
 from utils.helper_function import get_bounding_box
 
 
@@ -250,3 +250,7 @@ def create_magnetic_dataset():
     test_dataset = MagneticTileDatasetWithBoxPrompt(test_image_paths, test_mask_paths, test_labels, transforms=val_transforms, is_train=False)
 
     return train_dataset, val_dataset, test_dataset
+
+if __name__ == "__main__":
+    a, b, c = create_magnetic_dataset()
+    debug_dataset_info(a, b, c)
