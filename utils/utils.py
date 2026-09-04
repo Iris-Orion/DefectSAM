@@ -94,9 +94,11 @@ class MultiClassDiceLoss(nn.Module):
             dice_loss += 1 - dice
         return dice_loss / target.shape[1]
 
-def compute_dice_score(pred, target, epsilon=1e-6, threshold = 0.5):
+def compute_dice_score(pred, target, epsilon=1e-6, threshold = 0.5, as_tensor=False):
     """
     计算dice score
+    as_tensor=True 时返回 GPU 上的标量 tensor（不调用 .item()，避免每个 batch 强制 CPU-GPU 同步），
+    调用方可在 epoch 结束时一次性 .item()；默认 False 保持原有行为（返回 python float）。
     """
     assert pred.shape == target.shape
     batch_size = pred.shape[0]
@@ -113,11 +115,12 @@ def compute_dice_score(pred, target, epsilon=1e-6, threshold = 0.5):
     #     return 1.0 if intersection == 0 else 0.0
 
     dice = (2.0 * intersection + epsilon) / (union + epsilon)
-    return dice.item()
+    return dice if as_tensor else dice.item()
 
-def compute_iou_score(pred, target, epsilon=1e-6, threshold=0.5):
+def compute_iou_score(pred, target, epsilon=1e-6, threshold=0.5, as_tensor=False):
     """
     计算IOU (Intersection over Union) score
+    as_tensor=True 时返回 GPU 上的标量 tensor（不强制同步），默认返回 python float。
     """
     assert pred.shape == target.shape
     batch_size = pred.shape[0]
@@ -130,7 +133,7 @@ def compute_iou_score(pred, target, epsilon=1e-6, threshold=0.5):
     union = pred_flat.sum() + target_flat.sum() - intersection  # 计算并集
 
     iou = (intersection + epsilon) / (union + epsilon)  # 计算IOU
-    return iou.item()
+    return iou if as_tensor else iou.item()
 
 def save_lora_parameters(model: torch.nn.Module, filename: str) -> None:
     """

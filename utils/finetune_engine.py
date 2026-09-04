@@ -126,33 +126,6 @@ def prepare_base_model_for_hf_adapter_loading(base_model: SamModel, ft_type: str
         return prepare_sam_qkv_for_qv_peft(base_model, target_part='vision_encoder')
     return base_model
 
-
-def reverse_letterbox_1ch(input: np.ndarray, orig_size: tuple, target_size: tuple = (1024, 1024)) -> np.ndarray:
-    """
-    参数:
-        mask_letterbox: np.ndarray, shape = (target_height, target_width) 例如 (1024, 1024)
-        orig_size: 原始尺寸 (orig_height, orig_width) 例如 (256, 1600)
-        target_size: letterbox处理时的目标尺寸 (target_width, target_height) 例如 (1024, 1024)
-    返回:
-        restored_mask: np.ndarray, shape = (orig_height, orig_width)
-    """
-    orig_h, orig_w = orig_size
-    target_w, target_h = target_size
-
-    # 计算原始letterbox处理时的参数
-    scale = min(target_w / orig_w, target_h / orig_h)
-    new_w = int(orig_w * scale)
-    new_h = int(orig_h * scale)
-    x_offset = (target_w - new_w) // 2
-    y_offset = (target_h - new_h) // 2
-
-    mask_cropped = input[y_offset : y_offset + new_h, x_offset : x_offset + new_w]  # 提取letterbox中的有效区域
-    # 注意OpenCV的resize参数是(width, height)使用最近邻插值缩放到原始尺寸
-    restored_mask = cv2.resize(mask_cropped, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)  # TODO 和注释不一致 NTER_LANCZOS4效果不佳
-
-    return restored_mask
-
-
 def severstal_get_offset():
     """
     对每张 mask 应用 reverse letterbox (PyTorch 版本)
@@ -189,7 +162,6 @@ def _select_best_mask(pred_masks, iou_scores):
     B = pred_masks.shape[0]
     selected = pred_masks[torch.arange(B, device=pred_masks.device), best_idx]  # [B, H, W]
     return selected.unsqueeze(1)  # [B, 1, H, W]
-
 
 
 def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None, multimask=False):
@@ -521,17 +493,25 @@ def _train_one_epoch(model,
     global_step: 当前全局训练步数，用于 AdaLoRA 的 update_and_allocate。
     """
     model.train()
-    total_loss, total_dice, total_iou = 0, 0, 0
+    # loss/dice/iou 用 GPU tensor 累积，epoch 结束时一次性 .item()，
+    # 避免每个 step 的 .item() 强制 CPU-GPU 同步产生流水线气泡
+    total_loss = torch.zeros((), dtype=torch.float32, device=device)
+    total_dice = torch.zeros((), dtype=torch.float32, device=device)
+    total_iou = torch.zeros((), dtype=torch.float32, device=device)
     # 训练阶段默认不计算 HD95：OOM risk, --train_hd95
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0) if compute_hd95 else None
     use_amp = scaler is not None
+    # MFU 计时需要前后各一次 torch.cuda.synchronize()，每步都测会打断流水线，
+    # 改为每 MFU_SAMPLE_INTERVAL 步采样一次
+    MFU_SAMPLE_INTERVAL = 50
 
     pbar = tqdm(CUDAPrefetcher(dataloader, device), desc="Training", total=len(dataloader), disable=not master_process)
     for batch_idx, batch in enumerate(pbar):
         optimizer.zero_grad()
 
-        # MFU 计时起点：仅当 MFU 启用时 sync 一次确保上一步 GPU 工作已完成
-        if mfu_tracker is not None:
+        # MFU 计时起点：仅在采样步 sync 一次确保上一步 GPU 工作已完成
+        mfu_sample_this_step = mfu_tracker is not None and batch_idx % MFU_SAMPLE_INTERVAL == 0
+        if mfu_sample_this_step:
             torch.cuda.synchronize()
             t_step_start = time.time()
 
@@ -570,25 +550,27 @@ def _train_one_epoch(model,
             _raw.update_and_allocate(global_step)
         global_step += 1
 
-        # MFU 更新：sync 一次取 step 结束时间，dt 覆盖完整的 forward+backward+optimizer
-        if mfu_tracker is not None:
+        # MFU 更新：仅在采样步 sync 取 step 结束时间，dt 覆盖完整的 forward+backward+optimizer
+        if mfu_sample_this_step:
             torch.cuda.synchronize()
             mfu_tracker.update(time.time() - t_step_start)
             pbar.set_postfix_str(mfu_tracker.status())
 
         scheduler.step()  # 学习率调度，默认根据每个batch更新一次，而不是一个epoch完之后更新一次
 
-        total_loss += loss.item()
+        # GPU tensor 累积，不调用 .item()，不触发同步
+        total_loss += loss.detach()
         with torch.no_grad():
-            total_dice += compute_dice_score(pred_masks, gt)
-            total_iou += compute_iou_score(pred_masks, gt)
+            total_dice += compute_dice_score(pred_masks, gt, as_tensor=True)
+            total_iou += compute_iou_score(pred_masks, gt, as_tensor=True)
 
             if hd95_metric is not None:
                 hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().detach().cpu(), y=gt.detach().cpu())
 
-    avg_loss = total_loss / len(dataloader)
-    avg_dice = total_dice / len(dataloader)
-    avg_iou = total_iou / len(dataloader)
+    # epoch 结束后一次性同步取回三个标量
+    avg_loss = total_loss.item() / len(dataloader)
+    avg_dice = total_dice.item() / len(dataloader)
+    avg_iou = total_iou.item() / len(dataloader)
     if hd95_metric is not None:
         avg_hd95 = hd95_metric.aggregate().item()
         hd95_metric.reset()

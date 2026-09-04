@@ -30,20 +30,22 @@ from weights.severstal_wts import severstal_dict
 from utils.loratask import create_model_from_type
 
 
-def _load_single_weight_hyperparameters(json_path):
-    if not json_path:
-        return {}
-    with open(json_path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    for key in ("hyperparameters", "config", "args"):
-        value = payload.get(key)
-        if isinstance(value, dict):
-            return value
-    return payload if isinstance(payload, dict) else {}
-
-
 def _build_single_checkpoint_info(args):
-    hyperparameters = _load_single_weight_hyperparameters(args.single_weight_json)
+    # 读取单权重对应的超参数 json（若未提供则为空 dict），再据此构建 checkpoint 信息
+    hyperparameters = {}
+    if args.single_weight_json:
+        with open(args.single_weight_json, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        # 优先从常见的嵌套字段中取超参数，否则退回整个 payload
+        for key in ("hyperparameters", "config", "args"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                hyperparameters = value
+                break
+        else:
+            hyperparameters = payload if isinstance(payload, dict) else {}
+
+    # ft_type 优先使用 json 中记录的值，缺失时回退到命令行参数
     ft_type = hyperparameters.get("ft_type", args.ft_type)
     return {
         "path": args.single_weight_path,
@@ -70,9 +72,12 @@ def main():
     mini_dataset = args.mini_dataset            # for debugging purposes
     include_no_defect = args.include_no_defect
 
+    # personal log
     hyperparameters['optimizer'] = "AdamW"
     hyperparameters['scheduler'] = "cosine_scheduler"
     hyperparameters['loss_function'] = "monai.DiceCELoss"
+
+    # will pass as params
     hyperparameters['output_dir'] = './new_weights/finetune/severstal_output'
     hyperparameters['task_name'] = "severstal_" + hyperparameters['ft_type']
     if master_process:
