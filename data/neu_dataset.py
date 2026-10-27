@@ -15,10 +15,6 @@ from utils.helper_function import get_bounding_box
 
 
 class NEU_SEG_Dataset_BSL(Dataset):
-    """
-    无需box prompt的baseline使用
-    """
-
     def __init__(self, images_dir, annotations_dir, transforms: A.Compose):
         self.images_dir = images_dir
         self.annotations_dir = annotations_dir
@@ -39,7 +35,7 @@ class NEU_SEG_Dataset_BSL(Dataset):
         image_np = np.array(image)
         mask_np = np.array(mask)
 
-        # 原数据集将不同缺陷的掩码值分别设为了1-3，但是整个图片是单通道的，所以这里二值化为全为1进行处理
+        # Source masks are single-channel with defect classes labelled 1-3; binarize to one foreground class.
         mask_np = build_binary_mask(mask_np)
         if self.transforms:
             augmented = self.transforms(image=image_np, mask=mask_np)
@@ -49,8 +45,6 @@ class NEU_SEG_Dataset_BSL(Dataset):
 
 
 class NEU_SEG_Dataset(Dataset):
-    """SAM finetune 使用"""
-
     def __init__(self, images_dir, annotations_dir, transforms: A.Compose, is_train=True):
         self.images_dir = images_dir
         self.annotations_dir = annotations_dir
@@ -87,7 +81,7 @@ class NEU_SEG_Dataset(Dataset):
             image_tensor = augmented['image'] / 255.0
             mask_tensor = augmented['mask'].float()
 
-        # bbox 必须在增强之后从变换后的 mask 上计算，否则翻转后 bbox 与 mask 不一致
+        # Compute the bbox from the augmented mask, otherwise flips misalign bbox and mask.
         mask_np_for_bbox = mask_tensor.squeeze().numpy().astype(np.uint8)
         bbox = get_bounding_box(mask_np_for_bbox, perturb=self.is_train)
         bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
@@ -100,7 +94,6 @@ class NEU_SEG_Dataset(Dataset):
         }
 
 
-# 定义变换
 def get_neu_albumentation_transforms_baseline():
     train_transforms = A.Compose([
         A.Resize(height=256, width=256),

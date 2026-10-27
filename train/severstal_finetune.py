@@ -1,10 +1,10 @@
 """
-支持单卡和 DDP 多卡训练
+Supports single-GPU and DDP multi-GPU training.
 
-单卡训练:
+Single GPU:
     python -m train.severstal_finetune --batch_size 4 --device_id 1 --num_epoch 2 --save_custom_lora
 
-多卡训练 (指定 GPU):
+Multi-GPU (select GPUs):
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.severstal_finetune --batch_size 2 --num_epochs 2
 """
 import os
@@ -31,12 +31,10 @@ from utils.loratask import create_model_from_type
 
 
 def _build_single_checkpoint_info(args):
-    # 读取单权重对应的超参数 json（若未提供则为空 dict），再据此构建 checkpoint 信息
     hyperparameters = {}
     if args.single_weight_json:
         with open(args.single_weight_json, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        # 优先从常见的嵌套字段中取超参数，否则退回整个 payload
         for key in ("hyperparameters", "config", "args"):
             value = payload.get(key)
             if isinstance(value, dict):
@@ -45,7 +43,6 @@ def _build_single_checkpoint_info(args):
         else:
             hyperparameters = payload if isinstance(payload, dict) else {}
 
-    # ft_type 优先使用 json 中记录的值，缺失时回退到命令行参数
     ft_type = hyperparameters.get("ft_type", args.ft_type)
     return {
         "path": args.single_weight_path,
@@ -65,19 +62,17 @@ def main():
     master_process = ddp_rank == 0
 
     args = get_severstal_ft_args()
-    # 模型初始化前所有 rank 使用相同 seed，保证各进程初始权重一致（DDP 正确性前提）
+    # Every rank uses the same seed before model init so initial weights match across processes (required for DDP).
     set_seed(args.seed, seed_offset=0)
     hyperparameters = vars(args)
 
-    mini_dataset = args.mini_dataset            # for debugging purposes
+    mini_dataset = args.mini_dataset
     include_no_defect = args.include_no_defect
 
-    # personal log
     hyperparameters['optimizer'] = "AdamW"
     hyperparameters['scheduler'] = "cosine_scheduler"
     hyperparameters['loss_function'] = "monai.DiceCELoss"
 
-    # will pass as params
     hyperparameters['output_dir'] = './new_weights/finetune/severstal_output'
     hyperparameters['task_name'] = "severstal_" + hyperparameters['ft_type']
     if master_process:
@@ -146,7 +141,6 @@ def main():
         persistent_workers=(args.num_workers > 0),
     )
 
-    # ---------- 设备选择 ----------
     if ddp:
         device = torch.device(f"cuda:{ddp_local_rank}")
     else:
@@ -169,14 +163,15 @@ def main():
 
         SambPath = "./HuggingfaceModel/sam_vit_base/model"
         MedSamPath = "./HuggingfaceModel/wanglab/medsam-vit-base/model"
-        zero_shot(model_path = MedSamPath,
+        zs_path = SambPath if args.zero_shot_model == 'sam_base' else MedSamPath
+        zero_shot(model_path = zs_path,
                   train_dataloader=train_dataloader,
                     val_dataloader=val_dataloader,
                     test_dataloader=test_dataloader,
                     loss_fn=seg_loss,
                     process_batch_fn=process_batch_fn,
                     device=device,
-                    results_filename="evaluation_results.txt",
+                    results_filename="severstal_zeroshot_evaluation_results.txt",
                     auto_seg=False,
                     eval_traindataset=args.severstal_eval_train,
                     eval_valdataset=args.severstal_eval_val)
@@ -203,7 +198,7 @@ def main():
             checkpoint_path = checkpoint_info["path"]
             loading_type = checkpoint_info["type"]
 
-            current_model = None # 初始化
+            current_model = None
 
             print(f"================================================================")
             print(f"==> Path: {checkpoint_path}")

@@ -27,8 +27,7 @@ if __name__ == '__main__':
                                                              create_mini_dataset=create_mini_dataset, 
                                                              mini_size=256)
     severstal_dataset_path = Path("data/severstal_steel_defect_detection")
-    train_transforms, val_transforms = severstal.get_albumentations_transforms()    # albumentations
-    # train_transforms, val_transforms = data_setup.get_torchvision_transforms()
+    train_transforms, val_transforms = severstal.get_albumentations_transforms()
     train_dataloader, val_dataloader, test_dataloader = severstal.create_dataloaders_no_prompt(train_df,
                                                                                                 val_df,
                                                                                                 test_df,
@@ -54,13 +53,10 @@ if __name__ == '__main__':
         summary(model)
         print('-'*50)
 
-        # criterion = torch.nn.BCEWithLogitsLoss()
         criterion = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean') 
 
-        # optimizer = torch.optim.Adam(model.parameters(), lr=hyperparameters['learning_rate'])
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
-        # 学习率 warmup 策略
         total_steps = len(train_dataloader) * args.num_epochs
         warmup_ratio = 0.1
         warmup_steps = int(warmup_ratio * total_steps)     
@@ -80,21 +76,20 @@ if __name__ == '__main__':
                             save_best_model = args.save_bse_model,
                             scheduler_per_batch = True)
     else:
-        # checkpoints_to_evaluate = bsl_sever_dict()
         checkpoints_to_evaluate = severstal_dict()
         for checkpoint_info in checkpoints_to_evaluate:
 
             checkpoint_path = checkpoint_info["path"]
             loading_type = checkpoint_info["type"]
 
-            current_model = None # 初始化    
+            current_model = None
 
             print(f"================================================================")
             print(f"==> Path: {checkpoint_path}")
             print(f"==> Loading Type: {loading_type}")
             print(f"================================================================")
         
-            current_args = copy.deepcopy(args)          # 创建 args 的一个深拷贝，以防止循环间的副作用
+            current_args = copy.deepcopy(args)
             current_args.bse_model = loading_type
 
             current_model = create_bsl_model_from_type(args=current_args)

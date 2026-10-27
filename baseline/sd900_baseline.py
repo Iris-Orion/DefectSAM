@@ -29,9 +29,6 @@ if __name__ == '__main__':
     logging.info(f"训练集类别分布: {get_label_distribution(train_dataset)}")
     logging.info(f"验证集类别分布: {get_label_distribution(val_dataset)}")
     logging.info(f"测试集类别分布: {get_label_distribution(test_dataset)}")
-    # logging.info(f"训练集: {get_image_names_from_subset(train_dataset)}")
-    # logging.info(f"验证集: {get_image_names_from_subset(val_dataset)}")
-    # logging.info(f"测试集: {get_image_names_from_subset(test_dataset)}")
 
     test_sd900_info(train_dataset)
 
@@ -44,13 +41,9 @@ if __name__ == '__main__':
     if not args.infer_mode:
         model = create_bsl_model_from_type(args=args)
 
-        # 损失函数，优化器，训练循环，device
-        # criterion = nn.BCEWithLogitsLoss()
         criterion = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-        # optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)  # adam一般不配合weight decay使用
         optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         
-        # 学习率 warmup 策略
         total_steps = len(train_loader) * args.num_epochs
         warmup_ratio = 0.1
         warmup_steps = int(warmup_ratio * total_steps)     
@@ -79,7 +72,7 @@ if __name__ == '__main__':
             checkpoint_path = checkpoint_info["path"]
             loading_type = checkpoint_info["type"]
 
-            current_model = None # 初始化    
+            current_model = None
 
             print(f"================================================================")
             print(f"==> Inferencing")
@@ -87,7 +80,7 @@ if __name__ == '__main__':
             print(f"==> Loading Type: {loading_type}")
             print(f"================================================================")
         
-            current_args = copy.deepcopy(args)          # 创建 args 的一个深拷贝，以防止循环间的副作用
+            current_args = copy.deepcopy(args)
             current_args.bse_model = loading_type
 
             current_model = create_bsl_model_from_type(args=current_args)
@@ -100,6 +93,3 @@ if __name__ == '__main__':
                                 results_filename="bsl_sd900_evaluation_results.txt",
                                 eval_traindataset = True)
 
-
-    # best_model_path = '/workspace/DefectDetection/new_weights/sd900_output/sd900_unet_res34_20250715_035344.pth'
-    # bsl_infer(model, best_model_path, train_loader, val_loader, test_loader, criterion, device)

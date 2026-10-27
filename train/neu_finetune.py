@@ -1,5 +1,5 @@
 """
-支持单卡和 DDP 多卡训练
+Supports single-GPU and DDP multi-GPU training.
 """
 import os
 import torch
@@ -7,7 +7,7 @@ import monai
 from transformers import SamModel
 from torch.utils.data import DataLoader, DistributedSampler
 
-from data.neu_dataset import create_neu_dataset_stratified, debug_neu_dataset_info
+from data.neu_dataset import create_neu_dataset_stratified
 from utils.config import get_common_ft_args
 from utils.finetune_engine import run_finetune_engine, _process_batch, inference_engine, zero_shot
 from utils.helper_function import set_seed, cleanup_ddp
@@ -21,7 +21,7 @@ def main():
     master_process = ddp_rank == 0
 
     args = get_common_ft_args()
-    # 模型初始化前所有 rank 使用相同 seed，保证各进程初始权重一致（DDP 正确性前提）
+    # Every rank uses the same seed before model init so initial weights match across processes (required for DDP).
     set_seed(args.seed, seed_offset=0)
 
     hyperparameters = vars(args)
@@ -43,7 +43,7 @@ def main():
     train_dataloader = DataLoader(
                                     train_dataset,
                                     batch_size=hyperparameters['batch_size'],
-                                    shuffle=(train_sampler is None),  # DDP 时由 sampler 控制 shuffle，不在 DataLoader 层设置
+                                    shuffle=(train_sampler is None),  # DataLoader rejects shuffle=True together with a sampler; under DDP the sampler shuffles.
                                     sampler=train_sampler,
                                     num_workers=hyperparameters['num_workers'],
                                     pin_memory=True,
@@ -68,11 +68,7 @@ def main():
     else:
         device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
 
-    if master_process:
-        debug_neu_dataset_info(train_dataset, val_dataset, test_dataset)
-
     if not args.infer_mode and not args.zero_shot:
-        # Training and finetune
         model = create_model_from_type(args=args, train_dataloader=train_dataloader)
         results, fintuned_model = run_finetune_engine(train_dataloader, val_dataloader, test_dataloader,
                                                       model, device, hyperparameters,
@@ -82,7 +78,6 @@ def main():
                                                       train_sampler=train_sampler)
 
     elif args.zero_shot:
-        # Zero-shot evaluation
         seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
         if not ddp:
             device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
@@ -90,14 +85,15 @@ def main():
         SambPath = "./HuggingfaceModel/sam_vit_base/model"
         MedSamPath = "./HuggingfaceModel/wanglab/medsam-vit-base/model"
 
-        zero_shot(model_path = MedSamPath,
+        zs_path = SambPath if args.zero_shot_model == 'sam_base' else MedSamPath
+        zero_shot(model_path = zs_path,
                   train_dataloader=train_dataloader,
                     val_dataloader=val_dataloader,
                     test_dataloader=test_dataloader,
                     loss_fn=seg_loss,
                     process_batch_fn=_process_batch,
                     device=device,
-                    results_filename="infer_results/neu_eval/neu_abla_difRank.txt",
+                    results_filename="neu_zeroshot_evaluation_results.txt",
                     auto_seg=False,
                     eval_traindataset=True)
 
@@ -107,5 +103,5 @@ if __name__ == '__main__':
     try:
         main()
     finally:
-        # 放在 finally 里：训练异常退出时也要 destroy_process_group，
+        # In finally so destroy_process_group still runs when training raises.
         cleanup_ddp()

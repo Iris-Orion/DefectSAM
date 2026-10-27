@@ -15,40 +15,25 @@ def set_device(gpu_idx: int=0):
     return device
 
 def cleanup_ddp():
-    """销毁 DDP 进程组，在训练结束时调用。"""
     if int(os.environ.get('RANK', -1)) != -1:
         destroy_process_group()
 
 def set_seed(seed: int = 42, seed_offset: int = 0):
-    """
-    设置随机种子以确保实验可重复性。
-    DDP 模式下每个进程使用不同的 seed_offset，保证各卡采样数据不同。
-
-    参数:
-        seed (int): 随机种子值。默认为42。
-        seed_offset (int): 种子偏移量，DDP 模式下传入 rank 值。默认为0。
-    """
+    """Seed all RNGs with seed + seed_offset. Under DDP pass the rank as seed_offset so each process samples different data."""
     actual_seed = seed + seed_offset
     random.seed(actual_seed)
     np.random.seed(actual_seed)
     torch.manual_seed(actual_seed)
     torch.cuda.manual_seed(actual_seed)
-    torch.cuda.manual_seed_all(actual_seed)  # 多 GPU 时同步设置
+    torch.cuda.manual_seed_all(actual_seed)
 
 def get_lr_scheduler(optimizer, warmup_steps, total_steps, eta_min_ratio=0.1):
-    """Cosine warmup scheduler，最终学习率衰减到 base_lr * eta_min_ratio。
-
-    Args:
-        eta_min_ratio: 最终学习率 = 初始学习率 * eta_min_ratio，默认 0.1
-    """
+    """Linear warmup, then cosine decay to base_lr * eta_min_ratio (held there after total_steps)."""
     def lr_lambda(current_step):
-        # 1) linear warmup
         if current_step < warmup_steps:
             return (current_step + 1) / (warmup_steps + 1)
-        # 2) past total_steps, clamp to min lr
         if current_step > total_steps:
             return eta_min_ratio
-        # 3) cosine decay down to eta_min_ratio
         decay_ratio = (current_step - warmup_steps) / (total_steps - warmup_steps)
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return eta_min_ratio + coeff * (1 - eta_min_ratio)
@@ -56,16 +41,13 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, eta_min_ratio=0.1):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 def use_eager_attn_for_compat():
-    """
-    兼容 transformers 4.47.0 训练权重的推理补丁。
+    """Inference patch for checkpoints trained under transformers 4.47.0.
 
-    5.5.0 起 SamModel.from_pretrained 默认使用 sdpa attention，
-    与 4.47.0 eager 实现存在 ~0.002 dice 系统偏差。
-    在评估 4.47.0 旧权重的推理脚本顶部调用，确保与训练时 attention 实现一致。
-    可重复调用，第二次起为空操作。
+    From 5.5.0, SamModel.from_pretrained defaults to sdpa attention, which shifts Dice by ~0.002
+    versus the 4.47.0 eager implementation. Call at the top of inference scripts that evaluate
+    4.47.0 checkpoints so attention matches training. Idempotent.
     """
     from transformers import SamModel
-    # 幂等保护：避免多次调用时重复 patch
     if getattr(SamModel.from_pretrained, '_eager_compat_patched', False):
         return
     _orig = SamModel.from_pretrained
@@ -77,12 +59,10 @@ def use_eager_attn_for_compat():
 
 
 def get_bounding_box(ground_truth_map, perturb=True, perturb_range=20):
-    """
-    从ground_truth中获得bbox。
-    输入:ground_truth_map 是一个合并的掩码 : np.array
-    参数:
-        perturb: 是否对bbox添加随机扰动（训练时True，验证/测试时False）
-        perturb_range: 随机扰动的最大像素数，与SAM原始训练策略一致（默认±20px）
+    """Return [x_min, y_min, x_max, y_max] of a binary mask, or [0, 0, 0, 0] if it is empty.
+
+    perturb: grow each side outward by a random 0..perturb_range-1 px, mimicking SAM's box noise
+    (True for training, False for val/test).
     """
     assert type(ground_truth_map) == np.ndarray, "check type"
     if np.sum(ground_truth_map) == 0:

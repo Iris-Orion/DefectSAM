@@ -16,6 +16,8 @@ weights/flood_wts.py
 idea/nanoGPT/
 exp_log/
 
+benchamark/
+
 HuggingfaceModel/
 new_weights/
 notebooks/
@@ -33,7 +35,6 @@ notebooks/
 !utils/README.md
 
 
-# 忽略数据集文件夹
 data/BSD500/
 data/Dataset_BUSI_with_GT/
 data/FloodSeg/

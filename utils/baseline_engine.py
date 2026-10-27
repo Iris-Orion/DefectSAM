@@ -53,12 +53,11 @@ def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, device,
                     scheduler_per_batch=False, compute_hd95: bool = False):
     model.train()
     total_loss, total_dice, total_iou = 0, 0, 0
-    # 训练阶段默认不计算 HD95：CPU 上的 EDT 既慢又占内存，
-    # 容易把 DataLoader worker 拖到 OOM 被 SIGKILL。需要时可通过 --train_hd95 打开。
+    # HD95 is off during training by default: the CPU EDT is slow and memory-hungry and can
+    # get DataLoader workers OOM-killed (SIGKILL). Enable with --train_hd95.
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0) if compute_hd95 else None
     use_amp = scaler is not None
 
-    # nanoGPT 风格：pin_memory + non_blocking，由 CUDA 内部 copy stream 重叠传输与计算
     loader_iter = iter(data_loader)
     try:
         n_img, n_msk, n_meta = next(loader_iter)
@@ -119,9 +118,6 @@ def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, device,
     return avg_loss, avg_dice, avg_iou, avg_hd95
 
 def evaluate(model, data_loader, criterion, device, scaler=None):
-    """
-    Returns:  tuple: (平均损失, 平均Dice分数, 平均IoU分数, 平均HD95)
-    """
     model.eval()
     total_loss, total_dice, total_iou = 0, 0, 0
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
@@ -174,7 +170,6 @@ def baseline_experiment(model, device,
     output_dir =            hyperparameters.get('output_dir', "<dataset_dir>/<baseline_model>/")
     model_choice =          hyperparameters.get('bse_model', None)
 
-    # 统一保存目录结构: <dataset_dir>/<baseline_model>/
     if model_choice:
         normalized_dir = os.path.normpath(output_dir)
         if os.path.basename(normalized_dir) != model_choice:
@@ -186,13 +181,12 @@ def baseline_experiment(model, device,
         "val_loss": [], "val_dice": [], "val_iou": [], "val_hd95": [],
     }
 
-    # TF32：几乎零精度损失，提升 matmul / cudnn 吞吐
+    # TF32: negligible precision loss, higher matmul / cuDNN throughput.
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
     model.to(device)
 
-    # torch.compile：静态图优化，减少 kernel launch overhead
     if hyperparameters.get('no_compile', False):
         print("torch.compile 已被 --no_compile 禁用")
     else:
@@ -202,7 +196,7 @@ def baseline_experiment(model, device,
         except Exception as e:
             print(f"torch.compile 不可用，跳过: {e}")
 
-    # BF16 GradScaler：BF16 指数范围与 FP32 相同，无需梯度缩放
+    # BF16 has the same exponent range as FP32, so gradient scaling is only needed without BF16.
     _use_bf16 = torch.cuda.is_bf16_supported()
     scaler = torch.amp.GradScaler('cuda', enabled=not _use_bf16)
     print(f"AMP dtype: {'bfloat16' if _use_bf16 else 'float16'} | GradScaler enabled: {not _use_bf16}")
@@ -230,13 +224,11 @@ def baseline_experiment(model, device,
         )
         print(f'Validation Results: Loss: {avg_val_loss:.4f}, Dice: {avg_val_dice:.4f}, IoU: {avg_val_iou:.4f}, HD95: {avg_val_hd95:.4f}')
 
-        # 若未设定scheduler_per_batch = True进入下面这个分支，按照epoch来更新？
         if not scheduler_per_batch and scheduler is not None:
             scheduler.step()
         for i, param_group in enumerate(optimizer.param_groups):
             print(f"Current learning rate (param_group {i}): {param_group['lr']:.6e}")
 
-        # 手动log每一轮的训练训练数据
         history["train_loss"].append(avg_train_loss)
         history["train_dice"].append(avg_train_dice)
         history["train_iou"].append(avg_train_iou)
@@ -248,7 +240,6 @@ def baseline_experiment(model, device,
         history["val_hd95"].append(avg_val_hd95)
 
         if swanlab_run:
-            # swanlab log每一轮的训练训练数据
             swanlab.log({
                 "train/loss": avg_train_loss,
                 "train/dice": avg_train_dice,
@@ -261,14 +252,12 @@ def baseline_experiment(model, device,
                 "learning_rate": optimizer.param_groups[0]['lr']
             }, step=epoch+1)
 
-        # 早停逻辑和模型保存
         if avg_val_dice - best_val_dice > earlystop_MIN_DELTA:
             best_val_dice = avg_val_dice
             no_improve_epochs = 0
             best_epoch = epoch + 1
             history['best_epoch'] = best_epoch
 
-            # 手动额外log验证集指标最好的那一轮的训练数据
             history['best_metrics'] = {
                 "train_loss": avg_train_loss,
                 "train_dice": avg_train_dice,
@@ -291,7 +280,6 @@ def baseline_experiment(model, device,
                 )
             
             if swanlab_run:
-                # log最好的轮次和最好的轮次对应的训练集和验证集上的指标
                 swanlab.log({
                     "best_epoch": best_epoch,
                     "best/train_loss": avg_train_loss,
@@ -307,7 +295,6 @@ def baseline_experiment(model, device,
             no_improve_epochs += 1
             print(f"Validation dice 未改善. No improvement for {no_improve_epochs} consecutive epochs.")
         
-        # 保存每个epoch的日志
         output_data = save_training_logs(
             hyperparameters=hyperparameters, results=history, epoch=epoch+1,
             start_timestamp=start_timestamp, result_name=task_name, target_dir=output_dir
@@ -317,7 +304,6 @@ def baseline_experiment(model, device,
             print(f"Early stopping triggered after {earlystop_PATIENCE} epochs without improvement.")
             break
             
-    # --- 训练结束后，使用最佳模型进行最终评估 ---
     print("\n--- Training finished. Starting final evaluation with the best model. ---")
     if not best_model_path:
         print("Warning: No best model was saved. Final evaluation will be on the last state of the model.")
@@ -326,12 +312,10 @@ def baseline_experiment(model, device,
         checkpoint = torch.load(best_model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
 
-    # 在测试集上评估
     test_loss, test_dice, test_iou, test_hd95 = evaluate(model, test_loader, criterion, device)
     print(f'Final Test Set Evaluation: Loss: {test_loss:.4f}, Dice: {test_dice:.4f}, IoU: {test_iou:.4f}, HD95: {test_hd95:.4f}')
     history["final_test_metrics"]={"loss": test_loss, "dice": test_dice, "iou": test_iou, "hd95": test_hd95}
     
-    # 将最终结果保存到日志文件中
     save_training_logs(
         hyperparameters=hyperparameters, results=history, epoch=output_data["last_completed_epoch"],
         start_timestamp=start_timestamp, result_name=task_name, target_dir=output_dir,
@@ -369,17 +353,15 @@ def bsl_inference_engine(model, best_model_path,
         print("\n--- Evaluating on Training Set (optional) ---")
         _, train_dicescore, train_ious, train_hd95 = evaluate(loaded_model, train_dataloader, loss_fn, device=device)
 
-    # --- 整理结果 ---      
     print("\n--- Summary of Results ---")
     if eval_traindataset:
         print(f"Training Set:   Dice={train_dicescore:.4f}, IoU={train_ious:.4f}, HD95={train_hd95:.4f}")
     print(f"Validation Set: Dice={val_dicescore:.4f},  IoU={val_ious:.4f}, HD95={val_hd95:.4f}")
     print(f"Test Set:     Dice={test_dicescore:.4f}, IoU={test_ious:.4f}, HD95={test_hd95:.4f}")
 
-    # --- 将路径和结果保存到TXT文件 ---
-    print(f"\n--- Saving results to {results_filename} ---") # <-- Use the parameter here
+    print(f"\n--- Saving results to {results_filename} ---")
     try:
-        with open(results_filename, "a", encoding="utf-8") as f: # <-- And here
+        with open(results_filename, "a", encoding="utf-8") as f:
             f.write("="*50 + "\n")
             f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Checkpoint Path: {best_model_path}\n")
@@ -393,7 +375,6 @@ def bsl_inference_engine(model, best_model_path,
     except Exception as e:
         print(f"Error saving results to file: {e}")
     
-    # 推理完毕，手动释放模型显存
     del loaded_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

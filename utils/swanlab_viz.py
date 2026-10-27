@@ -111,14 +111,12 @@ def collect_all_data(api: OpenApi, projects: list[str], user: str,
         for exp in exps:
             exp_dict = exp.model_dump() if hasattr(exp, 'model_dump') else (exp.dict() if hasattr(exp, 'dict') else exp)
             
-            # fallback for dict access
             if not isinstance(exp_dict, dict) and hasattr(exp, '__getitem__'):
                 exp_dict = exp
                 
             eid = exp_dict.get('cuid') or (exp['cuid'] if hasattr(exp, '__getitem__') else getattr(exp, 'cuid'))
             raw_name = exp_dict.get('name') or (exp['name'] if hasattr(exp, '__getitem__') else getattr(exp, 'name'))
             
-            # Extract ft_type
             ft_type = "unknown"
             try:
                 profile = exp_dict.get('profile', {})

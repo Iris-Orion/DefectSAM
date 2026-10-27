@@ -61,8 +61,8 @@ def load_lora_state_dict_for_model(
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict_to_load, strict=False)
 
-    # transformers 版本升级后 shared_image_embedding 可能变为可训练参数，
-    # 但旧 checkpoint 未保存它，属版本差异而非 LoRA 对齐问题，降级为警告。
+    # Newer transformers versions make shared_image_embedding trainable, but older
+    # checkpoints never saved it. That is a version gap, not a LoRA mismatch, so only warn.
     compat_missing = sorted(
         key for key in missing_keys
         if key in trainable_keys and "shared_image_embedding" in key
@@ -102,9 +102,7 @@ def load_lora_state_dict_for_model(
 
 
 def debug_print_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None:
-    """
-    打印优化器中每个 param group 的关键信息，便于确认 LoRA+ 分组是否生效。
-    """
+    """Print lr/wd/size per param group to verify that LoRA+ grouping took effect."""
     print("\n========== Optimizer Param Groups ==========")
     total_params = 0
     for group_idx, group in enumerate(optimizer.param_groups):
@@ -128,17 +126,17 @@ def prepare_base_model_for_hf_adapter_loading(base_model: SamModel, ft_type: str
 
 def severstal_get_offset():
     """
-    对每张 mask 应用 reverse letterbox (PyTorch 版本)
+    Return (y0, x0, y1, x1) of the letterboxed 256x1600 Severstal image inside the
+    256x256 low-res mask space (image letterboxed into 1024x1024).
     """
     orig_h, orig_w = (256, 1600)
     target_h, target_w = (1024, 1024)
-    pred_h, pred_w = (256, 256)         #256 x 256
+    pred_h, pred_w = (256, 256)
 
     scale = min(target_w / orig_w, target_h / orig_h)
     new_w, new_h = int(orig_w * scale), int(orig_h * scale)
     x_offset, y_offset = (target_w - new_w) // 2, (target_h - new_h) // 2
 
-    #将 letterbox 空间的裁剪坐标映射到低分辨率 (256x256) 预测掩码空间
     crop_y_start = int(y_offset * (pred_h / target_h))
     crop_y_end = int((y_offset + new_h) * (pred_h / target_h))
     crop_x_start = int(x_offset * (pred_w / target_w))
@@ -147,10 +145,10 @@ def severstal_get_offset():
 
 
 def _select_best_mask(pred_masks, iou_scores):
-    """从 multimask 输出中选取 model 预测 IoU 最高的 mask。
+    """Pick the multimask output with the highest predicted IoU.
     Args:
-        pred_masks: [B, 1, 3, H, W] (squeeze point_batch 前) 或 [B, 3, H, W]
-        iou_scores: [B, 1, 3] 或 [B, 3]
+        pred_masks: [B, 1, 3, H, W] (before squeezing point_batch) or [B, 3, H, W]
+        iou_scores: [B, 1, 3] or [B, 3]
     Returns:
         selected: [B, 1, H, W]
     """
@@ -166,14 +164,15 @@ def _select_best_mask(pred_masks, iou_scores):
 
 def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None, multimask=False):
     """
-    处理severstal数据集单个批次的数据，执行前向传播和损失计算。
+    Crop the letterboxed region (offset_info) from the 256x256 logits and upsample it to
+    256x1600 before computing the loss against the original-size GT.
     """
     images = batch["image"].to(device)
-    ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)      # [b, 256, 1600] ----unsqueeze---> [b, 1, 256, 1600]
+    ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)      # [B, 1, 256, 1600]
     if auto_seg:
-        bboxes = None    #自动分割 TODO auto_seg应该是用grid prompt
+        bboxes = None    # TODO: auto_seg should use a grid point prompt
     else:
-        bboxes = batch["bbox"].unsqueeze(1).to(device)   #box prompt
+        bboxes = batch["bbox"].unsqueeze(1).to(device)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
         outputs = model(pixel_values=images, input_boxes=bboxes, multimask_output=multimask)
@@ -185,10 +184,8 @@ def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = 
         orig_h, orig_w = (256, 1600)
         crop_y_start, crop_x_start, crop_y_end, crop_x_end = offset_info
 
-        # 在256，256的尺寸内提取有效区域 (使用 Tensor slicing，这会保留计算图)
         masks_cropped_small = predicted_masks[:, :, crop_y_start:crop_y_end, crop_x_start:crop_x_end]
 
-        # 使用 PyTorch 的 interpolate 缩放到原始尺寸
         predicted_masks_256_1600 = F.interpolate(
             masks_cropped_small,
             size=(orig_h, orig_w),
@@ -196,16 +193,15 @@ def _process_batch_severstal(batch, model, loss_fn, device, use_amp, auto_seg = 
             align_corners=False
         ) # [B, 1, 256, 1600]
 
-        # 计算损失
         loss = loss_fn(predicted_masks_256_1600, ground_truth_masks)
     return loss, predicted_masks_256_1600, ground_truth_masks
 
 
 def _process_batch_severstal_resize_infer(batch, model, loss_fn, device, use_amp, auto_seg=False, offset_info=None, multimask=False):
     """
-    Severstal resize 推理评估:
-    输入图像已直接 resize 到 1024x1024，没有 letterbox padding，因此 SAM 的 256x256 logits
-    直接插值回原始 256x1600 尺寸，与原始 GT 计算指标。
+    Severstal resize-mode evaluation: images are resized straight to 1024x1024 without
+    letterbox padding, so the 256x256 logits are interpolated directly back to 256x1600
+    and scored against the original GT.
     """
     images = batch["image"].to(device)
     ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)
@@ -233,15 +229,15 @@ def _process_batch_severstal_resize_infer(batch, model, loss_fn, device, use_amp
 
 def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, offset_info = None, multimask=False):
     """
-    处理单个批次的数据，执行前向传播和损失计算。
-    此函数可用于sd900, magnetic, neu,训练和验证。
+    Batch step for SD900, magnetic tile and NEU (train and eval). The GT is downsampled
+    to 256x256 and the loss is computed at the logit resolution.
     """
     images = batch["image"].to(device)
     ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)
     if auto_seg:
-        bboxes = None    #TODO 有待完善，auto_seg 应该是 grid point prompt
+        bboxes = None    # TODO: auto_seg should use a grid point prompt
     else:
-        bboxes = batch["bbox"].unsqueeze(1).to(device)   #box prompt
+        bboxes = batch["bbox"].unsqueeze(1).to(device)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
         outputs = model(pixel_values=images, input_boxes=bboxes, multimask_output=multimask)
@@ -250,23 +246,22 @@ def _process_batch(batch, model, loss_fn, device, use_amp, auto_seg = False, off
         else:
             predicted_masks = outputs.pred_masks.squeeze(1)  # [B, 1, 256, 256]
 
-        # 将gt进行下采样到(256, 256)，在256x256的低分辨率空间计算损失，效率更高
         gt_downsampled = F.interpolate(ground_truth_masks, size=(256, 256), mode="nearest")
-        loss = loss_fn(predicted_masks, gt_downsampled)      # [B, 1, 256, 256]
+        loss = loss_fn(predicted_masks, gt_downsampled)
 
     return loss, predicted_masks, gt_downsampled
 
 
 def _sample_points_from_mask(gt_mask, num_points=1, sample_from='foreground'):
     """
-    从GT mask中采样点坐标，模拟SAM原始训练中的point prompt。
+    Sample point prompts from a binary GT mask, as in SAM's original training.
     Args:
-        gt_mask: [H, W] numpy array 或 tensor, 二值mask
-        num_points: 采样点数
-        sample_from: 'foreground' 从前景采样, 'error_region' 从预测错误区域采样
+        gt_mask: [H, W] (or [1, H, W]) numpy array or tensor
+        sample_from: 'foreground' samples foreground points; any other value, or an
+            empty foreground, samples background points instead
     Returns:
-        coords: [num_points, 2] numpy array, (x, y) 格式
-        labels: [num_points] numpy array, 1=前景, 0=背景
+        coords: [num_points, 2] float32, (x, y) order, padded with (0, 0)
+        labels: [num_points] int64, 1 = foreground, 0 = background
     """
     if isinstance(gt_mask, torch.Tensor):
         gt_mask = gt_mask.cpu().numpy()
@@ -290,7 +285,6 @@ def _sample_points_from_mask(gt_mask, num_points=1, sample_from='foreground'):
             coords.append([yx[1], yx[0]])
             labels.append(0)
 
-    # 如果采样不足（极端情况），用零填充
     while len(coords) < num_points:
         coords.append([0, 0])
         labels.append(0)
@@ -299,8 +293,9 @@ def _sample_points_from_mask(gt_mask, num_points=1, sample_from='foreground'):
 
 def _sample_correction_points(pred_mask, gt_mask, num_points=1):
     """
-    从上一轮预测的错误区域采样纠正点（SAM多轮迭代的核心）。
-    假阳性区域采样背景点(label=0)，假阴性区域采样前景点(label=1)。
+    Sample correction points from the larger error region of the previous prediction
+    (pred_mask is logits): false negatives give foreground points (label 1), false
+    positives give background points (label 0).
     """
     if isinstance(pred_mask, torch.Tensor):
         pred_mask = (torch.sigmoid(pred_mask) > 0.5).float().cpu().numpy()
@@ -311,8 +306,8 @@ def _sample_correction_points(pred_mask, gt_mask, num_points=1):
     if gt_mask.ndim == 3:
         gt_mask = gt_mask[0]
 
-    false_negative = (gt_mask > 0.5) & (pred_mask < 0.5)  # 漏检
-    false_positive = (gt_mask < 0.5) & (pred_mask > 0.5)  # 误检
+    false_negative = (gt_mask > 0.5) & (pred_mask < 0.5)
+    false_positive = (gt_mask < 0.5) & (pred_mask > 0.5)
 
     fn_indices = np.argwhere(false_negative)
     fp_indices = np.argwhere(false_positive)
@@ -320,17 +315,16 @@ def _sample_correction_points(pred_mask, gt_mask, num_points=1):
     coords = []
     labels = []
 
-    # 优先从较大的错误区域采样
     if len(fn_indices) >= len(fp_indices) and len(fn_indices) > 0:
         chosen = fn_indices[np.random.choice(len(fn_indices), size=min(num_points, len(fn_indices)), replace=False)]
         for yx in chosen:
             coords.append([yx[1], yx[0]])
-            labels.append(1)  # 前景纠正点
+            labels.append(1)
     elif len(fp_indices) > 0:
         chosen = fp_indices[np.random.choice(len(fp_indices), size=min(num_points, len(fp_indices)), replace=False)]
         for yx in chosen:
             coords.append([yx[1], yx[0]])
-            labels.append(0)  # 背景纠正点
+            labels.append(0)
 
     while len(coords) < num_points:
         coords.append([0, 0])
@@ -346,21 +340,19 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
                              num_points=1,
                              multimask=False):
     """
-    复刻SAM原始训练流程的process_batch分支。
+    SAM-style iterative training step.
 
-    核心逻辑:
-      1. 第一轮: 随机选择 prompt 类型 (box / point / no_prompt)
-         - box: 从GT mask提取bbox (扰动已在dataset中完成)
-         - point: 从GT前景区域随机采样点
-         - no_prompt: 不提供任何prompt (概率较低)
-      2. 后续轮次: 将上一轮的pred mask logits作为mask prompt送回，
-         同时从预测错误区域采样纠正点
-      3. 只对最后一轮计算loss并反向传播，前面的轮次用no_grad节省显存
+      1. Round 0 draws one prompt type for the whole batch: box (bbox jitter is done in
+         the dataset), foreground points sampled from the GT, or no prompt.
+      2. Later rounds use only point prompts sampled from the error regions of the
+         previous round's logits. The logits are NOT fed back as a mask prompt.
+      3. Only the last round keeps gradients and returns the loss; earlier rounds run
+         under no_grad to save memory.
 
     Args:
-        prompt_probs: (box_prob, point_prob, no_prompt_prob) 三种prompt的采样概率
-        num_iter_rounds: 迭代轮数 (SAM论文中默认用了多轮)
-        num_points: 每轮采样的点数
+        prompt_probs: sampling probabilities of (box, point, no_prompt) for round 0
+        num_iter_rounds: total number of rounds
+        num_points: points sampled per image per round
     """
     images = batch["image"].to(device)
     ground_truth_masks = batch["mask"].unsqueeze(1).float().to(device)  # [B, 1, H, W]
@@ -368,10 +360,9 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
 
     gt_downsampled = F.interpolate(ground_truth_masks, size=(256, 256), mode="nearest")  # [B, 1, 256, 256]
 
-    # 随机选择第一轮的prompt类型
     prompt_type = np.random.choice(['box', 'point', 'no_prompt'], p=prompt_probs)
 
-    prev_masks_logits = None  # 上一轮的预测logits，用作mask prompt
+    prev_masks_logits = None
     is_last_round = (num_iter_rounds == 1)
 
     for round_idx in range(num_iter_rounds):
@@ -380,7 +371,6 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
         input_points = None
         input_labels = None
 
-        # 构造当前轮的prompt
         if round_idx == 0:
             if prompt_type == 'box':
                 input_boxes = batch["bbox"].unsqueeze(1).to(device)  # [B, 1, 4]
@@ -394,9 +384,7 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
                     all_labels.append(labs)
                 input_points = torch.tensor(np.stack(all_coords), dtype=torch.float32, device=device).unsqueeze(1)
                 input_labels = torch.tensor(np.stack(all_labels), dtype=torch.long, device=device).unsqueeze(1)
-            # else: no_prompt -> 全部为None
         else:
-            # 后续轮次：从错误区域采样纠正点
             all_coords = []
             all_labels = []
             for b in range(batch_size):
@@ -411,7 +399,6 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
             input_labels = torch.tensor(np.stack(all_labels), dtype=torch.long, device=device).unsqueeze(1)
 
         if not is_last_round:
-            # 前面的轮次不需要梯度，只生成mask prompt，大幅节省显存
             with torch.no_grad():
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
                     outputs = model(
@@ -423,7 +410,6 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
                     )
                     prev_masks_logits = outputs.pred_masks.squeeze(1).detach()  # [B, 1, 256, 256]
         else:
-            # 最后一轮：保留梯度，计算loss
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
                 outputs = model(
                     pixel_values=images,
@@ -442,8 +428,8 @@ def _process_batch_sam_style(batch, model, loss_fn, device, use_amp,
 
 class CUDAPrefetcher:
     """
-    nanoGPT 风格的数据预取：依赖 DataLoader pin_memory=True + non_blocking=True，
-    由 CUDA 内部 copy stream 完成 H2D 传输与计算的重叠，无需手动管理 stream / record_stream。
+    nanoGPT-style one-batch-ahead prefetch. Relies on DataLoader(pin_memory=True) plus
+    non_blocking=True so CUDA overlaps the H2D copy with compute; no manual streams.
     """
     def __init__(self, dataloader, device: torch.device):
         self.loader = dataloader
@@ -476,7 +462,7 @@ def _train_one_epoch(model,
                     optimizer,
                     scheduler,
                     loss_fn,
-                    procees_batch_fn,
+                    process_batch_fn,
                     scaler, device,
                     auto_seg=False,
                     offset_info=None,
@@ -487,35 +473,35 @@ def _train_one_epoch(model,
                     compute_hd95: bool = False,
                     grad_clip: float = 1.0):
     """
-    执行一个完整的训练 epoch。
-    mfu_tracker: 可选，传入后每个 batch 会更新 MFU 并在 tqdm 后缀中显示。
-    master_process: DDP 模式下只在主进程显示进度条。
-    global_step: 当前全局训练步数，用于 AdaLoRA 的 update_and_allocate。
+    Args:
+        mfu_tracker: optional; when given, MFU is sampled every MFU_SAMPLE_INTERVAL steps
+            and shown in the tqdm postfix.
+        master_process: only the DDP master shows the progress bar.
+        global_step: global step count passed to AdaLoRA's update_and_allocate.
     """
     model.train()
-    # loss/dice/iou 用 GPU tensor 累积，epoch 结束时一次性 .item()，
-    # 避免每个 step 的 .item() 强制 CPU-GPU 同步产生流水线气泡
+    # Accumulate on GPU and call .item() once per epoch; a per-step .item() forces a
+    # CPU-GPU sync and stalls the pipeline.
     total_loss = torch.zeros((), dtype=torch.float32, device=device)
     total_dice = torch.zeros((), dtype=torch.float32, device=device)
     total_iou = torch.zeros((), dtype=torch.float32, device=device)
-    # 训练阶段默认不计算 HD95：OOM risk, --train_hd95
+    # HD95 is off during training by default (OOM risk); enable with --train_hd95.
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0) if compute_hd95 else None
     use_amp = scaler is not None
-    # MFU 计时需要前后各一次 torch.cuda.synchronize()，每步都测会打断流水线，
-    # 改为每 MFU_SAMPLE_INTERVAL 步采样一次
+    # MFU timing needs a torch.cuda.synchronize() before and after the step, which would
+    # stall the pipeline every step, so only sample every MFU_SAMPLE_INTERVAL steps.
     MFU_SAMPLE_INTERVAL = 50
 
     pbar = tqdm(CUDAPrefetcher(dataloader, device), desc="Training", total=len(dataloader), disable=not master_process)
     for batch_idx, batch in enumerate(pbar):
         optimizer.zero_grad()
 
-        # MFU 计时起点：仅在采样步 sync 一次确保上一步 GPU 工作已完成
         mfu_sample_this_step = mfu_tracker is not None and batch_idx % MFU_SAMPLE_INTERVAL == 0
         if mfu_sample_this_step:
             torch.cuda.synchronize()
             t_step_start = time.time()
 
-        loss, pred_masks, gt = procees_batch_fn(batch,
+        loss, pred_masks, gt = process_batch_fn(batch,
                                                 model,
                                                 loss_fn,
                                                 device,
@@ -524,7 +510,6 @@ def _train_one_epoch(model,
                                                 offset_info=offset_info,
                                                 multimask=multimask)
 
-        # 获取 LoRA-Pro hook（如果存在）
         _raw = getattr(model, 'module', model)  # DDP unwrap
 
         if use_amp:
@@ -545,20 +530,18 @@ def _train_one_epoch(model,
                 )
             optimizer.step()
 
-        # AdaLoRA rank 分配：必须在 optimizer.step() 之后、scheduler.step() 之前调用
+        # AdaLoRA rank allocation must run after optimizer.step() and before scheduler.step().
         if hasattr(_raw, 'update_and_allocate'):
             _raw.update_and_allocate(global_step)
         global_step += 1
 
-        # MFU 更新：仅在采样步 sync 取 step 结束时间，dt 覆盖完整的 forward+backward+optimizer
         if mfu_sample_this_step:
             torch.cuda.synchronize()
             mfu_tracker.update(time.time() - t_step_start)
             pbar.set_postfix_str(mfu_tracker.status())
 
-        scheduler.step()  # 学习率调度，默认根据每个batch更新一次，而不是一个epoch完之后更新一次
+        scheduler.step()  # stepped per batch, not per epoch
 
-        # GPU tensor 累积，不调用 .item()，不触发同步
         total_loss += loss.detach()
         with torch.no_grad():
             total_dice += compute_dice_score(pred_masks, gt, as_tensor=True)
@@ -567,7 +550,6 @@ def _train_one_epoch(model,
             if hd95_metric is not None:
                 hd95_metric(y_pred=(torch.sigmoid(pred_masks) > 0.5).float().detach().cpu(), y=gt.detach().cpu())
 
-    # epoch 结束后一次性同步取回三个标量
     avg_loss = total_loss.item() / len(dataloader)
     avg_dice = total_dice.item() / len(dataloader)
     avg_iou = total_iou.item() / len(dataloader)
@@ -583,7 +565,7 @@ def _train_one_epoch(model,
 def _evaluate( model,
             dataloader,
             loss_fn,
-            procees_batch_fn,
+            process_batch_fn,
             device, scaler,
             auto_seg = False,
             offset_info = None,
@@ -591,16 +573,12 @@ def _evaluate( model,
             multimask: bool = False,
             ddp: bool = False):
     """
-    评估模型。
-
     Args:
-        master_process: DDP 模式下只在主进程显示进度条。
-        ddp: 是否在 DDP 模式下运行。开启后会在结尾用 all_reduce 把各 rank 的
-             loss/dice/iou/hd95 汇总到全局平均。要求 dataloader 使用
-             DistributedSampler(shuffle=False)，保证每 rank batch 数相同。
+        master_process: only the DDP master shows the progress bar.
+        ddp: all_reduce loss/dice/iou/hd95 across ranks into a global mean. Requires
+            DistributedSampler(shuffle=False) so every rank sees the same batch count.
     """
     model.eval()
-    # 用 GPU tensor 累积，便于结尾做一次 all_reduce
     total_loss = torch.zeros(1, dtype=torch.float32, device=device)
     total_dice = torch.zeros(1, dtype=torch.float32, device=device)
     total_iou = torch.zeros(1, dtype=torch.float32, device=device)
@@ -610,7 +588,7 @@ def _evaluate( model,
 
     with torch.no_grad():
         for batch in tqdm(CUDAPrefetcher(dataloader, device), desc="Evaluating", total=len(dataloader), disable=not master_process):
-            loss, pred_masks, gt = procees_batch_fn(batch,
+            loss, pred_masks, gt = process_batch_fn(batch,
                                                     model,
                                                     loss_fn,
                                                     device,
@@ -667,13 +645,14 @@ def run_finetune_engine(train_dataloader,
                         ddp_info=None,
                         train_sampler=None):
     """
-    一个通用的微调训练引擎，适用于所有数据集。支持单卡和 DDP 多卡训练。
+    Fine-tuning loop shared by all datasets, single GPU or DDP. DDP is detected from the
+    RANK environment variable, not from ddp_info.
     Args:
-        process_batch_fn (function): 用于处理数据批次的函数。应为 `_process_batch` 或 `_process_batch_severstal`。
-        ddp_info (dict, optional): DDP 配置字典，由 setup_ddp() 返回。None 时退化为单卡训练。
-        train_sampler (DistributedSampler, optional): DDP 模式下的训练数据采样器，每个 epoch 需调用 set_epoch。
+        process_batch_fn: one of the `_process_batch*` functions. Letterbox offsets are
+            computed only for `_process_batch_severstal`.
+        ddp_info (dict, optional): only its 'world_size' is read, for the MFU batch size.
+        train_sampler (DistributedSampler, optional): set_epoch is called on it every epoch.
     """
-    # ---------- DDP / runtime 初始化 ----------
     ddp = int(os.environ.get('RANK', -1)) != -1
     if ddp:
         init_process_group(backend='nccl')
@@ -703,7 +682,6 @@ def run_finetune_engine(train_dataloader,
         save_lora_only or save_hf_format
     ) else hyperparameters["ft_type"]
 
-    # ---------- optimizer / scaler / scheduler 初始化 ----------
     lr = hyperparameters['learning_rate']
     wd = hyperparameters['weight_decay']
     num_epochs = hyperparameters['num_epochs']
@@ -755,7 +733,6 @@ def run_finetune_engine(train_dataloader,
     sam_type = hyperparameters.get('sam_type', 'sam_base')
     mfu_estimator = SAMMFUEstimator(sam_type=sam_type, gpu_type='rtx5090')
 
-    # TF32：在 matmul 和 cudnn 上允许 TF32，在几乎不损失精度的前提下提升吞吐
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -796,7 +773,6 @@ def run_finetune_engine(train_dataloader,
 
     model.train()
 
-    # ---------- rank0 启动期日志与 swanlab 初始化 ----------
     swanlab_run = None
     if use_swanlab:
         swanlab_run = swanlab.init(
@@ -845,7 +821,6 @@ def run_finetune_engine(train_dataloader,
     global_step = 0
     last_completed_epoch = 0
 
-    # ---------- epoch 训练主循环 ----------
     for epoch in range(num_epochs):
         if master_process:
             print(f"--- Epoch {epoch + 1}/{num_epochs} ---")
@@ -978,7 +953,6 @@ def run_finetune_engine(train_dataloader,
                 print(f"验证指标连续 {patience} 个 epoch 无改善，提前停止训练。")
             break
 
-    # ---------- 最佳模型处理与最终评估 ----------
     if master_process:
         print("\n--- Training finished. Starting final evaluation with the best model. ---")
 
@@ -988,7 +962,7 @@ def run_finetune_engine(train_dataloader,
         dist.broadcast_object_list(best_model_path_holder, src=0)
         best_model_path = best_model_path_holder[0]
 
-    # 加载权重前恢复未 compile 的 vision_encoder，避免 key 不匹配
+    # Restore the uncompiled vision_encoder before loading so state_dict keys match.
     if _compiled_ve is not None:
         if _compile_is_peft:
             _peft_inner.vision_encoder = _orig_ve
@@ -1037,7 +1011,6 @@ def run_finetune_engine(train_dataloader,
         auto_seg=auto_seg, offset_info=offset_info, master_process=master_process,
         multimask=use_multimask, ddp=ddp)
 
-    # ---------- 最终收尾 ----------
     if master_process:
         print(f'Final Test Set Evaluation: Loss: {final_test_loss:.4f}, Dice: {final_test_dice:.4f}, IoU: {final_test_iou:.4f}, HD95: {final_test_hd95:.4f}')
         history["final_test_metrics"] = {
@@ -1069,8 +1042,8 @@ def run_finetune_engine(train_dataloader,
 
 def evaluate_all_metrics(model, dataloader, loss_fn, process_batch_fn, device, auto_seg=False, offset_info=None):
     """
-    在给定的数据集上评估模型，并计算所有需要的指标 (IoU, Dice, BF1, HD)。
-    此函数用于训练完成后的最终评估。
+    Final evaluation: mean IoU, Dice and HD95. HD95 only aggregates batches where both
+    the GT and the prediction are non-empty.
     """
     model.eval()
     hd95_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95.0)
@@ -1114,9 +1087,6 @@ def inference_engine(model, args, best_model_path,
                      results_filename="evaluation_results.txt",
                      auto_seg: bool = False, eval_traindataset = False,
                      eval_valdataset: bool = True):
-    """
-    纯推理, 加bbox和不加bbox?
-    """
     SAVE_HUGGINGFACE_PRETRAINED_MODEL = args.save_hf_format
     save_lora_only = args.save_custom_lora
     zero_shot_infer = args.zero_shot
@@ -1127,7 +1097,7 @@ def inference_engine(model, args, best_model_path,
                 base_model = SamModel.from_pretrained(base_model_path)
                 base_model = prepare_base_model_for_hf_adapter_loading(base_model, args.ft_type).to(device)
                 
-                loaded_model = PeftModel.from_pretrained(base_model, best_model_path)       # 从保存的路径加载 PeftModel
+                loaded_model = PeftModel.from_pretrained(base_model, best_model_path)
                 print("Successfully loaded model in Hugging Face PEFT format.")
             except Exception as e:
                 raise RuntimeError(f"Failed to load Hugging Face PEFT model from {best_model_path}") from e
@@ -1139,7 +1109,6 @@ def inference_engine(model, args, best_model_path,
 
     else:
         checkpoint = torch.load(best_model_path, map_location=device)
-        # 若 model 的 vision_encoder 被 torch.compile 包装，先 unwrap 再加载
         _compiled_ve_infer = None
         if hasattr(model.vision_encoder, '_orig_mod'):
             _compiled_ve_infer = model.vision_encoder
@@ -1164,24 +1133,19 @@ def inference_engine(model, args, best_model_path,
         print("Severstal-specific processing enabled. Calculating offset info.")
         offset_info = severstal_get_offset()
 
-    # --- 执行评估 ---
     print("\n--- Evaluating on Test Set ---")
-    # test_results = evaluate_all_metrics_profiler(loaded_model, test_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
     test_results = evaluate_all_metrics(loaded_model, test_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
     val_results = None
     if eval_valdataset:
         print("\n--- Evaluating on Validation Set ---")
-        # val_results = evaluate_all_metrics_profiler(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
         val_results = evaluate_all_metrics(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
     train_results = None
     if eval_traindataset:
         print("\n--- Evaluating on Training Set (optional) ---")
-        # train_results = evaluate_all_metrics_profiler(loaded_model, train_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
         train_results = evaluate_all_metrics(loaded_model, train_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
-    # --- 整理结果 ---
     print("\n--- Summary of Results ---")
     if eval_traindataset:
         print(f"Training Set:   Dice={train_results['dice']:.4f}, IoU={train_results['iou']:.4f}, HD95={train_results['hd95']:.4f}")
@@ -1189,10 +1153,9 @@ def inference_engine(model, args, best_model_path,
         print(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}")
     print(f"Test Set:     Dice={test_results['dice']:.4f}, IoU={test_results['iou']:.4f}, HD95={test_results['hd95']:.4f}")
 
-    # --- 将路径和结果保存到TXT文件 ---
-    print(f"\n--- Saving results to {results_filename} ---") # <-- Use the parameter here
+    print(f"\n--- Saving results to {results_filename} ---")
     try:
-        with open(results_filename, "a", encoding="utf-8") as f: # <-- And here
+        with open(results_filename, "a", encoding="utf-8") as f:
             f.write("="*50 + "\n")
             f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Checkpoint Path: {best_model_path}\n")
@@ -1207,7 +1170,6 @@ def inference_engine(model, args, best_model_path,
     except Exception as e:
         print(f"Error saving results to file: {e}")
     
-    # 推理完毕，手动释放模型显存
     del loaded_model
     with torch.cuda.device(device):
         torch.cuda.empty_cache()
@@ -1226,24 +1188,19 @@ def zero_shot(model_path,
         print("Severstal-specific processing enabled. Calculating offset info.")
         offset_info = severstal_get_offset()
 
-    # --- 执行评估 ---
     print("\n--- Evaluating on Test Set ---")
-    # test_results = evaluate_all_metrics_profiler(loaded_model, test_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
     test_results = evaluate_all_metrics(loaded_model, test_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
     val_results = None
     if eval_valdataset:
         print("\n--- Evaluating on Validation Set ---")
-        # val_results = evaluate_all_metrics_profiler(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
         val_results = evaluate_all_metrics(loaded_model, val_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
     train_results = None
     if eval_traindataset:
         print("\n--- Evaluating on Training Set (optional) ---")
-        # train_results = evaluate_all_metrics_profiler(loaded_model, train_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
         train_results = evaluate_all_metrics(loaded_model, train_dataloader, loss_fn, process_batch_fn, device=device, auto_seg=auto_seg, offset_info=offset_info)
 
-    # --- 整理结果 ---
     print("\n--- Summary of Results ---")
     if eval_traindataset:
         print(f"Training Set:   Dice={train_results['dice']:.4f}, IoU={train_results['iou']:.4f}, HD95={train_results['hd95']:.4f}")
@@ -1251,10 +1208,9 @@ def zero_shot(model_path,
         print(f"Validation Set: Dice={val_results['dice']:.4f},  IoU={val_results['iou']:.4f}, HD95={val_results['hd95']:.4f}")
     print(f"Test Set:     Dice={test_results['dice']:.4f}, IoU={test_results['iou']:.4f}, HD95={test_results['hd95']:.4f}")
 
-    # --- 将路径和结果保存到TXT文件 ---
-    print(f"\n--- Saving results to {results_filename} ---") # <-- Use the parameter here
+    print(f"\n--- Saving results to {results_filename} ---")
     try:
-        with open(results_filename, "a", encoding="utf-8") as f: # <-- And here
+        with open(results_filename, "a", encoding="utf-8") as f:
             f.write("="*50 + "\n")
             f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Checkpoint Path: {model_path}\n")
@@ -1269,7 +1225,6 @@ def zero_shot(model_path,
     except Exception as e:
         print(f"Error saving results to file: {e}")
     
-    # 推理完毕，手动释放模型显存
     del loaded_model
     with torch.cuda.device(device):
         torch.cuda.empty_cache()

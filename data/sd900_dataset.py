@@ -16,8 +16,6 @@ from utils.helper_function import get_bounding_box
 
 
 class SDsaliency900Dataset_BSL(Dataset):
-    """无需box prompt的baseline使用"""
-
     def __init__(self, source_dir, ground_truth_dir, transforms: A.Compose):
         self.source_dir = source_dir
         self.ground_truth_dir = ground_truth_dir
@@ -61,8 +59,6 @@ class SDsaliency900Dataset_BSL(Dataset):
 
 
 class SDsaliency900Dataset_FT(Dataset):
-    """SAM finetune 使用"""
-
     def __init__(self, source_dir, ground_truth_dir, transforms: A.Compose, is_train=True):
         self.source_dir = source_dir
         self.ground_truth_dir = ground_truth_dir
@@ -111,7 +107,7 @@ class SDsaliency900Dataset_FT(Dataset):
             image_tensor = torch.from_numpy(resized_img.transpose(2, 0, 1)).float() / 255.0
             mask_tensor = torch.from_numpy(resized_mask).float() / 255.0
 
-        # bbox 在数据增强之后从变换后的 mask 上计算，确保与增强后的空间位置一致
+        # Compute the bbox from the augmented mask so it matches the augmented geometry.
         mask_np_for_bbox = (mask_tensor.numpy() * 255).astype(np.uint8)
         if mask_np_for_bbox.ndim == 3:
             mask_np_for_bbox = mask_np_for_bbox[0]
@@ -126,7 +122,6 @@ class SDsaliency900Dataset_FT(Dataset):
         }
 
 
-# 定义变换
 def get_sd900_albumentation_transforms_baseline():
     train_transforms = A.Compose([
         A.Resize(height=256, width=256),
@@ -153,7 +148,6 @@ def get_sd900_albumentation_transforms_ft():
     return train_transforms, val_transforms
 
 
-# 打印类别分布
 def get_label_distribution(dataset):
     labels_subset = [dataset.dataset.labels[idx] for idx in dataset.indices]
     label_counts = Counter(labels_subset)
@@ -287,7 +281,6 @@ def debug_read_and_transform_img():
 
 
 if __name__ == "__main__":
-    # debug_read_and_transform_img()
     
     a, b, c  = sd900_finetune_create_dataset()
     debug_dataset_info(a, b, c)

@@ -1,5 +1,5 @@
 """
-支持单卡和 DDP 多卡训练
+Supports single-GPU and DDP multi-GPU training.
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.sd900_finetune --batch_size 4 --ft_type loradsc_qkv_residual_gated
 """
 import os
@@ -30,7 +30,7 @@ def main():
     master_process = ddp_rank == 0
 
     args = get_common_ft_args()
-    # 模型初始化前所有 rank 使用相同 seed，保证各进程初始权重一致（DDP 正确性前提）
+    # Every rank uses the same seed before model init so initial weights match across processes (required for DDP).
     set_seed(args.seed, seed_offset=0)
     
     hyperparameters = vars(args)
@@ -44,7 +44,6 @@ def main():
 
     train_dataset, val_dataset, test_dataset = sd900_finetune_create_dataset()
     
-    # ---------- DataLoader：DDP 模式使用 DistributedSampler ----------
     train_sampler = DistributedSampler(train_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(val_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False, drop_last=True) if ddp else None
     test_sampler = DistributedSampler(test_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False, drop_last=True) if ddp else None
@@ -86,7 +85,7 @@ def main():
     if not args.infer_mode and not args.zero_shot:
         model = create_model_from_type(args=args, train_dataloader=train_dataloader)
 
-        # 选择 process_batch 函数：SAM原始多prompt多轮策略 or 单一box prompt
+        # sam_style_train: SAM's original multi-prompt iterative strategy; otherwise a single box prompt.
         if args.sam_style_train:
             batch_fn = _process_batch_sam_style
         else:
@@ -111,7 +110,8 @@ def main():
         SambPath = "./HuggingfaceModel/sam_vit_base/model"
         MedSamPath = "./HuggingfaceModel/wanglab/medsam-vit-base/model"
 
-        zero_shot(  model_path = SambPath,
+        zs_path = SambPath if args.zero_shot_model == 'sam_base' else MedSamPath
+        zero_shot(  model_path = zs_path,
                     train_dataloader=train_dataloader,
                     val_dataloader=val_dataloader,
                     test_dataloader=test_dataloader,
@@ -125,9 +125,6 @@ def main():
         scaler = torch.amp.GradScaler('cuda', enabled=True) 
         seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
-        # checkpoints_to_evaluate = sd900_dict()
-        # checkpoints_to_evaluate = scale_sd900_dict()
-        # checkpoints_to_evaluate = new_sd900_dict()
         checkpoints_to_evaluate = sd900_dict()
 
         if not ddp:
@@ -137,30 +134,24 @@ def main():
             checkpoint_path = checkpoint_info["path"]
             loading_type = checkpoint_info["type"]
 
-            current_model = None # 初始化    
+            current_model = None
 
-            # description = checkpoint_info["description"]
             if master_process:
                 print(f"================================================================")
-                # print(f"==> [STARTING INFERENCE] for: {description}")
                 print(f"==> Path: {checkpoint_path}")
                 print(f"==> Loading Type: {loading_type}")
                 print(f"================================================================")
 
-            current_args = copy.deepcopy(args)          # 创建 args 的一个深拷贝，以防止循环间的副作用
+            current_args = copy.deepcopy(args)
 
             current_args.ft_type = loading_type
-            # current_args.save_custom_lora = checkpoint_info["save_custom_lora"]
-            # current_args.save_hf_format = checkpoint_info["save_hf_format"]
-            # 如果 checkpoint_info 中没有 "lora_rank"，则使用 current_args 中已有的值（即默认值）
             current_args.lora_rank = checkpoint_info.get("lora_rank", current_args.lora_rank)
             current_args.lora_alpha = checkpoint_info.get("lora_alpha", current_args.lora_alpha)
 
             current_model = create_model_from_type(args = current_args, train_dataloader=train_dataloader)
 
-            # checkpoint_path='/workspace/DefectDetection/new_weights/sd900_output/loradsc_qv_rank_16_20250720_080218.pth'
             inference_engine (  model=current_model,
-                                args=current_args,  # 使用为本次循环特地配置的 args
+                                args=current_args,
                                 best_model_path=checkpoint_path,
                                 train_dataloader=train_dataloader,
                                 val_dataloader=val_dataloader,
@@ -178,5 +169,5 @@ if __name__ == '__main__':
     try:
         main()
     finally:
-        # 放在 finally 里：训练异常退出时也要 destroy_process_group，
+        # In finally so destroy_process_group still runs when training raises.
         cleanup_ddp()

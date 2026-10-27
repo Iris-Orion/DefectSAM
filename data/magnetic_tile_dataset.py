@@ -92,7 +92,6 @@ class MagneticTileDatasetWithBoxPrompt(Dataset):
         return len(self.image_paths)
 
 
-# Make function to find classes in target directory
 def magtile_find_classes(directory: str) -> Tuple[List[str], Dict[str, int]]:
     classes = sorted(entry.name for entry in os.scandir(directory) if entry.is_dir())
     if not classes:

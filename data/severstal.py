@@ -1,4 +1,3 @@
-### --- severstal数据集, baseline和finetune的处理代码 --- ###
 import os
 import cv2
 import torch
@@ -28,9 +27,7 @@ def _is_no_defect_image(image_df: pd.DataFrame) -> bool:
 
 
 def build_mask_cache(df, cache_dir="./data/severstal_steel_defect_detection/mask_cache"):
-    """一次性将所有 RLE 解码为 .npz 压缩文件，后续直接 np.load。
-    只需首次运行一次（约 1-2 分钟），之后自动跳过已有缓存。
-    """
+    """Decode every defect image's RLE into a compressed .npz once; existing cache files are skipped."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     fnames = df['ImageId'].unique()
@@ -59,7 +56,6 @@ def build_mask_cache(df, cache_dir="./data/severstal_steel_defect_detection/mask
 
 
 def _rle2mask_raw(image_id, df):
-    """原始 RLE 解码逻辑（无缓存）。"""
     mask = _empty_mask()
 
     image_df = df[df['ImageId'] == image_id]
@@ -67,7 +63,7 @@ def _rle2mask_raw(image_id, df):
         return mask
 
     for _, row in image_df.iterrows():
-        class_id = int(row['ClassId']) - 1  # numpy channel: 0 - 3
+        class_id = int(row['ClassId']) - 1  # ClassId 1-4 -> channel 0-3
         rle = row['EncodedPixels']
 
         if pd.isna(rle):
@@ -87,13 +83,9 @@ def _rle2mask_raw(image_id, df):
 
 
 def rle2mask(image_id, df, cache_dir="./data/severstal_steel_defect_detection/mask_cache"):
-    """
-    输入: img_id   xxxxxxx.jpg
-    输出: jpg对应的四通道的掩码
-    输出的np.shape: [256, 1600, 4]   [H, W, C]
-    优先从 .npz 磁盘缓存加载，未命中时走 RLE 解码。
-    注意：不使用进程级内存缓存，避免在 persistent_workers=True 下
-    worker 内存随 epoch 单调增长导致 OOM 被 SIGKILL。
+    """Return the 4-channel mask of `image_id`, shape (256, 1600, 4), from the .npz cache or by RLE decoding.
+
+    No in-process memory cache: with persistent_workers=True worker memory would grow every epoch until OOM SIGKILL.
     """
     npz_path = Path(cache_dir) / f"{Path(image_id).stem}.npz"
     if npz_path.exists():
@@ -108,14 +100,14 @@ def rle2mask(image_id, df, cache_dir="./data/severstal_steel_defect_detection/ma
 def traindf_preprocess( split_seed: int = 42, 
                         csv_path: str = "./data/severstal_steel_defect_detection/train.csv",
                         data_path: str = "./data/severstal_steel_defect_detection/train_images",
-                        train_ratio: float = 0.60,  # 60% 的数据作为训练集
-                        val_ratio: float = 0.20,    # 20% 的数据作为验证集
-                        test_ratio: float = 0.20,   # 20% 的数据作为测试集
+                        train_ratio: float = 0.60,
+                        val_ratio: float = 0.20,
+                        test_ratio: float = 0.20,
                         include_no_defect: bool = True,
                         create_mini_dataset: bool = False, mini_size: int = 1024):
-    """
-    处理原始的train.csv, 返回train_df和val_df dataframe
-    并且决定是否将未有缺陷的图片也加入dataframe中
+    """Split train.csv by image into (train_df, val_df, test_df).
+
+    With include_no_defect, images absent from train.csv are added as ClassId 0 rows with empty EncodedPixels.
     """
     if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
         raise ValueError("训练、验证和测试的比例总和必须为1.0")
@@ -123,29 +115,25 @@ def traindf_preprocess( split_seed: int = 42,
     trainfolder_df = pd.read_csv(csv_path)
 
     if include_no_defect:
-        all_train_images = os.listdir(data_path)   # 所有的训练集图片（包含无缺陷的）
+        all_train_images = os.listdir(data_path)
 
-        # 首先获取唯一的 缺陷图像ImageId 列表
         defect_image_ids = trainfolder_df['ImageId'].unique()
         no_defect_image_ids = [img for img in all_train_images if img not in defect_image_ids]
 
-        # 为无缺陷图像生成一个对应的DataFrame (class_id为0，EncodedPixels为空)
         no_defect_df = pd.DataFrame({
             'ImageId': no_defect_image_ids,
-            'ClassId': [0] * len(no_defect_image_ids),           # 考虑用NaN代替
+            'ClassId': [0] * len(no_defect_image_ids),
             'EncodedPixels': [None] * len(no_defect_image_ids)
         })
 
         full_df = pd.concat([trainfolder_df, no_defect_df], ignore_index=True)
     else:
-        full_df = trainfolder_df  # 只含缺陷
+        full_df = trainfolder_df
 
-    # 拆分数据集  6 : 2 : 2
     train_val_ids, test_ids = train_test_split(full_df['ImageId'].unique(), test_size=test_ratio, random_state=split_seed)
     val_size_relative = val_ratio / (train_ratio + val_ratio)
     train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_relative, random_state=split_seed)
     
-    # create mini test for quick test  
     if create_mini_dataset:
         train_ids = random.sample(list(train_ids), mini_size)
         val_ids = random.sample(list(val_ids), mini_size // int(train_ratio / val_ratio))
@@ -167,8 +155,8 @@ def traindf_preprocess( split_seed: int = 42,
     print(f"测试集总行数: {len(test_df)}")
     print("-" * 30)
     
-    train_class_counts = train_df['ClassId'].value_counts().sort_index()        # 统计 train_df 中每个 ClassId 的数量
-    val_class_counts = val_df['ClassId'].value_counts().sort_index()            # 统计 val_df 中每个 ClassId 的数量
+    train_class_counts = train_df['ClassId'].value_counts().sort_index()
+    val_class_counts = val_df['ClassId'].value_counts().sort_index()
     test_class_counts = test_df['ClassId'].value_counts().sort_index()
 
     print("Train Class Distribution:")
@@ -180,36 +168,30 @@ def traindf_preprocess( split_seed: int = 42,
     print("\nTest Class Distribution:")
     print(test_class_counts)
 
-    # build mask cache for quick load
     build_mask_cache(full_df)
 
     return train_df, val_df, test_df
 
 def get_bounding_box(ground_truth_map, perturb=True, perturb_px=None):
-    """
-    从ground_truth中获得bbox
-    TODO: severstal数据集的ground_truth_map不是合并的, 根据(4, 256, 1600)判断每个channel中的box
-    
-    Args:
-        perturb: 是否启用随机perturb（训练时使用）
-        perturb_px: 固定外扩像素数（验证/测试时使用）。若不为None，则忽略perturb参数，使用固定外扩。
+    """Return [x_min, y_min, x_max, y_max] of the mask foreground, or [0, 0, 0, 0] for an empty mask.
+
+    perturb: expand each side by a random 0-19 px (training).
+    perturb_px: expand each side by this fixed amount (val/test); overrides `perturb` when not None.
     """
     if torch.sum(ground_truth_map)== 0:
         bbox = [0, 0, 0, 0]
     else:
-        y_indices, x_indices = np.where(ground_truth_map > 0)   # np.where 支持  ground_truth_map是tensor输入
+        y_indices, x_indices = np.where(ground_truth_map > 0)
         x_min, x_max = np.min(x_indices), np.max(x_indices)
         y_min, y_max = np.min(y_indices), np.max(y_indices)
 
         H, W = ground_truth_map.shape
         if perturb_px is not None:
-            # 固定外扩模式（val/test）
             x_min = max(0, x_min - perturb_px)
             x_max = min(W, x_max + perturb_px)
             y_min = max(0, y_min - perturb_px)
             y_max = min(H, y_max + perturb_px)
         elif perturb:
-            # 随机perturb模式（train）
             x_min = max(0, x_min - np.random.randint(0, 20))
             x_max = min(W, x_max + np.random.randint(0, 20))
             y_min = max(0, y_min - np.random.randint(0, 20))
@@ -218,9 +200,7 @@ def get_bounding_box(ground_truth_map, perturb=True, perturb_px=None):
     return bbox
 
 def show_box(box, ax):
-    """
-    copy from segment-anything official repo
-    """
+    """Copied from the official segment-anything repo."""
     x0, y0 = box[0], box[1]
     w, h = box[2] - box[0], box[3] - box[1]
     ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2))   
@@ -233,14 +213,14 @@ class SteelDataset(Dataset):
         self.fnames = self.df['ImageId'].unique()
  
     def __getitem__(self, idx):
-        image_id = self.fnames[idx]   # 图片名字
-        mask = rle2mask(image_id, self.df)  # 掩码
+        image_id = self.fnames[idx]
+        mask = rle2mask(image_id, self.df)
         image_path = os.path.join(self.root, "train_images", image_id)
-        img = np.array(Image.open(image_path).convert("RGB"))  # 保证为rgb
+        img = np.array(Image.open(image_path).convert("RGB"))
 
-        augmented = self.transforms(image=img, mask=mask)   # 调用的是albumentations库
-        img = augmented["image"].float() / 255.0            # 调用albumentations库需要手动归一化
-        mask = augmented["mask"].permute(2, 0, 1)           # 对mask手动执行[h, w, c] ---> [c, h, w]
+        augmented = self.transforms(image=img, mask=mask)
+        img = augmented["image"].float() / 255.0
+        mask = augmented["mask"].permute(2, 0, 1)
         mask = torch.sum(mask, dim=0, keepdim=True).float()
         return img, mask, image_id
     
@@ -248,17 +228,10 @@ class SteelDataset(Dataset):
         return len(self.fnames)
 
 class SteelDataset_WithBoxPrompt(Dataset):
-    """
-    返回带有box提示的sevestal数据集用于微调sam
-    img: torch tensor : [C, H, W]
-    mask_tensor: [4, H, W]
-    image_id: "str"
-    bbox_tensor: tensor
-    修改后的数据集类:
-    1. 先对原始尺寸(256, 1600)的图像和掩码进行数据增强。
-    2. 对增强后的图像进行letterbox，得到(1024, 1024)的输入。
-    3. 保留增强后的(256, 1600)掩码作为Ground Truth，用于计算损失。
-    4. 返回逆向letterbox所需的元数据。
+    """Severstal with box prompts for SAM fine-tuning.
+
+    Augments image and merged binary mask at native (256, 1600), letterboxes the image to (1024, 1024) as model
+    input, keeps the augmented (256, 1600) mask as ground truth, and computes the box prompt on the letterboxed mask.
     """
     def __init__(self, df, data_path, transforms: transforms.Compose, is_train=True, perturb_px=None):
         self.df = df
@@ -269,26 +242,17 @@ class SteelDataset_WithBoxPrompt(Dataset):
         self.fnames = self.df['ImageId'].unique()
     
     def preprocess(self, original_image: torch.Tensor):
-        """
-        Normalize pixel values and pad to a square input.
-        这个来自segment anything的源码, 并未使用
-        """
-        # Normalize colors
-        # batched_x = (batched_x - self.pixel_mean) / self.pixel_std
-
-        # Pad
-        h, w = original_image.shape[-2:]   # (h, w, c)
+        h, w = original_image.shape[-2:]
         padh = 1024 - h
         padw = 1024 - w
         original_image = F.pad(original_image, (0, padw, 0, padh))
         return original_image
     
     def letterbox_img_np(self, img_np, target_size):
+        """Aspect-preserving resize with gray padding; target_size is (width, height).
+
+        Adapted from https://blog.csdn.net/weixin_44791964/article/details/102940768
         """
-        对图片进行resize, 使图片不失真。在空缺的地方进行padding
-        cited from https://blog.csdn.net/weixin_44791964/article/details/102940768
-        """
-        # 原尺寸
         original_h, original_w = img_np.shape[:2]
         target_w, target_h = target_size
 
@@ -296,99 +260,77 @@ class SteelDataset_WithBoxPrompt(Dataset):
         nw = int(original_w*scale)
         nh = int(original_h*scale)
 
-        if img_np.ndim == 3 and img_np.shape[2] > 1: # 假设是图像
+        if img_np.ndim == 3 and img_np.shape[2] > 1:
             interpolation = cv2.INTER_CUBIC
-            fill_value = [128, 128, 128] # 灰色背景
+            fill_value = [128, 128, 128]
 
-        # 缩放
         resized_img = cv2.resize(img_np, (nw, nh), interpolation=interpolation)
 
-        # 创建空白画布
         letterboxed_img = np.full((target_h, target_w, img_np.shape[2]), fill_value, dtype=img_np.dtype)
 
-        # 计算粘贴位置 (使其居中)
         x_offset = (target_w - nw) // 2
         y_offset = (target_h - nh) // 2
 
-        # 粘贴
         letterboxed_img[y_offset:y_offset+nh, x_offset:x_offset+nw, :] = resized_img
 
         return letterboxed_img
     
     def letterbox_mask(self, mask: np.ndarray, size: tuple) -> np.ndarray:
-        """
-        对形状为 (H, W, 4) 的四通道掩码做 letterbox 操作，
-        等比例缩放并居中填充到指定 size = (target_width, target_height)。
-        
-        参数:
-            mask: np.ndarray, shape = (H, W, 4)
-            size: (target_width, target_height), 例如 (1024, 1024)
+        """Nearest-neighbour letterbox of an (H, W, C) mask to (target_height, target_width, C).
 
-        返回:
-            result: np.ndarray, shape = (target_height, target_width, 4)
+        size: (target_width, target_height).
         """
-        # 原图尺寸
         H, W, C = mask.shape
-        # assert C == 4, f"输入的掩码必须是4通道, 但拿到的是 {C} 通道。"
 
-        # 目标尺寸
         target_w, target_h = size
 
-        # 计算等比例缩放
         scale = min(target_w / W, target_h / H)
         new_w = int(W * scale)
         new_h = int(H * scale)
 
-        # 最近邻插值缩放
-        # 注意 OpenCV 的 resize 第二个参数是 (width, height)
         mask_resized = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
-        # 如果 cv2.resize 返回的是二维数组 (当 C=1 时)，则为其增加一个维度
+        # cv2.resize drops the channel axis when C == 1.
         if mask_resized.ndim == 2:
             mask_resized = np.expand_dims(mask_resized, axis=-1)
 
-        # 创建空白画布 (target_h, target_w, 4)，填充值设为0（通常表示背景）
         letterbox_result = np.zeros((target_h, target_w, C), dtype=mask.dtype)
 
-        # 计算粘贴位置，使其居中
         x_offset = (target_w - new_w) // 2
         y_offset = (target_h - new_h) // 2
 
-        # 将缩放后的掩码贴到画布中
         letterbox_result[y_offset:y_offset+new_h, x_offset:x_offset+new_w, :] = mask_resized
 
         return letterbox_result
 
     def __getitem__(self, idx):
-        image_id = self.fnames[idx]                                             # 图片名字: 返回字符串
-        original_mask_4ch = rle2mask(image_id, self.df)                         # 四通道掩码shape: (256, 1600, 4)
-        original_mask_1ch = np.sum(original_mask_4ch, axis=2, keepdims=True)    # 二值掩码shape: (256, 1600, 1)
+        image_id = self.fnames[idx]
+        original_mask_4ch = rle2mask(image_id, self.df)                         # (256, 1600, 4)
+        original_mask_1ch = np.sum(original_mask_4ch, axis=2, keepdims=True)    # (256, 1600, 1)
 
         image_path = os.path.join(self.root, "train_images", image_id)
-        original_img_np = np.array(Image.open(image_path).convert("RGB"))       # 保证为rgb: (256, 1600, 3)
+        original_img_np = np.array(Image.open(image_path).convert("RGB"))       # (256, 1600, 3)
         
         augmented = self.transforms(image=original_img_np, mask=original_mask_1ch)
-        aug_img_np = augmented["image"]                                                 # (2560, 1600, 3)
-        aug_mask_1ch_np = augmented["mask"]                                             # (256, 1600, 1)  现在经过图像增强后的mask是gt
+        aug_img_np = augmented["image"]                                                 # (256, 1600, 3)
+        aug_mask_1ch_np = augmented["mask"]                                             # (256, 1600, 1)
 
         letterboxed_img_np = self.letterbox_img_np(aug_img_np, [1024, 1024])                                # (1024, 1024, 3)
-        model_input_tensor = torch.from_numpy(letterboxed_img_np).permute(2, 0, 1).float() / 255.0          # (3, 1024, 1024)  输入图像
+        model_input_tensor = torch.from_numpy(letterboxed_img_np).permute(2, 0, 1).float() / 255.0          # (3, 1024, 1024)
         gt_mask_1ch_tensor = torch.from_numpy(aug_mask_1ch_np).permute(2, 0, 1).float()                     # (1, 256, 1600)
 
-        # 为了获得box提示，需要对mask进行letterbox操作
+        # The box prompt lives in the letterboxed 1024x1024 frame.
         letterboxed_mask_np = self.letterbox_mask(aug_mask_1ch_np, [1024, 1024])          # (1024, 1024, 1)
 
         letterboxed_mask_tensor = torch.from_numpy(letterboxed_mask_np).permute(2, 0, 1).float()    # (1, 1024, 1024)
     
-        # combined_letterboxed_mask = torch.sum(letterboxed_mask_tensor, dim=0)
 
         bbox = get_bounding_box(letterboxed_mask_tensor.squeeze(), perturb=self.is_train, perturb_px=self.perturb_px)
-        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)           # torch.tensor([x_min, y_min, x_max, y_max]): size=(4)
+        bbox_tensor = torch.tensor(bbox, dtype=torch.float32)           # (4,): [x_min, y_min, x_max, y_max]
 
-        # 返回图像, mask, image_id，以及boxes作为prompt
         return {"image": model_input_tensor,
-                "mask": gt_mask_1ch_tensor.squeeze(),  # 用于计算损失和指标的ground truth mask [256, 1600]
-                "letterboxed_mask": letterboxed_mask_tensor.squeeze(),  # 用于计算损失和指标的ground truth mask [1024, 1024]
+                "mask": gt_mask_1ch_tensor.squeeze(),  # [256, 1600]
+                "letterboxed_mask": letterboxed_mask_tensor.squeeze(),  # [1024, 1024]
                 "image_id": image_id, 
                 "bbox": bbox_tensor
                 }
@@ -398,11 +340,9 @@ class SteelDataset_WithBoxPrompt(Dataset):
 
 
 class SteelDataset_WithBoxPromptResizeInfer(SteelDataset_WithBoxPrompt):
-    """
-    Severstal 推理专用数据集:
-    1. 原始图像和合并后的二值 mask 均从 (256, 1600) resize 到 (1024, 1024)。
-    2. box prompt 在 resize 后的 mask 空间生成。
-    3. 原始 (256, 1600) mask 仍作为 GT 返回，用于最终指标计算。
+    """Severstal inference variant: plain resize (no letterbox) of image and merged binary mask to (1024, 1024).
+
+    The box prompt is computed on the resized mask; the (256, 1600) mask is still returned as ground truth.
     """
     def __init__(self, df, data_path, transforms: transforms.Compose = None, is_train=False, perturb_px=None):
         super().__init__(df=df, data_path=data_path, transforms=transforms, is_train=is_train, perturb_px=perturb_px)
@@ -450,9 +390,6 @@ class SteelDataset_WithBoxPromptResizeInfer(SteelDataset_WithBoxPrompt):
         }
 
 def create_datasets_no_prompt(train_df, val_df, test_df, data_path, train_transform, val_transform):
-    '''
-    创建不返回box prompt的severstal数据集, 供不需prompt的baseline使用
-    '''
     train_dataset = SteelDataset(train_df, data_path, transforms=train_transform)
     val_dataset = SteelDataset(val_df, data_path, transforms=val_transform)
     test_datset = SteelDataset(test_df, data_path, transforms=val_transform)
@@ -460,9 +397,6 @@ def create_datasets_no_prompt(train_df, val_df, test_df, data_path, train_transf
 
     
 def create_dataloaders_no_prompt(train_df, val_df, test_df,data_path, train_transform, val_transform, batch_size, num_workers):
-    '''
-    创建不返回box prompt的severstal数据集的dataloader, 供不需prompt的baseline使用
-    '''
     train_dataset, val_dataset, test_dataset = create_datasets_no_prompt(train_df, val_df, test_df, data_path, train_transform, val_transform)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0))
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0))
@@ -478,17 +412,6 @@ def create_dataset_with_prompt(include_no_defect=True):
     train_dataset = SteelDataset_WithBoxPrompt(train_df, data_path=data_path, transforms=train_transforms, is_train=True)
     val_dataset = SteelDataset_WithBoxPrompt(val_df, data_path=data_path, transforms=val_transforms, is_train=False)
     test_dataset = SteelDataset_WithBoxPrompt(test_df, data_path=data_path, transforms=val_transforms, is_train=False)
-
-    # idx = random.randint(0, len(train_dataset)-1)
-    # sample = train_dataset[idx]
-    # img0, mask0, imgid0 = sample["image"], sample["mask"], sample["image_id"]
-    # print(type(img0), type(mask0), type(imgid0))
-    # print(f"imgid: {imgid0}")
-    # print(f"img0.dtype: {img0.dtype} ||| mask0.dtype: {mask0.dtype}")
-    # print(f"img0.shape: {img0.shape} ||| mask0.shape: {mask0.shape}")
-    # print(f"img0.data.range: {img0.min()} ~ {img0.max()} ||| mask0.data.range: {mask0.unique()}")
-    # print(imgid0)
-    # print('#'*20 + ' test_dataset_with_prompt ' + '#'*20)
     return train_dataset, val_dataset, test_dataset
 
 def get_albumentations_transforms():
@@ -514,15 +437,10 @@ def get_severstal_ft_albumentations_transforms():
     return train_transforms, val_transforms
 
 def mask2rle(img):
-    '''
-    将二值 mask (H, W) 转换为 RLE (Run-Length Encoding) 字符串。
-    img: numpy array, 值为 0 或 1 (bool 或 uint8)
-    返回: RLE 编码字符串，如 "1 3 10 5 ..."
-    空 mask 返回空字符串。
-    '''
+    '''Encode a binary (H, W) mask as a Kaggle RLE string ("start length ..."); empty mask -> "".'''
     if img.sum() == 0:
         return ""
-    pixels = img.T.flatten()  # Fortran order (column-major)，与 Kaggle 一致
+    pixels = img.T.flatten()  # column-major, as Kaggle's RLE expects
     pixels = np.concatenate([[0], pixels, [0]])
     runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
     runs[1::2] -= runs[0::2]
@@ -533,7 +451,6 @@ def random_visualize(dataset, num_pics):
     fig, ax = plt.subplots(nrows=num_pics, ncols=5, figsize=(16, 8))
     for i, targ_sample in enumerate(random_samples_idx):
         image, masks = dataset[targ_sample][0], dataset[targ_sample][1]
-        # mask的shape是[4, 256, 1600]，所以每个通道的shape就是[256, 1600]，所以mask不需要permute
         image = image.permute(1, 2, 0)    
         
         ax[i, 0].imshow(image)
@@ -555,7 +472,6 @@ def visualize_dataset_and_groundtruth_mask(dataset, img_count=1):
     fig, ax = plt.subplots(nrows=img_count, ncols=1, figsize=(16, 8))
     for i, targ_sample in enumerate(random_samples_idx):
         image, masks = dataset[targ_sample][0], dataset[targ_sample][1]
-        # mask的shape是[4, 256, 1600]，所以每个通道的shape就是[256, 1600]，所以mask不需要permute
         image = image.permute(1, 2, 0)
         
         ax[i, 0].imshow(image)
@@ -568,10 +484,6 @@ def visualize_dataset_and_groundtruth_mask(dataset, img_count=1):
     plt.show()
 
 def visualize_bbox_prompt(steel_dataset_withboxPrompt):
-    """
-    input: torch.dataset
-    """
-    # TODO: steel_dataset_withboxPrompt的逻辑返回了一个字典，如果要使用这个函数，修改下面的逻辑
     idx = random.randint(0, len(steel_dataset_withboxPrompt))
     sample = steel_dataset_withboxPrompt[idx]
     img0, mask0, imgid0, bbox = sample['image'], sample['mask'], sample['image_id'], sample['bbox']
@@ -584,7 +496,6 @@ def visualize_bbox_prompt(steel_dataset_withboxPrompt):
     mask = torch.sum(mask0, dim=0, keepdim=True)
     print(f"comined mask (keep dim) shape: {mask.shape}")
 
-    # bbox = get_bounding_box(mask)
     print(f"img get bbox position: {bbox}")
 
     fig, ax = plt.subplots()
@@ -598,29 +509,23 @@ def visualize_bbox_prompt(steel_dataset_withboxPrompt):
     show_box(bbox, ax)
 
 def reverse_letterbox_mask_1ch(mask_letterbox: np.ndarray, orig_size: tuple, target_size: tuple = (1024, 1024)) -> np.ndarray:
-    """
-    参数:
-        mask_letterbox: np.ndarray, shape = (target_height, target_width) 例如 (1024, 1024)
-        orig_size: 原始尺寸 (orig_height, orig_width) 例如 (256, 1600)
-        target_size: letterbox处理时的目标尺寸 (target_width, target_height) 例如 (1024, 1024)
-    返回:
-        restored_mask: np.ndarray, shape = (orig_height, orig_width)
+    """Crop the letterbox padding and resize back to (orig_height, orig_width).
+
+    mask_letterbox: (target_height, target_width).
+    orig_size: (orig_height, orig_width), e.g. (256, 1600).
+    target_size: (target_width, target_height) used for the letterbox, e.g. (1024, 1024).
     """
     orig_h, orig_w = orig_size
     target_w, target_h = target_size
 
-    # 计算原始letterbox处理时的参数
     scale = min(target_w / orig_w, target_h / orig_h)
     new_w = int(orig_w * scale)
     new_h = int(orig_h * scale)
     x_offset = (target_w - new_w) // 2
     y_offset = (target_h - new_h) // 2
 
-    # 提取letterbox中的有效区域
     mask_cropped = mask_letterbox[y_offset : y_offset + new_h, x_offset : x_offset + new_w]
 
-    # 使用最近邻插值缩放到原始尺寸
-    # 注意OpenCV的resize参数是(width, height)
     restored_mask = cv2.resize(mask_cropped, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
 
     return restored_mask

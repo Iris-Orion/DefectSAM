@@ -1,15 +1,15 @@
 """
-SD900 数据集上使用 32×32=1024 个网格点作为 prompt 的 SAM 微调训练脚本
+SAM fine-tuning on SD900 with a 32x32 = 1024 point grid as the prompt.
 
-显存估算 (batch_size=4):
-- 图像编码器 (ViT-B): ~6-8 GB
-- Prompt Encoder (1024点): ~0.5-1 GB
-- Mask Decoder: ~0.5 GB
-- 模型参数/梯度/优化器: ~1.6 GB
-- 激活值缓存: ~4-6 GB
-- 总计: ~14-20 GB (RTX 5090 32GB 安全)
+Estimated GPU memory (batch_size=4):
+- Image encoder (ViT-B): ~6-8 GB
+- Prompt encoder (1024 points): ~0.5-1 GB
+- Mask decoder: ~0.5 GB
+- Params / grads / optimizer state: ~1.6 GB
+- Activations: ~4-6 GB
+- Total: ~14-20 GB (fits an RTX 5090 32 GB)
 
-使用方法:
+Usage:
     python -m train.sd900_finetune_grid32 \
         --batch_size 4 \
         --learning_rate 2e-4 \
@@ -54,7 +54,6 @@ if __name__ == '__main__':
     print(f"Hyperparameters: {hyperparameters}")
     print("=" * 60)
 
-    # 创建数据集
     train_dataset, val_dataset, test_dataset = sd900_finetune_create_dataset()
     train_dataloader, val_dataloader, test_dataloader = sd900_finetune_create_dataloader(
         args=args, 
@@ -65,14 +64,13 @@ if __name__ == '__main__':
     
     device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
 
-    # 创建 32×32 网格点的 batch 处理函数
-    # 1024 个点覆盖整张 512×512 图像，点间距约 16 像素
+    # 1024 points cover the whole 512x512 image, ~16 px apart.
     process_batch_grid32 = partial(
         _process_batch_with_point_grid,
-        points_per_side=32,      # 32×32 = 1024 个网格点
-        auto_seg=True,           # 必须启用 auto_seg 才能使用点网格
-        offset_info=None,        # SD900 不需要 offset_info
-        multimask=False          # 单 mask 输出
+        points_per_side=32,
+        auto_seg=True,           # the point grid requires auto_seg
+        offset_info=None,        # SD900 needs no offset_info
+        multimask=False
     )
 
     if not args.infer_mode:
@@ -90,10 +88,10 @@ if __name__ == '__main__':
             test_dataloader=test_dataloader,
             model=model,
             device=device,
-            process_batch_fn=process_batch_grid32,  # 使用 32×32 网格点
+            process_batch_fn=process_batch_grid32,
             hyperparameters=hyperparameters,
             save_dir="./new_weights/finetune/sd900_grid32_output/" + hyperparameters['ft_type'],
-            auto_seg=True  # 关键：必须启用 auto_seg
+            auto_seg=True  # the point grid requires auto_seg
         )
     
     elif args.zero_shot:
@@ -109,10 +107,10 @@ if __name__ == '__main__':
             val_dataloader=val_dataloader,
             test_dataloader=test_dataloader,
             loss_fn=seg_loss,
-            process_batch_fn=process_batch_grid32,  # Zero-shot 也用 grid prompt
+            process_batch_fn=process_batch_grid32,
             device=device,
             results_filename="sd900_grid32_zeroshot_evaluation_results.txt",
-            auto_seg=True,  # Zero-shot 使用 auto_seg
+            auto_seg=True,
             eval_traindataset=True
         )
     
@@ -121,7 +119,6 @@ if __name__ == '__main__':
         scaler = torch.amp.GradScaler('cuda', enabled=True)
         seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
-        # 加载待评估的 checkpoint
         checkpoints_to_evaluate = sd900_dict()
 
         device = torch.device(f"cuda:{hyperparameters['device_id']}" if torch.cuda.is_available() else "cpu")
@@ -150,10 +147,10 @@ if __name__ == '__main__':
                 val_dataloader=val_dataloader,
                 test_dataloader=test_dataloader,
                 loss_fn=seg_loss,
-                process_batch_fn=process_batch_grid32,  # 推理使用 32×32 网格
+                process_batch_fn=process_batch_grid32,
                 scaler=scaler,
                 device=device,
                 results_filename="sd900_grid32_eval_results.txt",
-                auto_seg=True,  # 推理也使用 auto_seg
+                auto_seg=True,
                 eval_traindataset=True
             )

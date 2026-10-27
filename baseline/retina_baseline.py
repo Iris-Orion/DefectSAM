@@ -65,7 +65,7 @@ if __name__ == '__main__':
         device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
         criterion = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
-        # 需要指定checkpoint路径
+        # Hard-coded checkpoint path; edit before running inference.
         checkpoint_path = "./new_weights/retina_best_model.pth"
         bsl_inference_engine(model=model,
                            best_model_path=checkpoint_path,

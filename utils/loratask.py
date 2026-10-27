@@ -1,4 +1,3 @@
-### 选择不同的lora微调方法，返回SAM模型
 import copy
 import peft
 import torch
@@ -15,7 +14,7 @@ from transformers import SamModel
 from utils.utils import print_trainable_parameters
 
 class FusedQKVSplitLinear(nn.Module):
-    """将 SAM 的 fused qkv 线性层拆成 q/k/v 三个子层，但保持输出接口不变。"""
+    """SAM's fused qkv Linear split into q_proj/k_proj/v_proj with identical output, so PEFT can target q and v separately."""
 
     def __init__(self, qkv_layer: nn.Linear):
         super().__init__()
@@ -52,10 +51,7 @@ class FusedQKVSplitLinear(nn.Module):
 
 
 def prepare_sam_qkv_for_qv_peft(model, target_part='vision_encoder'):
-    """
-    将 vision encoder 中 fused qkv 替换为暴露 q_proj/k_proj/v_proj 的等价包装层。
-    幂等：若已是 FusedQKVSplitLinear，则跳过。
-    """
+    """Replace every vision-encoder fused qkv with FusedQKVSplitLinear. Idempotent."""
     if target_part != 'vision_encoder':
         raise ValueError("q/v-only PEFT 目前仅支持 target_part='vision_encoder'.")
 
@@ -84,7 +80,6 @@ def get_hf_adalora_model(
         deltaT=10,
         target_modules=target_modules,
         total_step=total_step,
-        # modules_to_save=["classifier"],
     )
     model = get_peft_model(model, config)
     return model
@@ -98,16 +93,12 @@ def get_hf_lora_model(model, lora_rank=16, lora_alpha=16, lora_dropout=0.0, targ
         target_modules=target_modules,
         lora_dropout=lora_dropout,
         bias="none",
-        # modules_to_save=["mask_decoder"]  # 如果想同时训练这个部分，取消注释
     )
     model = get_peft_model(model, config)
     return model
 
 
 def get_hf_dora_qv_model(model, lora_rank=16, lora_alpha=16, lora_dropout=0.0, target_part='vision_encoder'):
-    """
-    严格 q/v-only DoRA：先将 fused qkv 拆成 q/k/v 子层，再仅对 q_proj/v_proj 注入 DoRA。
-    """
     model = prepare_sam_qkv_for_qv_peft(model, target_part=target_part)
     target_modules = get_sam_qv_target_modules_for_peft(model, target_part=target_part)
     config = LoraConfig(
@@ -123,9 +114,6 @@ def get_hf_dora_qv_model(model, lora_rank=16, lora_alpha=16, lora_dropout=0.0, t
 
 
 def get_hf_lokr_qv_model(model, lokr_rank=16, lokr_alpha=16, rank_dropout=0.0, module_dropout=0.0, target_part='vision_encoder'):
-    """
-    严格 q/v-only LoKr：先将 fused qkv 拆成 q/k/v 子层，再仅对 q_proj/v_proj 注入 LoKr。
-    """
     model = prepare_sam_qkv_for_qv_peft(model, target_part=target_part)
     target_modules = get_sam_qv_target_modules_for_peft(model, target_part=target_part)
     config = LoKrConfig(
@@ -140,9 +128,6 @@ def get_hf_lokr_qv_model(model, lokr_rank=16, lokr_alpha=16, rank_dropout=0.0, m
 
 
 def get_hf_loha_qv_model(model, loha_rank=16, loha_alpha=16, rank_dropout=0.0, module_dropout=0.0, target_part='vision_encoder'):
-    """
-    严格 q/v-only LoHa：先将 fused qkv 拆成 q/k/v 子层，再仅对 q_proj/v_proj 注入 LoHa。
-    """
     model = prepare_sam_qkv_for_qv_peft(model, target_part=target_part)
     target_modules = get_sam_qv_target_modules_for_peft(model, target_part=target_part)
     config = LoHaConfig(
@@ -163,7 +148,6 @@ def get_hf_lokr_model(model):
         alpha=16,
         target_modules=target_modules,
         module_dropout=0.1,
-        # modules_to_save=["classifier"],
     )
     model = get_peft_model(model, config)
     model.print_trainable_parameters()
@@ -171,16 +155,6 @@ def get_hf_lokr_model(model):
 
 
 def filter_target_modules(named_modules, target_substrings):
-    """
-    筛选出名称中包含指定子字符串的线性层模块名称。
-    
-    Args:
-        named_modules (iterator): 模型的命名模块迭代器。
-        target_substrings (list of str): 需要匹配的子字符串列表。
-        
-    Returns:
-        list: 匹配的模块名称列表。
-    """
     return [
         name
         for name, module in named_modules
@@ -189,12 +163,8 @@ def filter_target_modules(named_modules, target_substrings):
 
 
 def get_sam_target_modules(model, target_part='vision_encoder'):
-    """
-    动态选择指定部分中所有名为 'q_proj', 'k_proj', 'v_proj', 'qkv' 的线性层作为 LoRA 的目标模块。
-    """
     target_substrings = ['q_proj', 'k_proj', 'v_proj', 'qkv']
     
-    # 根据 target_part 获取对应的子模块
     submodule_map = {
         'vision_encoder': model.vision_encoder,
         'mask_decoder': model.mask_decoder
@@ -204,20 +174,17 @@ def get_sam_target_modules(model, target_part='vision_encoder'):
         raise ValueError(f"未知的 target_part: {target_part}. 可选项为 {list(submodule_map.keys())}")
     selected_submodule = submodule_map[target_part]
 
-    target_modules = filter_target_modules(selected_submodule.named_modules(), target_substrings)       # 筛选目标模块
+    target_modules = filter_target_modules(selected_submodule.named_modules(), target_substrings)
     print("\n选择的目标模块：")
     for module_name in target_modules:
         print(module_name)
     
     if not target_modules:
-        raise ValueError("未找到任何匹配的目标模块，请检查模型结构和目标模块名称。")                        # 确保至少选择了一个目标模块
+        raise ValueError("未找到任何匹配的目标模块，请检查模型结构和目标模块名称。")
     return target_modules
 
 
 def get_sam_qv_target_modules_for_peft(model, target_part='vision_encoder'):
-    """
-    仅选择 q_proj / v_proj 作为 strict q/v-only PEFT 目标模块，要求模型已经过 qkv 拆分包装。
-    """
     if target_part != 'vision_encoder':
         raise ValueError("q/v-only PEFT 目前仅支持 vision_encoder.")
 
@@ -233,8 +200,6 @@ def get_sam_qv_target_modules_for_peft(model, target_part='vision_encoder'):
         raise ValueError("未找到 q_proj/v_proj 目标模块，请先执行 prepare_sam_qkv_for_qv_peft().")
     return target_modules
 
-#   第三个 True/False — pass_sam_type：是否把 args.sam_type 传给工厂函数。True 表示该变体支持 sam_base/sam_large 切换。
-#   第四个 True/False — set_loraplus_optim：是否在调用前强制设置 args.use_loraplus_optim = True（启用 LoRA+ 差异学习率优化器）。
 
 _SAM_ARCH_VARIANTS = {
     # name: (factory, fixed_kwargs, pass_sam_type, set_loraplus_optim)
@@ -348,16 +313,7 @@ _HF_PEFT_BUILDERS = {
 
 
 def create_model_from_type(args: argparse.Namespace, train_dataloader: DataLoader = None):
-    """
-    根据给定的模型类型字符串和参数创建一个模型实例。
-
-    Args:
-        args (argparse.Namespace): 包含所有超参数的args对象。
-        train_dataloader (DataLoader, optional): 仅在需要计算总步数时(如AdaLora)提供。
-
-    Returns:
-        torch.nn.Module: 创建好的模型实例。
-    """
+    """Build the model for args.ft_type. train_dataloader is required only by adalora_encoder (to compute total steps)."""
     model_type = args.ft_type
     print(f"--- Creating model of type: {model_type} with rank: {args.lora_rank} ---")
 
@@ -443,7 +399,6 @@ def simple_task():
     criterion = nn.CrossEntropyLoss()
     train(module, optimizer, criterion, train_dataloader, eval_dataloader, epochs=max_epochs)
 
-    ### lora ###
     config = peft.LoraConfig(
         r=8,
         target_modules=["seq.0", "seq.2"],
@@ -451,7 +406,7 @@ def simple_task():
     )
 
     module = MLP().to(device)
-    module_copy = copy.deepcopy(module)  # we keep a copy of the original model for later
+    module_copy = copy.deepcopy(module)
     peft_model = peft.get_peft_model(module, config)
     optimizer = torch.optim.Adam(peft_model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
@@ -480,11 +435,8 @@ def simple_task():
             print(f"Parameter {name_before:<13} | {param.numel():>7} parameters | updated")
 
 if __name__ == '__main__':
-    # simple_task()
     hgsam_model = SamModel.from_pretrained("./HuggingfaceModel/sam_vit_base/model")
     encoder_layer_0 = hgsam_model.vision_encoder.layers[0]
     decoder_trans_layer_0 = hgsam_model.mask_decoder.transformer.layers[0]
     print(encoder_layer_0)
-    # print(decoder_trans_layer_0)
     print_trainable_parameters(get_hf_lora_model(model=hgsam_model, target_part='vision_encoder'))
-    # print_trainable_parameters(get_hf_lora_model(model=hgsam_model, target_part='mask_decoder'))
